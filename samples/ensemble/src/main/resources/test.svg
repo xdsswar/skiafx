@@ -1,0 +1,49 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 800" width="100%" height="100%">
+    <defs>
+        <!-- Complex Radial Gradient -->
+        <radialGradient id="grad1" cx="50%" cy="50%" r="50%" fx="50%" fy="50%">
+            <stop offset="0%" stop-color="#FF0077" />
+            <stop offset="40%" stop-color="#7700FF" stop-opacity="0.8" />
+            <stop offset="100%" stop-color="#00FFFF" stop-opacity="0" />
+        </radialGradient>
+
+        <!-- Linear Gradient with transparency mask -->
+        <linearGradient id="grad2" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#FFD700" stop-opacity="1" />
+            <stop offset="100%" stop-color="#FF4500" stop-opacity="0.5" />
+        </linearGradient>
+
+        <!-- Clip Path for overlapping geometry -->
+        <clipPath id="myClip">
+            <circle cx="400" cy="400" r="200" />
+        </clipPath>
+    </defs>
+
+    <!-- Background Grid to test transparency and rendering -->
+    <rect width="800" height="800" fill="#E0E0E0" />
+    <rect width="800" height="800" fill="url(#grid)" />
+
+    <!-- Clipped intricate shapes -->
+    <g clip-path="url(#myClip)">
+        <rect width="800" height="800" fill="url(#grad2)" />
+
+        <!-- Nested rotated ellipses to stress-test rendering engine -->
+        <g stroke="white" stroke-width="2" fill="none">
+            <ellipse cx="400" cy="400" rx="350" ry="150" transform="rotate(0 400 400)" />
+            <ellipse cx="400" cy="400" rx="350" ry="150" transform="rotate(30 400 400)" />
+            <ellipse cx="400" cy="400" rx="350" ry="150" transform="rotate(60 400 400)" />
+            <ellipse cx="400" cy="400" rx="350" ry="150" transform="rotate(90 400 400)" />
+            <ellipse cx="400" cy="400" rx="350" ry="150" transform="rotate(120 400 400)" />
+            <ellipse cx="400" cy="400" rx="350" ry="150" transform="rotate(150 400 400)" />
+        </g>
+
+        <!-- Transparent Radial Gradient Overlays -->
+        <circle cx="400" cy="400" r="300" fill="url(#grad1)" />
+    </g>
+
+    <!-- Solid border demonstrating crisp stroke rendering -->
+    <rect x="5" y="5" width="790" height="790" fill="none" stroke="#000" stroke-width="10" />
+
+    <!-- Vector text with embedded fonts to test typography -->
+    <text x="400" y="750" font-family="sans-serif" font-size="48" font-weight="bold" fill="#000" text-anchor="middle">SVG Test Graphic</text>
+</svg>

@@ -1,0 +1,503 @@
+/*
+ * samples/ensemble — sample apps for the skia-fx pipeline.
+ *
+ * Tasks:
+ *   :samples:ensemble:run             — DashboardApp (default)
+ *   :samples:ensemble:runDemo3D       — Demo3D (3D scene-graph showcase)
+ *   :samples:ensemble:runMediaSmoke   — MediaSmokeApp (audio/video smoke)
+ *   :samples:ensemble:runPlayer       — VideoPlayerApp (file picker)
+ *
+ * Optional flags (none required — Skia, GPU, D3D11VA zero-copy and
+ * dirty-opts are all default-on in skia-fx):
+ *   -PffmpegDir=C:/ffmpeg/bin     ffmpeg DLL location for ffmpeg-backed
+ *                                 decode. Forwarded as -Dopenjfx.media
+ *                                 .ffmpeg.dir; when omitted the engine
+ *                                 falls back to mfwrapper / dshowwrapper.
+ *   --args="C:/path/to/clip.mp4"  pre-load this file (runPlayer only).
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'application'
+}
+
+// Per-module repository (settings.gradle keeps the build otherwise hermetic).
+// Needed only for the AtlantaFX theme used by the Showcase sample.
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation project(':javafx.base')
+    implementation project(':javafx.graphics')
+    implementation project(':javafx.scene3d')
+    implementation project(':javafx.controls')
+    implementation project(':javafx.fxml')
+    implementation project(':javafx.media')
+    implementation project(':javafx.web')
+
+    // AtlantaFX PrimerLight theme for the Showcase (a CSS-heavy modern theme to
+    // stress the Skia CSS/render path). Exclude its transitive org.openjfx
+    // dependency so it resolves against OUR javafx.* project modules, not the
+    // stock OpenJFX jars from Maven Central.
+    implementation('io.github.mkpaz:atlantafx-base:2.0.1') {
+        exclude group: 'org.openjfx'
+    }
+}
+
+application {
+    mainClass  = 'org.openjfx.samples.ensemble.DashboardApp'
+    mainModule = 'openjfx.samples.ensemble'
+    applicationDefaultJvmArgs = [
+        '--enable-preview',
+        '--enable-native-access=ALL-UNNAMED',
+    ]
+}
+
+// ----------------------------------------------------------------------
+// Dev-tree run config — common to every sample task.
+//
+// We launch against the in-tree build outputs rather than a packaged
+// SDK, so we have to point `java.library.path` at javafx.graphics +
+// javafx.media native dirs and tell NativeBridge where the Skia bridge
+// DLL lives. A downstream user with a real SDK doesn't need any of
+// this — `java --module-path sdk/lib --add-modules javafx.controls`
+// works the same way it does with stock OpenJFX 25.
+// ----------------------------------------------------------------------
+
+// Per-platform native dirs. The skiafx.native-conventions plugin
+// exposes nativePlatform ('win'|'mac'|'linux') and nativeArch
+// ('x64'|'arm64'); replicate that logic here so the samples module
+// stays portable without depending on the convention plugin.
+def repoRoot = rootDir
+def hostOs   = System.getProperty('os.name').toLowerCase()
+def hostPlat = hostOs.contains('win')  ? 'win'
+            : hostOs.contains('mac')   ? 'mac'
+            : 'linux'
+def hostArch = (System.getProperty('os.arch') in ['x86_64', 'amd64']) ? 'x64' : 'arm64'
+def graphicsLib = new File(repoRoot,
+    "javafx.graphics/build/native/${hostPlat}-${hostArch}/lib")
+def mediaLib    = new File(repoRoot,
+    "javafx.media/build/native/${hostPlat}-${hostArch}/lib")
+// javafx.scene3d ships its own native asset lib (openjfx_model3d) in a
+// separate build dir; the model demo points the loader at it explicitly.
+def scene3dLib  = new File(repoRoot,
+    "javafx.scene3d/build/native/${hostPlat}-${hostArch}/lib")
+def model3dBridgeName = hostPlat == 'win'  ? 'openjfx_model3d.dll'
+                      : hostPlat == 'mac'  ? 'libopenjfx_model3d.dylib'
+                                           : 'libopenjfx_model3d.so'
+def model3dBridge = new File(scene3dLib, model3dBridgeName)
+// WebKit's native build dir uses the 'webkit-<platform>-<arch>' prefix
+// (see skiafx.webkit-native-conventions.gradle).
+def webLib      = new File(repoRoot,
+    "javafx.web/build/native/webkit-${hostPlat}-${hostArch}/bin")
+def skiaBridgeName = hostPlat == 'win'  ? 'openjfx_skia_shared.dll'
+                   : hostPlat == 'mac'  ? 'libopenjfx_skia_shared.dylib'
+                                        : 'libopenjfx_skia_shared.so'
+def skiaBridge  = new File(graphicsLib, skiaBridgeName)
+
+// Optional: ffmpeg DLL directory. Resolved from (in order):
+//   -PffmpegDir=...                             explicit user override
+//   OPENJFX_MEDIA_FFMPEG_DIR env var            shell convention
+//   javafx.media's auto-fetched dev runtime     fetched by the dev build
+//
+// Forwarded as -Dopenjfx.media.ffmpeg.dir, which is the canonical
+// system property; NativeMediaManager picks it up automatically on
+// first Media construction.
+def ffmpegDir = providers.gradleProperty('ffmpegDir')
+                        .orElse(providers.environmentVariable('OPENJFX_MEDIA_FFMPEG_DIR'))
+                        .orElse(provider {
+                            def mp = project(':javafx.media')
+                            mp.hasProperty('ffmpegRuntimeDir') ?
+                                (String) mp.ext.ffmpegRuntimeDir : null
+                        })
+                        .getOrNull()
+
+def applyDevTreeRunConfig = { JavaExec t ->
+    t.doFirst {
+        systemProperty 'java.library.path',
+            "${graphicsLib.absolutePath}${File.pathSeparator}${mediaLib.absolutePath}${File.pathSeparator}${webLib.absolutePath}"
+        if (skiaBridge.exists()) {
+            systemProperty 'openjfx.skia.nativeLib', skiaBridge.absolutePath
+        }
+        if (ffmpegDir != null && !ffmpegDir.isBlank()) {
+            systemProperty 'openjfx.media.ffmpeg.dir', ffmpegDir
+        }
+    }
+    if (ffmpegDir != null && providers.gradleProperty('ffmpegDir').getOrNull() == null) {
+        // The default ffmpegDir comes from the dev auto-fetch task —
+        // depend on it so the DLLs exist before launch. An explicit
+        // -PffmpegDir override skips the fetch entirely.
+        def mediaProject = project(':javafx.media')
+        if (mediaProject.tasks.findByName('fetchFfmpegRuntime')) {
+            t.dependsOn mediaProject.tasks.named('fetchFfmpegRuntime')
+        }
+    }
+}
+
+tasks.named('run') {
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runMediaSmoke', JavaExec) {
+    group = 'application'
+    description = 'Launch MediaSmokeApp (audio/video smoke test).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.MediaSmokeApp')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runDualPlayer', JavaExec) {
+    group = 'application'
+    description = 'Launch DualStreamPlayer (separate audio + video sources).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.DualStreamPlayer')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runLoaderDemo', JavaExec) {
+    group = 'application'
+    description = 'Launch LoaderDemo (loader animation, then content fade-in).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.LoaderDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runWebView', JavaExec) {
+    group = 'application'
+    description = 'Launch WebViewDemo (exercises batch 4 image + batch 5 text/emoji native paths).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.WebViewDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+    // Forward diagnostic flags from the gradlew CLI to the app JVM, at
+    // CONFIGURATION time (Project access is allowed here; only EXECUTION-time
+    // Project access breaks the configuration cache). Accept both -P<k>=... (a
+    // Gradle/project property) and -D<k>=... (a JVM system property on the
+    // gradle process). Setting systemProperty at config time makes it a proper
+    // task input, so changing the flag re-runs the task.
+    ['webdemo.page', 'skia.verbose', 'skia.web.nativeShadow',
+     'prism.dirtyopts', 'prism.showdirty', 'prism.verbose',
+     'skia.effect.diag', 'skia.effect.dump',
+     'skia.resize.diag', 'skia.paint.diag'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    // Native-side diagnostics are read with getenv() in the C++ bridge, so they
+    // must reach the forked app JVM as an ENVIRONMENT variable (a system
+    // property won't do). Forwarding via environment() here is daemon-proof —
+    // it doesn't depend on the gradle daemon having inherited the var.
+    ['OPENJFX_SKIA_PRESENT_DIAG', 'OPENJFX_PDF_PLUGIN'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
+    }
+}
+
+tasks.register('runDashboard', JavaExec) {
+    group = 'application'
+    description = 'Launch DashboardDemo (FXML emerald dashboard: custom title bar, collapsible icon rail, all controls).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.DashboardDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runCustomTitleBar', JavaExec) {
+    group = 'application'
+    description = 'Launch CustomTitleBarDemo (StageStyle.CUSTOM end-to-end).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.CustomTitleBarDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runShowcase', JavaExec) {
+    group = 'application'
+    description = 'Launch ShowcaseApp (FXML dashboard: custom title bar, animated sidebar, all nodes, FPS).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.ShowcaseApp')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    // Tag the benchmark CSV as the skia-fx run for A/B comparison.
+    systemProperty 'showcase.bench.label', 'skia-fx'
+    // Forward optional benchmark knobs from -P<k>=... or -D<k>=...
+    ['showcase.bench.nodes', 'showcase.bench.out', 'showcase.bench.record',
+     'showcase.bench.label'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runSvgDemo', JavaExec) {
+    group = 'application'
+    description = 'Launch SvgDemoApp (SvgImage/SvgImageView: crisp vector SVG, zoom, grid, tint, icons).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.SvgDemoApp')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runSvgLiveTest', JavaExec) {
+    group = 'verification'
+    description = 'Live repaint test: confirms a tint change repaints the node automatically.'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.SvgLiveTest')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED',
+            // reflective read of NGSvgImageView.RENDER_COUNT (internal package)
+            '--add-exports', 'javafx.graphics/com.sun.javafx.sg.prism=openjfx.samples.ensemble'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runSvgRenderTest', JavaExec) {
+    group = 'verification'
+    description = 'Headless render test: confirms SvgImageView tint/background change the output.'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.SvgRenderTest')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runSvgSmoke', JavaExec) {
+    group = 'verification'
+    description = 'Headless smoke test of the native SVG pipeline (parse + intrinsic size).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.SvgSmoke')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runBench', JavaExec) {
+    group = 'application'
+    description = 'Launch ShowcaseBenchmark (portable stress scene + CSV metrics for A/B vs stock JavaFX).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.ShowcaseBenchmark')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'showcase.bench.label', 'skia-fx'
+    ['showcase.bench.nodes', 'showcase.bench.out', 'showcase.bench.record',
+     'showcase.bench.label'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runDemo3D', JavaExec) {
+    group = 'application'
+    description = 'Launch Demo3D (3D scene-graph showcase: meshes, lights, camera).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.Demo3D')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    applyDevTreeRunConfig(it)
+    // 3D needs the D3D12 backend (bgfx shares Skia's D3D12 device). Enable
+    // it BY DEFAULT so the demo shows real 3D when launched straight from
+    // the IntelliJ Gradle sidebar (or `gradlew runDemo3D`) with no args.
+    // SCENE3D is gated on this; without it the demo shows the "unsupported"
+    // panel. Override with -POPENJFX_SKIA_D3D=0 to force the GL backend.
+    environment 'OPENJFX_SKIA_D3D', '1'
+    // Shadows are opt-in in the renderer (fixed-sun first increment); enable them by
+    // default in this showcase. Override with -POPENJFX_SKIA_3D_SHADOWS=0.
+    environment 'OPENJFX_SKIA_3D_SHADOWS', '1'
+    // 3D spike (docs/3D.md Increment 1). Forward the JVM flag that gates
+    // the SkiaPresentable.present() hook from -Pskia.3d.spike / -D...
+    ['skia.3d.spike', 'skia.3d.selftest', 'skia.3d.parallelcam'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    // Native-side env vars (read with getenv in the C++ bridge). Allow
+    // overriding the defaults above via -P<k>=... or an inherited shell var.
+    ['OPENJFX_SKIA_D3D', 'OPENJFX_SKIA_3D_DIAG', 'OPENJFX_SKIA_D3D_DIAG',
+     'OPENJFX_SKIA_3D_SHADOWS'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
+    }
+}
+
+tasks.register('runModelDemo', JavaExec) {
+    group = 'application'
+    description = 'Launch Model3DDemo (glTF 2.0 model loading via javafx.scene3d). ' +
+        '-Dmodel.file=<path> loads a custom model; -Pmodel.selftest=true runs headless ' +
+        'asserts; -Pfullspeed uncaps the frame rate (dramatic VSync on/off fps swing).'
+    dependsOn 'classes'
+    // The scene3d native lib must exist before launch.
+    dependsOn ':javafx.scene3d:nativeBuild'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.Model3DDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED',
+            // javafx.scene3d (a named module) calls FFM restricted methods, so it
+            // needs native access in addition to the unnamed app module.
+            '--enable-native-access=javafx.scene3d'
+    applyDevTreeRunConfig(it)
+    // 3D needs the D3D12 backend (bgfx shares Skia's device), like runDemo3D.
+    environment 'OPENJFX_SKIA_D3D', '1'
+    environment 'OPENJFX_SKIA_3D_SHADOWS', '1'
+    doFirst {
+        // Point the loader at the freshly built dev-tree native lib (the
+        // deployed path extracts it from the jar instead).
+        if (model3dBridge.exists()) {
+            systemProperty 'openjfx.model3d.nativeLib', model3dBridge.absolutePath
+        }
+    }
+    // Forward model.* flags from -P<k>=... or -D<k>=... (config time → task input).
+    ['model.file', 'model.selftest', 'skia.verbose'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    ['OPENJFX_SKIA_D3D', 'OPENJFX_SKIA_3D_DIAG', 'OPENJFX_SKIA_3D_SHADOWS'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
+    }
+    // -Pfullspeed[=true] uncaps the master timer (javafx.animation.fullspeed) so
+    // the pulse — and the uncapped present path — can exceed the display refresh.
+    // Makes the VSync on/off fps difference dramatic. -Pfullspeed=false disables.
+    def fullspeed = project.findProperty('fullspeed')
+    if (fullspeed != null && fullspeed.toString() != 'false') {
+        systemProperty 'javafx.animation.fullspeed', 'true'
+    }
+}
+
+tasks.register('runPlayer', JavaExec) {
+    group = 'application'
+    description = 'Launch VideoPlayerApp (file picker + drag-drop).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.VideoPlayerApp')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    // Bulletproof default: route around the WGL_NV_DX_interop2
+    // zero-copy path which hangs the FX thread on swap-chain
+    // resize (maximize / restore / fullscreen toggle). The
+    // producer's HW path emits meta-only buffers that only the
+    // zero-copy consumer can read, so when zero-copy is off the
+    // producer must also avoid hwaccel — both flags flip together.
+    // Override with `-PuseHwaccel=true` to A/B test on a driver
+    // where the WGL layer is well behaved.
+    // ffmpeg D3D11VA hwaccel is on by default — the freeze that made
+    // us turn it off was fixed at the source (bounded effect-validate
+    // retry in PrEffectHelper + a non-null-image SkiaPassthroughPeer).
+    // Override with `-PuseHwaccel=false` to force software decode for
+    // A/B comparison.
+    def useHw = providers.gradleProperty('useHwaccel').getOrElse('true')
+    environment 'OPENJFX_MEDIA_USE_HWACCEL', useHw
+    // Force every video stream through ffmpegwrapper when ffmpeg can
+    // decode it — even for codecs MFT/DirectShow can also handle.
+    // ffmpegwrapper preserves the source's full colour metadata
+    // (mfwrapper strips it), so this is the reliable path for
+    // colour-correct playback of AV1 / HEVC / etc.
+    def forceFfmpeg = providers.gradleProperty('forceFfmpeg').getOrElse('false')
+    environment 'OPENJFX_MEDIA_FORCE_FFMPEG', forceFfmpeg
+    // Manual colour overrides (HW path + Skia consumer). All three
+    // accept "auto" (default — engine detects) or a token:
+    //
+    //   -PyuvMatrix=<auto|601|smpte170|bt470bg|pal|fcc|709|bt709|
+    //                 2020|bt2020|smpte240|rgb>
+    //   -PyuvRange=<auto|full|limited>          (HW path)
+    //   -PyuvColorSpace=<auto|0|1|2|3>          (Skia consumer:
+    //                                             0=601, 1=709,
+    //                                             2=2020, 3=JPEG-full)
+    //
+    // The full range of tokens is here so a developer can A/B test
+    // every standard YUV configuration when a specific file's
+    // colour metadata is wrong or missing.
+    def yuvMatrix = providers.gradleProperty('yuvMatrix').getOrElse('auto')
+    environment 'OPENJFX_MEDIA_YUV_MATRIX', yuvMatrix
+    def yuvRange = providers.gradleProperty('yuvRange').getOrElse('auto')
+    environment 'OPENJFX_MEDIA_YUV_RANGE', yuvRange
+    // Modern DXGI colour-space override (HW path). Accepts a token
+    // that picks one of DXGI_COLOR_SPACE_TYPE's named enums:
+    //   bt709 / bt709-full
+    //   bt601 / bt601-full / smpte170
+    //   bt2020 / bt2020-full
+    //   bt2020-pq                (HDR10)
+    //   bt2020-hlg               (Hybrid Log-Gamma)
+    //   rgb-full / rgb-studio
+    //   auto                     (default — engine detects)
+    def yuvDxgi = providers.gradleProperty('dxgiColorSpace').getOrElse('auto')
+    if (yuvDxgi != 'auto') {
+        environment 'OPENJFX_MEDIA_YUV_COLORSPACE', yuvDxgi
+    }
+    def yuvColorSpace = providers.gradleProperty('yuvColorSpace').getOrElse('auto')
+    if (yuvColorSpace != 'auto') {
+        systemProperty 'skia.media.yuvColorSpace', yuvColorSpace
+    } else if (yuvMatrix != 'auto') {
+        // Keep Skia consumer-side aligned to a matrix override when
+        // the user didn't set yuvColorSpace explicitly.
+        def consumerValue = (yuvMatrix.contains('601') || yuvMatrix.contains('smpte170')
+                            || yuvMatrix.contains('470') || yuvMatrix.contains('pal')
+                            || yuvMatrix.contains('fcc')) ? '0'
+                          : (yuvMatrix.contains('2020')) ? '2'
+                          : (yuvMatrix.contains('709') || yuvMatrix.contains('240')) ? '1'
+                          : '-1'
+        if (consumerValue != '-1') {
+            systemProperty 'skia.media.yuvColorSpace', consumerValue
+        }
+    }
+
+    // HDR pipeline. SkiaMediaTexture detects HDR PQ / HLG content and
+    // either tone-maps on the GPU (via the SkRuntimeEffect BT.2390
+    // pass added to the Skia bridge) or in pure Java (LUT-based
+    // PQ EOTF + BT.2020→sRGB + BT.2390 + sRGB OETF). System properties:
+    //
+    //   -PhdrPath=<auto|gpu|cpu|off>     auto = GPU if native built,
+    //                                     CPU otherwise.
+    //   -PhdrPeakNits=<N>                source mastering peak (default
+    //                                     0 = auto, falls back to 1000
+    //                                     for HDR content lacking
+    //                                     metadata).
+    //   -PhdrDisplayNits=<N>             display target peak (default
+    //                                     100 = SDR sRGB).
+    //   -PforceHdr=<auto|pq|hlg|sdr|709> pretend the source has this
+    //                                     transfer regardless of caps —
+    //                                     useful for testing HDR with
+    //                                     a file whose metadata didn't
+    //                                     reach the consumer.
+    def hdrPath = providers.gradleProperty('hdrPath').getOrElse('auto')
+    systemProperty 'skia.media.hdrPath', hdrPath
+    def hdrPeak = providers.gradleProperty('hdrPeakNits').getOrElse('0')
+    systemProperty 'skia.media.hdrPeakNits', hdrPeak
+    def hdrDisp = providers.gradleProperty('hdrDisplayNits').getOrElse('100')
+    systemProperty 'skia.media.hdrDisplayNits', hdrDisp
+    def forceHdr = providers.gradleProperty('forceHdr').getOrElse('auto')
+    systemProperty 'skia.media.forceHdr', forceHdr
+
+    applyDevTreeRunConfig(it)
+}
+
+description = 'Sample apps for the Skia pipeline.'

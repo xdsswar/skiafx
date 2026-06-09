@@ -1,0 +1,5 @@
+# Stub -- pruned directory, jux-engine build
+
+declare_args() {
+  build_tflite_with_xnnpack = false
+}

@@ -1,0 +1,156 @@
+/*
+ * LoaderDemo theme. Modern dark surface, accent cyan, soft typography.
+ */
+
+.root,
+.root-pane {
+    -fx-background-color: linear-gradient(
+        from 0% 0% to 100% 100%,
+        #0e1116 0%,
+        #161a22 100%);
+    -fx-font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+    -fx-font-smoothing-type: gray;
+}
+
+/* -------------------------------------------------------------- loader */
+
+.dual-loader {
+    -fx-padding: 0;
+}
+
+.dual-loader > .outer-arc {
+    -fx-stroke: #3ecfd1;
+    -fx-effect: dropshadow(gaussian, rgba(62, 207, 209, 0.45), 14, 0.0, 0, 0);
+}
+
+.dual-loader > .inner-arc {
+    -fx-stroke: #7c8aff;
+    -fx-effect: dropshadow(gaussian, rgba(124, 138, 255, 0.35), 10, 0.0, 0, 0);
+}
+
+.dual-loader > .loader-label {
+    -fx-text-fill: #b6c0cf;
+    -fx-font-size: 13px;
+    -fx-font-weight: 500;
+    -fx-padding: 6 0 0 0;
+}
+
+/* -------------------------------------------------------------- card */
+
+.card {
+    -fx-background-color: rgba(255, 255, 255, 0.04);
+    -fx-background-radius: 16;
+    -fx-border-color: rgba(255, 255, 255, 0.08);
+    -fx-border-radius: 16;
+    -fx-border-width: 1;
+    -fx-effect: dropshadow(gaussian, rgba(0, 0, 0, 0.45), 30, 0.0, 0, 12);
+}
+
+.card > .title {
+    -fx-text-fill: #f5f7fb;
+    -fx-font-size: 28px;
+    -fx-font-weight: 600;
+}
+
+.card > .subtitle {
+    -fx-text-fill: #9aa6b7;
+    -fx-font-size: 14px;
+}
+
+/* -------------------------------------------------------------- tiles */
+
+.tiles {
+    -fx-padding: 12 0 6 0;
+}
+
+.tile {
+    -fx-background-color: rgba(255, 255, 255, 0.03);
+    -fx-background-radius: 12;
+    -fx-border-color: rgba(255, 255, 255, 0.07);
+    -fx-border-radius: 12;
+    -fx-border-width: 1;
+    -fx-padding: 16 18 16 18;
+    -fx-min-width: 130;
+}
+
+.tile .tile-caption {
+    -fx-text-fill: #7a8595;
+    -fx-font-size: 11px;
+}
+
+.tile .tile-value {
+    -fx-text-fill: #ffffff;
+    -fx-font-size: 22px;
+    -fx-font-weight: 600;
+    -fx-padding: 2 0 0 0;
+}
+
+.tile .tile-delta {
+    -fx-text-fill: #3ecfd1;
+    -fx-font-size: 11px;
+    -fx-padding: 4 0 0 0;
+}
+
+/* -------------------------------------------------------------- buttons */
+
+.card .button {
+    -fx-background-radius: 10;
+    -fx-border-radius: 10;
+    -fx-padding: 10 22 10 22;
+    -fx-font-size: 13px;
+    -fx-font-weight: 600;
+    -fx-cursor: hand;
+}
+
+.card .button.primary {
+    -fx-background-color: linear-gradient(
+        to right, #3ecfd1, #5b8df0);
+    -fx-text-fill: #0d1117;
+    -fx-border-color: transparent;
+    -fx-effect: dropshadow(gaussian, rgba(62, 207, 209, 0.45), 18, 0.0, 0, 6);
+}
+
+.card .button.primary:hover {
+    -fx-background-color: linear-gradient(
+        to right, #4ed8da, #6c9bf5);
+}
+
+.card .button.secondary {
+    -fx-background-color: transparent;
+    -fx-text-fill: #cfd6e2;
+    -fx-border-color: rgba(255, 255, 255, 0.18);
+    -fx-border-width: 1;
+}
+
+.card .button.secondary:hover {
+    -fx-background-color: rgba(255, 255, 255, 0.06);
+    -fx-border-color: rgba(255, 255, 255, 0.28);
+}
+
+.card .button:focused {
+    -fx-effect: dropshadow(gaussian, rgba(62, 207, 209, 0.6), 22, 0.0, 0, 0);
+}
+
+/* -------------------------------------------------------------- fps badge */
+
+.fps-badge {
+    -fx-background-color: rgba(0, 0, 0, 0.55);
+    -fx-background-radius: 999;
+    -fx-border-color: rgba(255, 255, 255, 0.12);
+    -fx-border-radius: 999;
+    -fx-border-width: 1;
+    -fx-padding: 4 12 4 12;
+    -fx-font-size: 11px;
+    -fx-font-weight: 600;
+    -fx-text-fill: #cfd6e2;
+}
+
+.fps-badge.fps-good {
+    -fx-text-fill: #5fffa6;
+}
+.fps-badge.fps-okay {
+    -fx-text-fill: #ffd166;
+}
+.fps-badge.fps-slow {
+    -fx-text-fill: #ff7a7a;
+}

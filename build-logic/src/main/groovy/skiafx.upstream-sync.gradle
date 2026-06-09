@@ -1,0 +1,42 @@
+/*
+ * skiafx.upstream-sync
+ *
+ * Records which upstream module each subproject was sourced from,
+ * for drift tracking against /jfx-master.
+ *
+ * NOTE: this convention does NOT inject /jfx-master as a source root
+ * into our subprojects. All upstream module source is physically
+ * copied into <module>/src in our repo and compiled from there.
+ * /jfx-master remains a read-only reference for human inspection,
+ * file-by-file copies (when modifying), and the drift-check tasks
+ * (`syncJfxMaster`, `listCopiedFiles`, `checkUpstreamDrift`) at the
+ * root project.
+ *
+ * Usage:
+ *   plugins {
+ *     id 'skiafx.upstream-sync'
+ *   }
+ *   upstream {
+ *     trackedFromJfxMaster 'modules/javafx.base'    // path inside /jfx-master
+ *   }
+ */
+
+abstract class UpstreamExtension {
+    String relativePath
+
+    void trackedFromJfxMaster(String path) {
+        this.relativePath = path
+    }
+
+    /** @deprecated use trackedFromJfxMaster (kept until callers migrate). */
+    void syncFromJfxMaster(String path) {
+        trackedFromJfxMaster(path)
+    }
+}
+
+extensions.create('upstream', UpstreamExtension)
+
+// The relativePath is read by the root `listCopiedFiles` /
+// `checkUpstreamDrift` tasks via project properties; nothing else
+// happens at configuration time. Source roots come from the
+// subproject's own src/main/java tree (already on disk).

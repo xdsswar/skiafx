@@ -1,0 +1,117 @@
+/*
+ * Copyright (c) 2012, 2025, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package com.sun.javafx.stage;
+
+import com.sun.javafx.util.Utils;
+import javafx.beans.value.ObservableValue;
+import javafx.stage.Stage;
+import javafx.stage.Window;
+
+/**
+ * Utility class class used for accessing certain implementation-specific
+ * runtime functionality.
+ */
+public class StageHelper extends WindowHelper {
+
+    private static final StageHelper theInstance;
+    private static StageAccessor stageAccessor;
+
+    static {
+        theInstance = new StageHelper();
+        Utils.forceInit(Stage.class);
+    }
+
+    private static WindowHelper getInstance() {
+        return theInstance;
+    }
+
+    public static void initHelper(Stage stage) {
+        setHelper(stage, getInstance());
+    }
+
+    @Override
+    protected void visibleChangingImpl(Window window, boolean visible) {
+        super.visibleChangingImpl(window, visible);
+        stageAccessor.doVisibleChanging(window, visible);
+    }
+
+    @Override
+    protected void visibleChangedImpl(Window window, boolean visible) {
+        super.visibleChangedImpl(window, visible);
+        stageAccessor.doVisibleChanged(window, visible);
+    }
+
+    public static void setPrimary(Stage stage, boolean primary) {
+        stageAccessor.setPrimary(stage, primary);
+    }
+
+    public static void setImportant(Stage stage, boolean important) {
+        stageAccessor.setImportant(stage, important);
+    }
+
+    public static void setPrefHeaderButtonHeight(Stage stage, double height) {
+        stageAccessor.setPrefHeaderButtonHeight(stage, height);
+    }
+
+    public static double getPrefHeaderButtonHeight(Stage stage) {
+        return stageAccessor.getPrefHeaderButtonHeight(stage);
+    }
+
+    public static ObservableValue<HeaderButtonMetrics> getHeaderButtonMetrics(Stage stage) {
+        return stageAccessor.getHeaderButtonMetrics(stage);
+    }
+
+    public static void setStageAccessor(StageAccessor a) {
+        if (stageAccessor != null) {
+            System.out.println("Warning: Stage accessor already set: " + stageAccessor);
+            Thread.dumpStack();
+        }
+        stageAccessor = a;
+    }
+
+    public static StageAccessor getStageAccessor() {
+        return stageAccessor;
+    }
+
+    public static interface StageAccessor {
+        void doVisibleChanging(Window window, boolean visible);
+        void doVisibleChanged(Window window, boolean visible);
+        void setPrimary(Stage stage,  boolean primary);
+        void setImportant(Stage stage,  boolean important);
+        void setPrefHeaderButtonHeight(Stage stage, double height);
+        double getPrefHeaderButtonHeight(Stage stage);
+        ObservableValue<HeaderButtonMetrics> getHeaderButtonMetrics(Stage stage);
+        /**
+         * skia-fx: returns the per-stage custom-decorations holder, or
+         * {@code null} if the application has never called any
+         * {@code Stage.set*Region(...)} / {@code set*Color(...)} /
+         * {@code setCornerPreference(...)} method on this stage.
+         * Used by {@code WindowStage} when the stage's style is
+         * {@link javafx.stage.StageStyle#CUSTOM}.
+         */
+        com.sun.javafx.stage.custom.CustomDecorations getCustomDecorations(Stage stage);
+    }
+}

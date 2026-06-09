@@ -1,0 +1,37 @@
+#
+--add-exports javafx.base/com.sun.javafx=ALL-UNNAMED
+--add-exports javafx.base/com.sun.javafx.binding=ALL-UNNAMED
+--add-exports javafx.base/com.sun.javafx.collections=ALL-UNNAMED
+--add-exports javafx.base/com.sun.javafx.event=ALL-UNNAMED
+--add-exports javafx.base/com.sun.javafx.property=ALL-UNNAMED
+--add-opens javafx.base/javafx.beans.property=ALL-UNNAMED
+--add-opens javafx.base/com.sun.javafx.binding=ALL-UNNAMED
+--add-exports javafx.base/com.sun.javafx.logging=ALL-UNNAMED
+--add-opens javafx.base/com.sun.javafx.collections=ALL-UNNAMED
+--add-opens javafx.base/javafx.collections=ALL-UNNAMED
+#
+--add-exports javafx.graphics/com.sun.javafx.application=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.font=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.geom=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.perf=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.scene=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.scene.input=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.scene.layout=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.scene.text=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.stage=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.tk=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.javafx.util=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.prism=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.prism.paint=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.scenario=ALL-UNNAMED
+--add-exports javafx.graphics/com.sun.scenario.animation=ALL-UNNAMED
+#
+--add-exports javafx.controls/com.sun.javafx.charts=ALL-UNNAMED
+--add-exports javafx.controls/com.sun.javafx.scene.control=ALL-UNNAMED
+--add-exports javafx.controls/com.sun.javafx.scene.control.behavior=ALL-UNNAMED
+--add-exports javafx.controls/com.sun.javafx.scene.control.inputmap=ALL-UNNAMED
+--add-exports javafx.controls/com.sun.javafx.scene.control.skin=ALL-UNNAMED
+--add-opens javafx.controls/javafx.scene.control=ALL-UNNAMED
+# compile additions
+--add-exports=javafx.graphics/com.sun.javafx.menu=ALL-UNNAMED
+--add-exports=javafx.graphics/com.sun.javafx.text=ALL-UNNAMED

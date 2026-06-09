@@ -1,0 +1,64 @@
+/*
+ * javafx.swing — copied from upstream, ours to modify.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'skiafx.module-conventions'
+    id 'skiafx.upstream-sync'
+    id 'skiafx.sdk-conventions'
+}
+
+upstream {
+    trackedFromJfxMaster 'modules/javafx.swing'
+}
+
+dependencies {
+    api project(':javafx.base')
+    api project(':javafx.graphics')
+}
+
+description = 'JavaFX Swing interop module.'
+
+// ---------------------------------------------------------------------------
+// jdk.unsupported.desktop removal.
+//
+// This module used to `requires jdk.unsupported.desktop` to obtain the
+// jdk.swing.interop.* wrappers over JLightweightFrame and friends. That JDK
+// module is deprecated and will be removed, so we ported those wrappers into
+// com.sun.javafx.embed.swing.interop and now reach the underlying internals
+// directly. java.desktop does not export those packages to us, so we re-open
+// exactly the set java.desktop used to qualify-export to jdk.unsupported.desktop.
+//
+// IMPORTANT: these flags are needed at COMPILE time (here) AND at RUNTIME for
+// any application that actually uses JFXPanel or SwingNode. See
+// docs/MODULE_SWING_DROP_UNSUPPORTED_DESKTOP.md for the runtime launch flags.
+// ---------------------------------------------------------------------------
+ext.swingInteropAddExports = [
+    'java.desktop/sun.swing=javafx.swing',
+    'java.desktop/sun.awt=javafx.swing',
+    'java.desktop/sun.awt.dnd=javafx.swing',
+    'java.desktop/java.awt.dnd.peer=javafx.swing',
+]
+
+tasks.withType(JavaCompile).configureEach {
+    // javac refuses `--add-exports` against a *system* module (java.desktop)
+    // when compiling with `--release` (release mode compiles against the
+    // documented API signatures, where these internal packages don't exist).
+    // Drop --release for this module and pin source/target to the toolchain
+    // version instead. --enable-preview (inherited from java-conventions) also
+    // requires an explicit -source, which this satisfies.
+    options.release.set(null as Integer)
+    sourceCompatibility = '25'
+    targetCompatibility = '25'
+
+    swingInteropAddExports.each { spec ->
+        options.compilerArgs.addAll(['--add-exports', spec])
+    }
+}
+
+tasks.withType(Javadoc).configureEach {
+    swingInteropAddExports.each { spec ->
+        options.addStringOption('-add-exports', spec)
+    }
+}

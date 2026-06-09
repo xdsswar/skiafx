@@ -1,0 +1,116 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  showcase.fxml — shell for the skia-fx Showcase Dashboard.
+
+  The shell is declared in FXML; ShowcaseController fills the sidebar nav
+  and builds each section in code. The custom title bar nodes carry fx:ids
+  so the controller can register them as the Stage's caption / min / max /
+  close hit regions (StageStyle.CUSTOM).
+-->
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.Label?>
+<?import javafx.scene.layout.BorderPane?>
+<?import javafx.scene.layout.HBox?>
+<?import javafx.scene.layout.Region?>
+<?import javafx.scene.layout.StackPane?>
+<?import javafx.scene.layout.VBox?>
+<?import javafx.scene.shape.SVGPath?>
+
+<BorderPane fx:id="rootPane" styleClass="root-pane"
+            xmlns:fx="http://javafx.com/fxml/1"
+            fx:controller="org.openjfx.samples.ensemble.ShowcaseController">
+
+    <!-- ============================================ custom title bar -->
+    <top>
+        <HBox fx:id="titleBar" styleClass="title-bar"
+              alignment="CENTER" minHeight="40" prefHeight="40">
+            <children>
+                <HBox fx:id="captionRegion" alignment="CENTER_LEFT" spacing="10"
+                      HBox.hgrow="ALWAYS">
+                    <padding><Insets left="14"/></padding>
+                    <children>
+                        <Region styleClass="app-mark"/>
+                        <Label styleClass="app-title" text="skia-fx"/>
+                        <Label styleClass="app-title-dim" text="·  Showcase Dashboard"/>
+                    </children>
+                </HBox>
+
+                <StackPane fx:id="minBtn" styleClass="win-btn, win-btn-min"
+                           minWidth="46" prefWidth="46" maxWidth="46"
+                           minHeight="40" prefHeight="40" maxHeight="40">
+                    <children>
+                        <SVGPath styleClass="ctb-icon" content="M0,5 H10"/>
+                    </children>
+                </StackPane>
+
+                <StackPane fx:id="maxBtn" styleClass="win-btn, win-btn-max"
+                           minWidth="46" prefWidth="46" maxWidth="46"
+                           minHeight="40" prefHeight="40" maxHeight="40">
+                    <children>
+                        <SVGPath fx:id="maxIcon" styleClass="ctb-icon"
+                                 content="M0.5,0.5 H9.5 V9.5 H0.5 Z"/>
+                    </children>
+                </StackPane>
+
+                <StackPane fx:id="closeBtn" styleClass="win-btn, win-btn-close"
+                           minWidth="46" prefWidth="46" maxWidth="46"
+                           minHeight="40" prefHeight="40" maxHeight="40">
+                    <children>
+                        <SVGPath styleClass="ctb-icon" content="M0,0 L10,10 M10,0 L0,10"/>
+                    </children>
+                </StackPane>
+            </children>
+        </HBox>
+    </top>
+
+    <!-- ============================================ sidebar -->
+    <left>
+        <VBox fx:id="sidebar" styleClass="sidebar" spacing="6"
+              minWidth="236" prefWidth="236" maxWidth="236">
+            <children>
+                <HBox fx:id="sidebarHeader" styleClass="sidebar-header"
+                      alignment="CENTER_LEFT" spacing="12">
+                    <children>
+                        <StackPane fx:id="hamburger" styleClass="hamburger">
+                            <children>
+                                <SVGPath styleClass="ctb-icon"
+                                         content="M0,0 H16 M0,5 H16 M0,10 H16"/>
+                            </children>
+                        </StackPane>
+                        <Label fx:id="sidebarBrand" styleClass="app-title" text="Navigation"/>
+                    </children>
+                </HBox>
+
+                <!-- nav items injected by the controller -->
+                <VBox fx:id="navBox" spacing="6"/>
+
+                <Region VBox.vgrow="ALWAYS"/>
+
+                <Label fx:id="sidebarFooter" styleClass="card-sub"
+                       text="Skia pipeline · uncapped"/>
+            </children>
+        </VBox>
+    </left>
+
+    <!-- ============================================ content -->
+    <center>
+        <StackPane fx:id="contentStack" styleClass="content-area"/>
+    </center>
+
+    <!-- ============================================ status bar -->
+    <bottom>
+        <HBox fx:id="statusBar" styleClass="status-bar"
+              alignment="CENTER_LEFT" spacing="8" minHeight="30" prefHeight="30">
+            <children>
+                <Region styleClass="state-dot"/>
+                <Label fx:id="statusText" styleClass="status-text" text="Ready"/>
+                <Region HBox.hgrow="ALWAYS"/>
+                <Label fx:id="nodeCountLabel" styleClass="status-text" text=""/>
+                <Label fx:id="sizeLabel" styleClass="status-text" text=""/>
+                <Label fx:id="fpsBadge" styleClass="fps-badge" text="— fps"/>
+            </children>
+        </HBox>
+    </bottom>
+</BorderPane>

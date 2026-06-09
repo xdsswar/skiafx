@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>skia-fx WebView · feature playground</title>
+<style>
+  :root { --ink:#0f172a; --muted:#64748b; --line:#e2e8f0;
+          --brand1:#6d5efc; --brand2:#22d3ee; --card:#ffffff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font:16px/1.6 -apple-system,Segoe UI,Roboto,sans-serif;
+         color:var(--ink); background:#f1f5f9; }
+  .hero { padding:56px 40px 64px; color:#fff;
+          background:linear-gradient(135deg,var(--brand1),var(--brand2));
+          box-shadow:0 10px 30px rgba(99,102,241,.25); }
+  .hero h1 { margin:0 0 6px; font-size:34px; letter-spacing:-.5px; }
+  .hero p  { margin:0; opacity:.92; font-size:17px; }
+  .wrap { max-width:880px; margin:-32px auto 56px; padding:0 24px;
+          display:grid; gap:20px; grid-template-columns:1fr 1fr; }
+  .card { background:var(--card); border:1px solid var(--line);
+          border-radius:16px; padding:22px 24px;
+          box-shadow:0 6px 18px rgba(15,23,42,.06); }
+  .card.full { grid-column:1 / -1; }
+  .card h2 { margin:0 0 4px; font-size:15px; text-transform:uppercase;
+             letter-spacing:.08em; color:var(--brand1); }
+  .card p.hint { margin:0 0 14px; color:var(--muted); font-size:13.5px; }
+  a { color:var(--brand1); font-weight:600; text-decoration:none; }
+  a:hover { text-decoration:underline; }
+  select, input[type=color] { font:inherit; padding:8px 10px;
+          border:1px solid var(--line); border-radius:10px;
+          background:#fff; cursor:pointer; }
+  input[type=color] { width:64px; height:42px; padding:4px; }
+  .swatch { display:inline-block; width:22px; height:22px; border-radius:6px;
+            vertical-align:-5px; margin-left:8px; border:1px solid var(--line); }
+  .pill { display:inline-block; padding:3px 10px; border-radius:999px;
+          background:#eef2ff; color:var(--brand1); font-size:12.5px;
+          font-weight:600; }
+  img.logo { width:120px; height:120px; border-radius:18px;
+             box-shadow:0 8px 20px rgba(34,211,238,.35); }
+  .dl { display:inline-block; padding:10px 16px; border-radius:10px;
+        background:linear-gradient(135deg,var(--brand1),var(--brand2));
+        color:#fff; font-weight:600; }
+  .tall { height:140vh; }
+</style>
+</head>
+<body>
+  <div class="hero">
+    <h1>WebView feature playground</h1>
+    <p>Everything below is the off-screen Blink page handing control to
+       native JavaFX. Right-click anywhere to start.</p>
+  </div>
+  <div class="wrap">
+    <div class="card full">
+      <h2>Right-click context menu &amp; copy</h2>
+      <p class="hint">Select this sentence, then right-click &rarr; <b>Copy</b>;
+         it lands on the system clipboard. Right-click the
+         <a href="https://openjfx.io/" title="Go to openjfx.io">OpenJFX link</a>
+         for Open / Copy&nbsp;Link&nbsp;Address.</p>
+      <span class="pill">selectable + link + image targets</span>
+    </div>
+    <div class="card">
+      <h2>Tooltips</h2>
+      <p class="hint">Hover the logo or the link — the page's
+         <code>title</code> shows as a JavaFX tooltip.</p>
+      <img class="logo" title="skia-fx · Skia GPU + Blink" alt="logo" src="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='120' height='120'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%236d5efc'/><stop offset='1' stop-color='%2322d3ee'/></linearGradient></defs><rect width='120' height='120' rx='22' fill='url(%23g)'/><text x='60' y='74' font-size='52' text-anchor='middle' fill='white' font-family='sans-serif'>fx</text></svg>">
+    </div>
+    <div class="card">
+      <h2>Native &lt;select&gt;</h2>
+      <p class="hint">Opens as a JavaFX menu; your pick fires
+         <code>change</code> back into the page. Scroll the page while it's
+         open — it dismisses.</p>
+      <select id="pipe" onchange="document.getElementById('pv').textContent=this.value">
+        <optgroup label="2D">
+          <option value="skia-gpu">Skia · GPU (Ganesh)</option>
+          <option value="skia-cpu">Skia · CPU raster</option>
+        </optgroup>
+        <optgroup label="legacy">
+          <option value="prism">Prism (disabled)</option>
+        </optgroup>
+      </select>
+      <p class="hint">picked: <b id="pv">skia-gpu</b></p>
+    </div>
+    <div class="card">
+      <h2>Colour input</h2>
+      <p class="hint">Opens the standard JavaFX colour dialog.</p>
+      <input type="color" id="col" value="#6d5efc"
+         oninput="document.getElementById('sw').style.background=this.value;
+                  document.getElementById('cv').textContent=this.value">
+      <span id="sw" class="swatch" style="background:#6d5efc"></span>
+      <p class="hint">value: <b id="cv">#6d5efc</b></p>
+    </div>
+    <div class="card">
+      <h2>Download</h2>
+      <p class="hint">Routes to a JavaFX <code>FileChooser</code>.</p>
+      <a class="dl" download="skia-fx-notes.txt"
+         href="data:text/plain;charset=utf-8,Saved%20from%20the%20skia-fx%20Blink%20WebView%20demo.">
+         Download notes.txt</a>
+    </div>
+    <div class="card full">
+      <h2>Multi-select</h2>
+      <p class="hint">A <code>&lt;select multiple&gt;</code> opens with check items + Done.</p>
+      <select id="multi" multiple size="4">
+        <option value="text">Text</option>
+        <option value="shapes" selected>Shapes</option>
+        <option value="images">Images</option>
+        <option value="effects">Effects</option>
+      </select>
+    </div>
+    <div class="card full tall">
+      <h2>Scroll room</h2>
+      <p class="hint">Extra height so you can open a &lt;select&gt; and scroll to
+         confirm the popup dismisses.</p>
+    </div>
+  </div>
+</body>
+</html>

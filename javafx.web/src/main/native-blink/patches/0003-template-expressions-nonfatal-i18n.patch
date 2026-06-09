@@ -1,0 +1,33 @@
+diff --git a/ui/base/template_expressions.cc b/ui/base/template_expressions.cc
+index d6f6a04..fe8d7ce 100644
+--- a/ui/base/template_expressions.cc
++++ b/ui/base/template_expressions.cc
+@@ -12,6 +12,7 @@
+ 
+ #include "base/check_op.h"
+ #include "base/compiler_specific.h"
++#include "base/logging.h"  // skia-fx: LOG(ERROR) for missing $i18n keys
+ #include "base/no_destructor.h"
+ #include "base/notreached.h"
+ #include "base/strings/escape.h"
+@@ -169,10 +170,16 @@ bool ReplaceTemplateExpressionsInternal(
+     CHECK(!key.empty());
+ 
+     auto value = replacements.find(key);
+-    CHECK(value != replacements.end()) << "$i18n replacement key \"" << key
+-                                       << "\" not found";
+-
+-    std::string replacement = value->second;
++    // skia-fx: a missing $i18n key is non-fatal during bring-up. The print-
++    // preview WebUI's string set is incomplete (placeholder strings + no full
++    // generated_resources/components_strings paks yet), and an unknown key would
++    // otherwise CHECK-crash the engine. Log it and substitute empty so the page
++    // still loads; the logged keys drive completing the string set.
++    if (value == replacements.end()) {
++      LOG(ERROR) << "[skia-fx] missing $i18n replacement key: \"" << key << "\"";
++    }
++    std::string replacement =
++        value != replacements.end() ? value->second : std::string();
+     if (is_javascript) {
+       // Run JS escaping first.
+       std::optional<char> last = formatted->empty()

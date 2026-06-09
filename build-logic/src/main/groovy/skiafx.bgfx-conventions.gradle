@@ -1,0 +1,115 @@
+/*
+ * skiafx.bgfx-conventions
+ *
+ * Provides the bgfx source tree (bgfx + bx + bimg) to the native build
+ * for the Skia 3D pipeline (docs/3D.md). bgfx is BSD-2 and built from
+ * source via CMake — there is no prebuilt binary to link, and the
+ * desktop backends we need (Direct3D12, Vulkan, native Metal) are all
+ * in-tree and open.
+ *
+ * We consume bgfx through `bkaradzic/bgfx.cmake`, the canonical
+ * public-domain CMake wrapper that bundles bgfx + bx + bimg as git
+ * submodules and exposes `bgfx`, `bx`, `bimg`, and `shaderc` CMake
+ * targets. Because the source lives in submodules, a GitHub source
+ * TARBALL would NOT include it — so we fetch with `git clone` +
+ * submodule update (mirrors the project's other git-based fetches).
+ *
+ * Resolution order for the bgfx directory (first hit wins):
+ *   1. `-PbgfxDir=...`              — Gradle property (CLI / properties file)
+ *   2. `OPENJFX_BGFX_DIR` env       — CI / offline / pre-vendored tree
+ *   3. fetchBgfx task git-clones widberg/bgfx.cmake @ the pinned ref
+ *      into build/generated/bgfx/<ref>/ (recursive).
+ *
+ * The native convention plugin reads `ext.bgfxDir` (set here) and passes
+ * it to CMake as -DOPENJFX_BGFX_DIR. The 3D CMakeLists guards on that
+ * directory's existence, so a build without bgfx (e.g. the Phase-1 stub)
+ * still succeeds. The plugin is OPTIONAL — apply it only on modules that
+ * build the 3D pipeline.
+ *
+ * NOTE (Phase 1): the skia3d library is a stub that does NOT yet link
+ * bgfx, so nothing here is on the critical build path and no clone runs
+ * unless a task explicitly depends on fetchBgfx (it doesn't yet). The
+ * fetch + nativeConfigure wiring is enabled in Phase 2.
+ */
+
+def libs = project.extensions.getByType(VersionCatalogsExtension).named('libs')
+def bgfxRef = providers.gradleProperty('bgfxRef')
+        .orElse(libs.findVersion('bgfx-cmake-ref').get().requiredVersion)
+        .get()
+def bgfxRepo = 'https://github.com/bkaradzic/bgfx.cmake.git'
+
+// User-supplied / pre-vendored tree (highest priority).
+def userDir = providers.gradleProperty('bgfxDir')
+        .orElse(providers.environmentVariable('OPENJFX_BGFX_DIR'))
+        .getOrNull()
+
+// Auto-fetched location, versioned by ref so switching refs never
+// collides with an older checkout.
+def autoDir = layout.buildDirectory.dir("generated/bgfx/${bgfxRef}")
+
+def fetchTask = tasks.register('fetchBgfx') {
+    group = 'build'
+    description = "Clone widberg/bgfx.cmake @ ${bgfxRef} (recursive: bgfx + bx + bimg) " +
+            "into ${autoDir.get().asFile.relativePath(rootDir)}"
+
+    inputs.property('bgfxRef', bgfxRef)
+    outputs.dir(autoDir)
+    outputs.upToDateWhen {
+        def d = autoDir.get().asFile
+        new File(d, 'CMakeLists.txt').exists() &&
+        new File(d, 'bgfx/src/bgfx.cpp').exists()
+    }
+
+    doLast {
+        def dir = autoDir.get().asFile
+        if (new File(dir, 'bgfx/src/bgfx.cpp').exists()) {
+            logger.lifecycle "[bgfx] reusing existing checkout at ${dir}"
+            return
+        }
+        if (dir.exists()) { dir.deleteDir() }
+        dir.parentFile.mkdirs()
+
+        // git clone (master) → detach at the pinned ref → recursive
+        // submodule update. We can't `clone --branch <sha>` (that flag
+        // only accepts branch/tag names), so clone then checkout the
+        // exact commit; the commit pins the bgfx/bx/bimg submodule SHAs.
+        def runGit = { List<String> cmd ->
+            def p = new ProcessBuilder(['git'] + cmd).redirectErrorStream(true).start()
+            p.inputStream.eachLine { logger.info "[bgfx.git] ${it}" }
+            if (p.waitFor() != 0) {
+                throw new GradleException(
+                    "[bgfx] 'git ${cmd.join(' ')}' failed (exit ${p.exitValue()}). " +
+                    "Ensure git is on PATH, or supply a pre-vendored tree via " +
+                    "-PbgfxDir / OPENJFX_BGFX_DIR. Pin: gradle/libs.versions.toml " +
+                    "(bgfx-cmake-ref).")
+            }
+        }
+
+        logger.lifecycle "[bgfx] cloning ${bgfxRepo}"
+        runGit(['clone', bgfxRepo, dir.absolutePath])
+        logger.lifecycle "[bgfx] checkout ${bgfxRef}"
+        runGit(['-C', dir.absolutePath, 'checkout', '--detach', bgfxRef])
+        logger.lifecycle "[bgfx] submodule update --init --recursive (bgfx + bx + bimg)"
+        runGit(['-C', dir.absolutePath, 'submodule', 'update', '--init', '--recursive'])
+        logger.lifecycle "[bgfx] checkout ready: ${dir}"
+    }
+}
+
+def resolvedDir
+if (userDir != null && !userDir.isBlank()) {
+    resolvedDir = userDir
+    logger.lifecycle "[bgfx] using user-supplied dir: ${resolvedDir}"
+} else {
+    resolvedDir = autoDir.get().asFile.absolutePath
+}
+ext.bgfxDir = resolvedDir
+ext.bgfxFetchTask = fetchTask
+
+// Make CMake configure depend on the fetch so bgfx is present before the
+// 3D lib configures/builds (only when auto-fetching; a user-supplied
+// -PbgfxDir / OPENJFX_BGFX_DIR tree is assumed already present).
+if (userDir == null || userDir.isBlank()) {
+    tasks.matching { it.name == 'nativeConfigure' }.configureEach {
+        dependsOn fetchTask
+    }
+}

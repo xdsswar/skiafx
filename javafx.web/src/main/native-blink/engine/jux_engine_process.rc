@@ -1,0 +1,37 @@
+// Copyright 2026 Xtreme Software Solutions. All rights reserved.
+// Windows resource script for skia-fx-webview.exe.
+// Embeds version information and application icon into the executable.
+
+#include <winver.h>
+
+// Application icon — shown in taskbar, Alt-Tab, Explorer, etc.
+// IDI_ICON 1 is the default icon resource ID that Windows picks up.
+IDI_ICON1 ICON "skia-fx.ico"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION 1,0,0,0
+PRODUCTVERSION 1,0,0,0
+FILEFLAGSMASK VS_FFI_FILEFLAGSMASK
+FILEFLAGS 0x0
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "skia-fx"
+            VALUE "FileDescription", "skia-fx WebView Engine (Blink) Subprocess"
+            VALUE "FileVersion", "1.0.0.0"
+            VALUE "InternalName", "skia-fx-webview"
+            VALUE "OriginalFilename", "skia-fx-webview.exe"
+            VALUE "ProductName", "skia-fx WebView"
+            VALUE "ProductVersion", "1.0.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 0x04B0
+    END
+END

@@ -1,0 +1,33 @@
+# Stub -- pruned directory, jux-engine build.
+# Provides empty targets and include path so transitive dependents compile.
+import("//build/buildflag_header.gni")
+import("//third_party/tflite/features.gni")
+
+config("tflite_public_include") {
+  include_dirs = [ "src" ]
+}
+
+buildflag_header("buildflags") {
+  header = "buildflags.h"
+  flags = [
+    "BUILD_TFLITE_WITH_XNNPACK=$build_tflite_with_xnnpack",
+    "BUILD_TFLITE_WITH_NNAPI=false",
+    "BUILD_TFLITE_WITH_OPENCL=false",
+  ]
+}
+
+group("tflite") {
+  public_configs = [ ":tflite_public_include" ]
+  public_deps = [ ":buildflags" ]
+}
+
+group("tflite_builtin_op_resolver") {
+  public_configs = [ ":tflite_public_include" ]
+}
+
+group("tflite_public_headers") {
+  public_configs = [ ":tflite_public_include" ]
+}
+
+config("tflite_config") {}
+config("tflite_config_no_undef") {}

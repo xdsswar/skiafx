@@ -1,0 +1,81 @@
+/*
+ * javafx.graphics — the main fork target.
+ *
+ * Layout:
+ *   - src/main/java/javafx/...                  — public API (copied from upstream)
+ *   - src/main/java/com/sun/prism/skia/...      — NEW Skia pipeline (ours)
+ *   - src/main/java/com/sun/prism/...           — Prism + selectively modified
+ *   - src/main/native-skia/                     — native Skia integration (CMake)
+ *   - src/main/native-prism/                    — legacy Prism natives (kept for v1 transition)
+ *
+ * All source is local; /jfx-master is reference-only.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'skiafx.native-conventions'
+    id 'skiafx.skia-conventions'
+    id 'skiafx.bgfx-conventions'
+    id 'skiafx.module-conventions'
+    id 'skiafx.test-conventions'
+    id 'skiafx.upstream-sync'
+    id 'skiafx.sdk-conventions'
+}
+
+upstream {
+    trackedFromJfxMaster 'modules/javafx.graphics'
+}
+
+dependencies {
+    api project(':javafx.base')
+    // Copy-tracking instrumentation is in-module
+    // (com.sun.prism.skia.impl.Copies) so a named JPMS module like
+    // javafx.graphics can reach it. The standalone tools:copy-counter
+    // subproject was removed.
+}
+
+// Generate JNI headers (com_sun_glass_*_*.h, com_sun_prism_*_*.h, etc.)
+// alongside compileJava. Glass + Prism SW + font + iio all #include
+// these into their .cpp files; the headers list the @native methods
+// each Java class declares, with the right Java_xxx_yyy_zzz mangled
+// names and JNI-mapped argument types.
+def jniHeaderDir = layout.buildDirectory.dir('generated/sources/headers/java/main')
+tasks.withType(JavaCompile).configureEach {
+    options.headerOutputDirectory.set(jniHeaderDir)
+}
+ext.jniHeaderDir = jniHeaderDir
+
+// TODO(phase-1): wire upstream tests (the `test/...` package tree)
+// once we've set up the cross-module test-utility source set
+// (test.javafx.util.* etc.). For now, restrict test compilation to
+// the Skia tests we wrote.
+sourceSets {
+    test {
+        java {
+            includes.add('com/sun/prism/skia/**')
+        }
+    }
+}
+
+// Point tests at the just-built native library, and ensure it exists
+// before tests run.
+tasks.named('test') {
+    dependsOn 'nativeBuild'
+    def libDir = layout.buildDirectory.dir("native/${nativePlatform}-${nativeArch}/lib")
+    doFirst {
+        def candidates = [
+            'libopenjfx_skia_shared.dll',
+            'openjfx_skia_shared.dll',
+            'libopenjfx_skia_shared.so',
+            'libopenjfx_skia_shared.dylib',
+        ]
+        def found = candidates
+            .collect { libDir.get().asFile.toPath().resolve(it) }
+            .find { java.nio.file.Files.exists(it) }
+        if (found != null) {
+            systemProperty 'openjfx.skia.nativeLib', found.toAbsolutePath().toString()
+        }
+    }
+}
+
+description = 'JavaFX graphics module (Skia-backed pipeline).'

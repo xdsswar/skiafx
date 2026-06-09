@@ -1,0 +1,20 @@
+/*
+ * build-logic — precompiled Groovy script plugins live in
+ * src/main/groovy/skiafx.<name>.gradle and surface to the main
+ * build with plugin id 'skiafx.<name>'.
+ */
+
+plugins {
+    id 'groovy-gradle-plugin'
+}
+
+dependencies {
+    // Plugins applied by our convention plugins must be on the
+    // build-logic classpath. Add them here as we wire each in.
+    // implementation 'com.github.ben-manes:gradle-versions-plugin:0.51.0'
+    // implementation 'org.gradle.toolchains:foojay-resolver:0.8.0'
+}
+
+// Make the catalog available inside precompiled script plugins.
+// Gradle exposes it automatically when versionCatalogs is declared in
+// settings.gradle of build-logic (already done).

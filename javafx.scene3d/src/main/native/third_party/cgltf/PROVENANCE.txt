@@ -1,0 +1,15 @@
+cgltf — single-file glTF 2.0 parser (C99)
+
+Upstream:  https://github.com/jkuhlmann/cgltf
+Version:   1.14   (tag v1.14)
+File:      cgltf.h  (vendored verbatim, byte-for-byte; DO NOT edit)
+Fetched:   2026-06-08
+License:   MIT (notice at the end of cgltf.h)
+
+Why vendored (not fetched at build time): cgltf is a single public-domain-
+style MIT header. Vendoring it keeps the build hermetic and network-free
+(CLAUDE.md: "No network access during build beyond the initial dependency
+fetch"). Re-sync by replacing cgltf.h with a newer tagged release and bumping
+the Version line above — keep it pristine so the diff against upstream stays
+trivial. CGLTF_IMPLEMENTATION is defined in exactly one translation unit
+(openjfx_model3d_bridge.cpp); this header is compiled there.

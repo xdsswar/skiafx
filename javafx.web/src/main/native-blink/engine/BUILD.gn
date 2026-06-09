@@ -1,0 +1,474 @@
+# Copied from F:\DEV\jux-framework-blink\engine\BUILD.gn (Chromium 147.0.7727.56)
+# on 2026-05-30. Modified for skia-fx: OUTPUT artifacts renamed to
+# skia-fx-webview.{dll,exe,pak}. Internal GN target names (jux_engine,
+# jux_engine_process, pak) and the //jux overlay label are unchanged — our
+# Chromium checkout is a fully isolated copy, so there is no collision.
+# See CLAUDE.md and docs/WEB_MODULE_BUILD.md.
+# =============================================================================
+# skia-fx-webview engine — GN build targets
+#
+# Produces two artifacts:
+#   skia-fx-webview.dll (.so/.dylib) — monolithic shared library containing the
+#       entire Chromium content layer (Blink, V8, compositor, GPU, network,
+#       media, print, DevTools protocol). All Chromium code is statically
+#       linked into this single library.
+#   skia-fx-webview(.exe) — single executable that serves as both the browser
+#       process (when called with <mmap-path>) and child process (when
+#       Chromium spawns it with --type= flags). Contains the IPC layer
+#       for communication with the Java side via shared memory.
+#
+# Copied into chromium/src/jux/ by ConfigureBuildTask before gn gen runs.
+# =============================================================================
+
+import("//build/config/features.gni")
+import("//build/config/ui.gni")
+import("//build/config/win/console_app.gni")
+import("//build/config/win/manifest.gni")
+import("//media/media_options.gni")
+import("//mojo/public/tools/bindings/mojom.gni")
+# skia-fx: brings enable_printing / enable_print_preview into scope so the
+# printing dep + SFXWEB_ENABLE_PRINTING define can be gated on the GN flags
+# emitted from -Pchromium.feature.printing / .printPreview.
+import("//printing/buildflags/buildflags.gni")
+import("//tools/grit/repack.gni")
+import("//tools/v8_context_snapshot/v8_context_snapshot.gni")
+
+# -----------------------------------------------------------------------------
+# jux_dom_mojom — Mojo interface for browser ↔ renderer DOM manipulation.
+#
+# Generates jux/jux_dom.mojom.{h,cc} C++ bindings used by jux-engine.dll.
+# -----------------------------------------------------------------------------
+mojom("jux_dom_mojom") {
+  sources = [ "jux_dom.mojom" ]
+
+  public_deps = [
+    "//mojo/public/mojom/base",
+  ]
+}
+
+# jux_pdf_mojom — renderer→browser interface so the print-preview PDF plugin can
+# fetch the generated preview PDF from the browser (the chrome://print/pdf frame
+# can't fetch the cross-scheme chrome-untrusted byte-server). Only depended on
+# under enable_print_preview, so the default build never builds it.
+mojom("jux_pdf_mojom") {
+  sources = [ "jux_pdf.mojom" ]
+  public_deps = [ "//mojo/public/mojom/base" ]
+}
+
+# jux_pdf_plugin — the in-renderer print-preview PDF plugin, compiled SEPARATELY
+# from jux_engine because it pulls gin (via chrome_pdf::PostMessageReceiver, the
+# viewer-scripting receiver) which the Blink-GC clang plugin — applied to
+# jux_engine via its //third_party/blink/renderer/core dep — rejects. This target
+# does NOT depend on renderer/core, so the GC plugin doesn't run on it. jux_engine
+# creates the plugin through jux_pdf_plugin_factory.h. Only built under print
+# preview (the default engine build never references it).
+if (enable_print_preview) {
+  source_set("jux_pdf_plugin") {
+    sources = [
+      "jux_pdf_plugin.cc",
+      "jux_pdf_plugin.h",
+      "jux_pdf_plugin_factory.h",
+    ]
+    deps = [
+      ":jux_pdf_mojom",
+      "//base",
+      "//cc/paint",
+      "//content/public/renderer",
+      "//gin",
+      "//pdf",
+      "//skia",
+      "//third_party/blink/public:blink",
+      "//ui/gfx",
+      "//ui/gfx/geometry",
+      "//v8",
+    ]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# jux_engine — monolithic shared library
+#
+# With is_component_build = false, all component() targets resolve to
+# static_library, so everything gets linked into this single .dll/.so.
+# Only functions marked JUX_EXPORT are visible to external callers.
+# -----------------------------------------------------------------------------
+shared_library("jux_engine") {
+  output_name = "skia-fx-webview"
+
+  sources = [
+    "jux_engine_export.h",
+    "jux_engine_api.h",
+    "jux_engine_api.cc",
+    "jux_content_client.h",
+    "jux_content_client.cc",
+    "jux_content_utility_client.h",
+    "jux_content_utility_client.cc",
+    "jux_main_delegate.h",
+    "jux_main_delegate.cc",
+    "jux_browser_client.h",
+    "jux_browser_client.cc",
+    "jux_browser_main_parts.h",
+    "jux_browser_main_parts.cc",
+    "jux_web_contents_delegate.h",
+    "jux_web_contents_delegate.cc",
+    "jux_js_dialog_manager.h",
+    "jux_js_dialog_manager.cc",
+    "jux_permission_manager.h",
+    "jux_permission_manager.cc",
+    "jux_login_delegate.h",
+    "jux_login_delegate.cc",
+    "jux_download_manager_delegate.h",
+    "jux_download_manager_delegate.cc",
+    "jux_network_interceptor.h",
+    "jux_network_interceptor.cc",
+    "jux_url_loader_throttle.h",
+    "jux_url_loader_throttle.cc",
+    "jux_proxying_url_loader_factory.h",
+    "jux_proxying_url_loader_factory.cc",
+    "jux_browser_context.h",
+    "jux_browser_context.cc",
+    "jux_views_delegate.h",
+    "jux_views_delegate.cc",
+    "jux_renderer_client.h",
+    "jux_renderer_client.cc",
+
+    # IPC layer — moved from the executable into the DLL so all Chromium
+    # code lives in a single binary. This prevents duplicate //base and
+    # //content symbols when the exe links these deps directly, which
+    # caused child process crashes (access violation from conflicting
+    # global state between the exe's and DLL's copies of //base).
+    "jux_ipc.h",
+    "jux_ipc.cc",
+    "jux_ring_buffer.h",
+    "jux_ring_buffer.cc",
+    "jux_heartbeat.h",
+    "jux_heartbeat.cc",
+    "jux_event_types.h",
+    "jux_command_types.h",
+    "jux_command_dispatch.h",
+    "jux_command_dispatch.cc",
+    "jux_widget_delegate.h",
+    "jux_widget_delegate.cc",
+    "jux_widget_observer.h",
+    "jux_widget_observer.cc",
+
+    # Windows custom chrome (WM_NCCALCSIZE + WM_NCHITTEST subclass).
+    # All code is guarded by #if BUILDFLAG(IS_WIN) so non-Windows
+    # builds compile to empty translation units.
+    "jux_chrome_subclass.h",
+    "jux_chrome_subclass.cc",
+
+    # DOM Mojo bridge (Phase 3).
+    "jux_dom_handler_impl.h",
+    "jux_dom_handler_impl.cc",
+    "jux_dom_client_impl.h",
+    "jux_dom_client_impl.cc",
+
+    # JavaScript object bridge (netscape.javascript.JSObject) — tagged-value
+    # codec shared by executeScript + all JSObject ops.
+    "jux_js_value.h",
+    "jux_js_value.cc",
+  ]
+
+  defines = [ "JUX_ENGINE_IMPLEMENTATION" ]
+
+  deps = [
+    "//base",
+    # skia-fx OSR HiDPI: RenderWidgetHostViewBase::SetScaleOverrideForCapture
+    # (per-view device-scale override) lives in this internal target. The
+    # configureBuild step patches content/browser's visibility list to allow
+    # //jux (see patchContentBrowserVisibility).
+    "//content/browser",
+    "//content/public/app",
+    "//content/public/browser",
+    "//content/public/child",
+    "//content/public/common",
+    "//content/public/gpu",
+    "//content/public/renderer",
+    "//content/public/utility",
+    "//media",
+    "//net",
+    "//sandbox",
+    "//services/network:network_service",
+    "//third_party/blink/public:blink",
+    # Reach into blink renderer/core for real DOM manipulation and
+    # event listener registration (no JS injection). This is a
+    # layering exception explicitly for jux_dom_handler_impl.cc — it
+    # uses WebNode::Unwrap<Element>() + internal Element/EventTarget
+    # APIs that the public web/ surface doesn't expose.
+    "//third_party/blink/renderer/core:core",
+    "//ui/base",
+    "//ui/base/ime/init",
+    "//ui/display",
+    "//ui/gfx",
+    "//ui/platform_window",
+    "//ui/shell_dialogs",
+    "//ui/views",
+    "//ui/views/controls/webview",
+    "//url",
+    "//v8",
+
+    # Link resolution for transitive deps pulled in by the content layer.
+    "//components/metrics/private_metrics",
+    "//components/variations/proto",
+
+    # Default User-Agent string + client-hint metadata (BuildUnifiedPlatform
+    # UserAgentFromProduct / GetUserAgentMetadata) used by JuxBrowserClient.
+    "//components/embedder_support:user_agent",
+
+    # DownloadItem / DownloadTargetInfo used by JuxDownloadManagerDelegate.
+    "//components/download/public/common:public",
+
+    # Jux DOM Mojo bindings (Phase 3).
+    ":jux_dom_mojom",
+  ]
+
+  # skia-fx: printing/PDF/print-preview are OPT-IN (off by default for size).
+  # Enable with -Pchromium.feature.pdf=true -Pchromium.feature.printing=true
+  # [-Pchromium.feature.printPreview=true]; those emit enable_pdf / enable_printing
+  # / enable_print_preview into args.gn. This block is INERT when the flags are
+  # off, so the default engine build is byte-identical and the rest is
+  # unaffected. When ON it restores the //printing dep and defines
+  # SFXWEB_ENABLE_PRINTING so the guarded print handlers (jux_command_dispatch.cc,
+  # jux_dom_client_impl.cc) compile.
+  if (enable_printing) {
+    deps += [ "//printing" ]
+    defines += [ "SFXWEB_ENABLE_PRINTING" ]
+  }
+
+  # skia-fx: Chrome print-preview (chrome://print) ported as a content-layer
+  # target and rendered off-screen. Pulled in only when print preview is on
+  # (the target itself asserts enable_print_preview). The source tree lives at
+  # javafx.web/src/main/native-blink/print_preview/ and is copied to
+  # chromium/src/jux/print_preview/ by ConfigureBuildTask. INERT by default.
+  if (enable_print_preview) {
+    # When print preview is on, window.print()/Ctrl+P is owned by the preview
+    # (PrintRenderFrameHelper → PrintViewManager → chrome://print). The legacy
+    # native-OS-dialog path in jux_dom_client_impl.cc must NOT also fire, or the
+    # user gets two dialogs. This define suppresses it.
+    defines += [ "SFXWEB_ENABLE_PRINT_PREVIEW" ]
+    deps += [ "//jux/print_preview:jux_print_preview" ]
+    # Renderer→browser PDF byte fetch for the in-renderer print-preview PDF plugin.
+    deps += [ ":jux_pdf_mojom" ]
+    # chrome PrintingService (PdfNupConverter) hosted in a utility process by
+    # JuxContentUtilityClient — drives print preview's pages-per-sheet (N-up)
+    # conversion (PdfNupConverterClient::DoNupPdfConvert). Without it N-up fails.
+    deps += [
+      "//chrome/services/printing:lib",
+      "//chrome/services/printing/public/mojom",
+    ]
+    # PrintCompositor service + per-WebContents client + the print_to_pdf helper
+    # (print_to_pdf::PdfPrintJob / GetPrintPagesParams), for headless page→PDF
+    # used by WebEngine.print()/print(location).
+    deps += [
+      "//components/printing/browser",
+      "//components/printing/browser/print_to_pdf",
+      "//components/services/print_compositor",
+      "//components/services/print_compositor/public/mojom",
+    ]
+    # JuxBrowserContext becomes a Profile with an in-memory PrefService holding
+    # the print-preview prefs (see jux_browser_context.cc); needs the prefs +
+    # syncable-registry + user_prefs components.
+    deps += [
+      "//components/pref_registry",
+      "//components/prefs",
+      "//components/user_prefs",
+    ]
+    # Renderer-side print pipeline: PrintRenderFrameHelper (created per frame by
+    # JuxRendererClient) drives window.print()/Ctrl+P → PrintManagerHost.
+    deps += [ "//components/printing/renderer" ]
+    # Print-preview document rendering. JuxRendererClient::OverrideCreatePlugin
+    # routes the <embed application/x-google-chrome-pdf> to our JuxPdfPlugin,
+    # which rasterizes the generated preview PDF with chrome_pdf (//pdf, PDFium)
+    # and paints it — sidestepping the OOPIF-only pdf::CreateInternalPlugin that
+    # our lean engine (extensions/guest_view OFF, no PDF process) cannot satisfy.
+    # Built with enable_pdf_ink2=false (third_party/ink absent — see gradle.properties).
+    sources += [
+      # Skia-rendered <select> drop-down for the preview's own <select> controls
+      # (their native Blink popup can't composite off-screen). See
+      # jux_select_dropdown.{h,cc} + jux_engine_api.cc OpenPreviewSelectDropdown.
+      "jux_select_dropdown.cc",
+      "jux_select_dropdown.h",
+    ]
+    # JuxPdfPlugin is built in the separate ":jux_pdf_plugin" source_set (GC-plugin
+    # free); this target reaches it only through jux_pdf_plugin_factory.h.
+    deps += [
+      ":jux_pdf_plugin",
+      "//components/pdf/renderer",
+      "//pdf",
+    ]
+    # components/pdf/renderer's PdfViewWebPluginClient includes the screen_ai
+    # (accessibility OCR) mojom UNCONDITIONALLY, but it only deps it under
+    # enable_screen_ai_service — and that mojom target assert()s the flag. So the
+    # flag must be ON (set in gradle.properties: chromium.gn.enable_screen_ai_service=true)
+    # for the include to resolve.
+  }
+
+  if (is_win) {
+    ldflags = [
+      "/WHOLEARCHIVE:obj/components/variations/proto/proto.lib",
+    ]
+  }
+
+  if (is_win) {
+    deps += [
+      "//content:sandbox_helper_win",
+      "//sandbox/win:sandbox",
+    ]
+  }
+
+  if (use_aura) {
+    deps += [
+      "//ui/aura",
+      "//ui/events",
+      "//ui/wm",
+    ]
+  }
+
+  if (use_ozone) {
+    deps += [ "//ui/ozone" ]
+  }
+}
+
+# -----------------------------------------------------------------------------
+# jux_engine_process — thin dual-mode executable (browser + child process)
+#
+# Zero Chromium dependencies — all Chromium code lives in jux-engine.dll.
+# The exe only calls JuxRunBrowser() and JuxSubprocessMain() via the DLL's
+# import library. This prevents duplicate //base and //content symbols that
+# previously caused child process crashes.
+#
+#   - Browser process: called with <mmap-path> → delegates to JuxRunBrowser
+#   - Child process: called with --type= → delegates to JuxSubprocessMain
+# -----------------------------------------------------------------------------
+executable("jux_engine_process") {
+  output_name = "skia-fx-webview"
+
+  sources = [
+    # Thin entry point — zero Chromium dependencies. All Chromium code
+    # lives exclusively in jux-engine.dll. The exe only calls exported
+    # C functions (JuxRunBrowser, JuxSubprocessMain) via import library.
+    "jux_engine_process.cc",
+  ]
+
+  deps = [
+    ":jux_engine",
+    "//build/win:default_exe_manifest",
+  ]
+
+  if (is_win) {
+    sources += [ "jux_engine_process.rc" ]
+
+    # Subsystem WINDOWS — no console window.
+    if (!win_console_app) {
+      configs -= [ "//build/config/win:console" ]
+      configs += [ "//build/config/win:windowed" ]
+    }
+  }
+
+  data_deps = [
+    ":pak",
+    "//tools/v8_context_snapshot",
+  ]
+}
+
+# -----------------------------------------------------------------------------
+# Resource pak — merged resource file for Blink, UI, and DevTools
+#
+# Contains all .pak files the content layer needs at runtime: Blink resources,
+# strings, DevTools frontend, UI resources.
+# -----------------------------------------------------------------------------
+repack("pak") {
+  sources = [
+    "$root_gen_dir/base/tracing/protos/tracing_proto_resources.pak",
+    "$root_gen_dir/content/content_resources.pak",
+    "$root_gen_dir/content/gpu_resources.pak",
+    "$root_gen_dir/content/browser/resources/media/media_internals_resources.pak",
+    # WebRTC internals removed — enable_webrtc = false.
+    # "$root_gen_dir/content/browser/webrtc/resources/webrtc_internals_resources.pak",
+    "$root_gen_dir/mojo/public/js/mojo_bindings_resources.pak",
+    "$root_gen_dir/net/net_resources.pak",
+    "$root_gen_dir/third_party/blink/public/resources/blink_resources.pak",
+    "$root_gen_dir/third_party/blink/public/resources/blink_scaled_resources_100_percent.pak",
+    "$root_gen_dir/third_party/blink/public/resources/inspector_overlay_resources.pak",
+    "$root_gen_dir/third_party/blink/public/strings/blink_strings_en-US.pak",
+    "$root_gen_dir/third_party/blink/public/strings/permission_element_generated_strings.pak",
+    "$root_gen_dir/third_party/blink/public/strings/permission_element_strings_en-US.pak",
+    "$root_gen_dir/ui/resources/ui_lottie_resources.pak",
+    "$root_gen_dir/ui/resources/ui_resources_100_percent.pak",
+    "$root_gen_dir/ui/strings/app_locale_settings_en-US.pak",
+    "$root_gen_dir/ui/strings/auto_image_annotation_strings_en-US.pak",
+    "$root_gen_dir/ui/strings/ax_strings_en-US.pak",
+    "$root_gen_dir/ui/strings/ui_strings_en-US.pak",
+    # webui_resources.pak removed — Chrome browser UI framework (Lit, Polymer,
+    # composebox, etc.). Not needed by the content layer. DevTools has its own
+    # resource system via //content/browser/devtools:devtools_resources.
+  ]
+
+  deps = [
+    "//base/tracing/protos:chrome_track_event_resources",
+    "//content:content_resources",
+    "//content/browser/resources",
+    "//content/browser/resources/media:resources",
+    "//mojo/public/js:resources",
+    "//net:net_resources",
+    "//third_party/blink/public:devtools_inspector_resources",
+    "//third_party/blink/public:resources",
+    "//third_party/blink/public:scaled_resources_100_percent",
+    "//third_party/blink/public/strings",
+    "//third_party/blink/public/strings:permission_element_generated_strings",
+    "//third_party/blink/public/strings:permission_element_strings",
+    "//ui/resources",
+    "//ui/strings",
+  ]
+
+  # DevTools frontend resources EXCLUDED — the frontend UI (~30-40 MB)
+  # is not shipped. The DevTools protocol server (CDP) is still built
+  # into the content layer at zero extra cost. Use Chrome's DevTools
+  # UI via remote debugging: --remote-debugging-port=9222, then open
+  # chrome://inspect in Chrome to connect.
+  #
+  # To re-enable the built-in frontend, uncomment:
+  # if (!is_android && !is_fuchsia && !is_ios) {
+  #   sources +=
+  #       [ "$root_gen_dir/content/browser/devtools/devtools_resources.pak" ]
+  #   deps += [ "//content/browser/devtools:devtools_resources" ]
+  # }
+
+  # Tracing internals removed — requires ts-proto node module for
+  # TypeScript proto generation. Not needed for content embedding.
+  # sources += [
+  #   "$root_gen_dir/content/browser/tracing/tracing_resources.pak",
+  #   "$root_gen_dir/content/traces_internals_resources.pak",
+  # ]
+  # deps += [ "//content/browser/tracing:resources" ]
+
+  # skia-fx: under print preview, re-add the Chrome WebUI framework pak (Lit/
+  # Polymer/cr_elements — stripped above by default) plus the chrome://print
+  # Polymer UI pak, so the off-screen print-preview WebUI has its assets. Gated,
+  # so the default engine build stays byte-identical.
+  if (enable_print_preview) {
+    sources += [
+      "$root_gen_dir/ui/webui/resources/webui_resources.pak",
+      "$root_gen_dir/chrome/print_preview_resources.pak",
+      # The print-preview app embeds the PDF viewer; print_preview.js imports
+      # chrome://print/pdf/* (pdf_scripting_api.js etc.). Those paths are served
+      # by the UI data source via pdf_extension_util::GetResources() and must be
+      # present in the pak or the module graph aborts (app never boots).
+      "$root_gen_dir/chrome/pdf_resources.pak",
+      # English UI strings: components_strings (IDS_CANCEL etc., real grit ids) +
+      # our generated print-preview strings (IDS_PRINT_PREVIEW_*, ids matching the
+      # generated_resources.h stub; built by _genpak from printing_strings.grdp).
+      "$root_gen_dir/components/strings/components_strings_en-US.pak",
+      "//jux/print_preview/print_preview_strings_en-US.pak",
+    ]
+    deps += [
+      "//chrome/browser/resources/print_preview:resources",
+      "//chrome/browser/resources/pdf:resources",
+      "//ui/webui/resources:resources",
+      "//components/strings",
+    ]
+  }
+
+  output = "$root_out_dir/skia-fx-webview.pak"
+}

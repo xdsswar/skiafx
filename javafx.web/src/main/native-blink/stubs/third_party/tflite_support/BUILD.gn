@@ -1,0 +1,13 @@
+# Stub -- pruned directory, jux-engine build.
+
+config("tflite_support_include") {
+  include_dirs = [ "src" ]
+}
+
+group("tflite_support") {
+  public_configs = [ ":tflite_support_include" ]
+}
+
+group("tflite_support_proto") {
+  public_configs = [ ":tflite_support_include" ]
+}

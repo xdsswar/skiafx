@@ -1,0 +1,668 @@
+/*
+ * Nebula Workspace — CustomTitleBarDemo theme.
+ *
+ * Layout: a full-height navigation rail on the left (top-to-bottom),
+ * a content column on the right whose top strip carries the window
+ * buttons in the corner. Dark surface, cyan/blue accent.
+ */
+
+* {
+    -fx-font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+    -fx-font-smoothing-type: gray;
+}
+
+.root-pane {
+    -fx-background-color: #0e1116;
+}
+
+/* Shared accent gradient. */
+/* (#34d8e6 -> #2b8cf0) */
+
+/* =================================================== navigation rail */
+
+.nav-rail {
+    -fx-background-color: #0b0e13;
+    -fx-border-color: transparent rgba(255,255,255,0.06) transparent transparent;
+    -fx-border-width: 0 1 0 0;
+}
+
+.nav-header {
+    -fx-min-height: 44;
+    -fx-pref-height: 44;
+    -fx-padding: 0 0 0 18;
+}
+
+.app-mark {
+    -fx-background-color: linear-gradient(to bottom right, #34d8e6, #2b8cf0);
+    -fx-background-radius: 5;
+}
+
+.nav-brand {
+    -fx-text-fill: #f5f7fb;
+    -fx-font-size: 15px;
+    -fx-font-weight: 800;
+}
+
+.nav-items {
+    -fx-padding: 12 10 12 10;
+}
+
+/* Nav entries are ToggleButtons styled as full-width list rows. */
+.nav-button {
+    -fx-background-color: transparent;
+    -fx-background-radius: 8;
+    -fx-padding: 9 12 9 13;
+    -fx-cursor: hand;
+    -fx-alignment: center-left;
+}
+
+.nav-button:hover {
+    -fx-background-color: rgba(255,255,255,0.05);
+}
+
+.nav-button:selected {
+    -fx-background-color: rgba(52,216,230,0.12);
+}
+
+.nav-label {
+    -fx-text-fill: #aeb8c7;
+    -fx-font-size: 13px;
+    -fx-font-weight: 600;
+}
+
+.nav-button:selected .nav-label {
+    -fx-text-fill: #eaf6ff;
+}
+
+.nav-icon {
+    -fx-fill: transparent;
+    -fx-stroke: #8893a4;
+    -fx-stroke-width: 1.8;
+    -fx-stroke-line-cap: round;
+    -fx-stroke-line-join: round;
+}
+
+.nav-button:selected .nav-icon {
+    -fx-stroke: #34d8e6;
+}
+
+.nav-rail .separator *.line {
+    -fx-border-color: rgba(255,255,255,0.07);
+    -fx-border-insets: 6 12 6 12;
+}
+
+/* Logged-in user cell pinned to the bottom of the rail. */
+.user-cell {
+    -fx-background-color: rgba(255,255,255,0.02);
+    -fx-border-color: rgba(255,255,255,0.06) transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+}
+
+.user-name {
+    -fx-text-fill: #e7ecf4;
+    -fx-font-size: 12.5px;
+    -fx-font-weight: 700;
+}
+
+.user-sub {
+    -fx-text-fill: #6b7686;
+    -fx-font-size: 11px;
+}
+
+/* ===================================================== content column */
+
+.content-column {
+    -fx-background-color: #0e1116;
+}
+
+.top-strip {
+    -fx-background-color: #0e1116;
+    -fx-border-color: transparent transparent rgba(255,255,255,0.06) transparent;
+    -fx-border-width: 0 0 1 0;
+}
+
+.crumb {
+    -fx-text-fill: #e7ecf4;
+    -fx-font-size: 14px;
+    -fx-font-weight: 700;
+}
+
+.search-field {
+    -fx-background-color: rgba(255,255,255,0.05);
+    -fx-background-radius: 8;
+    -fx-text-fill: #e7ecf4;
+    -fx-prompt-text-fill: #6b7686;
+    -fx-font-size: 12.5px;
+    -fx-padding: 7 12 7 12;
+    -fx-border-color: rgba(255,255,255,0.08);
+    -fx-border-radius: 8;
+    -fx-border-width: 1;
+}
+
+.search-field:focused {
+    -fx-border-color: #2b8cf0;
+    -fx-background-color: rgba(255,255,255,0.07);
+}
+
+/* ===================================================== window buttons */
+
+.win-buttons {
+    -fx-padding: 0;
+}
+
+.win-btn {
+    -fx-background-color: transparent;
+    -fx-cursor: hand;
+    -fx-alignment: center;
+}
+
+/* The collapse (hamburger) toolbar button reads as a normal icon button. */
+.rail-toggle {
+    -fx-background-radius: 8;
+    -fx-min-width: 36;
+    -fx-pref-width: 36;
+    -fx-max-width: 36;
+    -fx-min-height: 32;
+    -fx-pref-height: 32;
+    -fx-max-height: 32;
+}
+
+.rail-toggle:hover {
+    -fx-background-color: rgba(255,255,255,0.06);
+}
+
+/* Caption glyphs: stroked outlines, no fill. */
+.ctb-icon {
+    -fx-fill: transparent;
+    -fx-stroke: #cfd6e2;
+    -fx-stroke-width: 1;
+    -fx-stroke-line-cap: round;
+    -fx-stroke-line-join: round;
+}
+
+.rail-toggle .nav-icon {
+    -fx-stroke: #aeb8c7;
+}
+
+/* Hover feedback driven by native WM_NCHITTEST + :ht-* pseudo-classes
+   set by CustomDecorations.updateHovered. */
+.win-btn-min:ht-min,
+.win-btn-max:ht-max {
+    -fx-background-color: rgba(255,255,255,0.08);
+}
+
+.win-btn-close:ht-close {
+    -fx-background-color: #e81123;
+}
+
+.win-btn-close:ht-close .ctb-icon {
+    -fx-stroke: #ffffff;
+}
+
+/* ============================================================ content */
+
+.page-scroll,
+.page-scroll > .viewport {
+    -fx-background-color: transparent;
+}
+
+.page-scroll {
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
+
+.content .heading {
+    -fx-text-fill: #f5f7fb;
+    -fx-font-size: 24px;
+    -fx-font-weight: 800;
+}
+
+.content .subtitle {
+    -fx-text-fill: #9aa6b7;
+    -fx-font-size: 13.5px;
+}
+
+/* ============================================================== cards */
+
+.card-row {
+    -fx-padding: 2 0 2 0;
+}
+
+.card,
+.panel {
+    -fx-background-color: #161b24;
+    -fx-background-radius: 12;
+    -fx-border-color: rgba(255,255,255,0.06);
+    -fx-border-radius: 12;
+    -fx-border-width: 1;
+}
+
+.panel {
+    -fx-padding: 18;
+}
+
+.panel-title {
+    -fx-text-fill: #e7ecf4;
+    -fx-font-size: 14px;
+    -fx-font-weight: 700;
+    -fx-padding: 0 0 4 0;
+}
+
+/* ------- stat / KPI cards */
+
+.stat-label {
+    -fx-text-fill: #8593a6;
+    -fx-font-size: 12px;
+    -fx-font-weight: 600;
+}
+
+.stat-value {
+    -fx-text-fill: #f5f7fb;
+    -fx-font-size: 28px;
+    -fx-font-weight: 800;
+}
+
+.stat-delta {
+    -fx-font-size: 11.5px;
+    -fx-font-weight: 700;
+}
+
+.delta-up   { -fx-text-fill: #46d39a; }
+.delta-down { -fx-text-fill: #ff6b81; }
+
+/* ------- activity feed */
+
+.act-row {
+    -fx-padding: 6 2 6 2;
+}
+
+.act-row .text {
+    -fx-fill: #aeb8c7;
+    -fx-font-size: 12.5px;
+}
+
+.act-who {
+    -fx-fill: #f5f7fb;
+    -fx-font-weight: 700;
+}
+
+.act-when {
+    -fx-text-fill: #6b7686;
+    -fx-font-size: 11px;
+}
+
+/* ============================================================ avatars */
+
+.avatar-bg {
+    -fx-fill: linear-gradient(to bottom right, #34d8e6, #2b8cf0);
+}
+
+.av-mail   { -fx-fill: linear-gradient(to bottom right, #7c5cff, #5b7bff); }
+.av-feed   { -fx-fill: linear-gradient(to bottom right, #34d8e6, #2b8cf0); }
+.av-member { -fx-fill: linear-gradient(to bottom right, #ffae5c, #ff6b81); }
+.av-user   { -fx-fill: linear-gradient(to bottom right, #46d39a, #2bb0f0); }
+
+.avatar-text {
+    -fx-text-fill: #06131c;
+    -fx-font-size: 12px;
+    -fx-font-weight: 800;
+}
+
+/* =========================================================== mail list */
+
+.mail-list {
+    -fx-background-color: #161b24;
+    -fx-background-radius: 12;
+    -fx-border-color: rgba(255,255,255,0.06);
+    -fx-border-radius: 12;
+    -fx-border-width: 1;
+    -fx-padding: 6;
+}
+
+.mail-list .list-cell {
+    -fx-background-color: transparent;
+    -fx-background-radius: 8;
+    -fx-padding: 0 4 0 4;
+}
+
+.mail-list .list-cell:filled:hover {
+    -fx-background-color: rgba(255,255,255,0.04);
+}
+
+.mail-list .list-cell:filled:selected {
+    -fx-background-color: rgba(52,216,230,0.12);
+}
+
+.mail-from    { -fx-text-fill: #f5f7fb; -fx-font-size: 13px; -fx-font-weight: 700; }
+.mail-time    { -fx-text-fill: #6b7686; -fx-font-size: 11px; }
+.mail-subject { -fx-text-fill: #cdd6e2; -fx-font-size: 12.5px; -fx-font-weight: 600; }
+.mail-preview { -fx-text-fill: #7c869a; -fx-font-size: 12px; }
+
+.read-from    { -fx-text-fill: #8593a6; -fx-font-size: 12px; -fx-font-weight: 600; }
+.read-subject { -fx-text-fill: #f5f7fb; -fx-font-size: 20px; -fx-font-weight: 800; }
+.read-body    { -fx-text-fill: #aeb8c7; -fx-font-size: 13px; -fx-line-spacing: 4; }
+
+/* =============================================================== table */
+
+.table-view {
+    -fx-background-color: transparent;
+    -fx-table-cell-border-color: transparent;
+    -fx-padding: 4;
+}
+
+.table-view .column-header-background {
+    -fx-background-color: transparent;
+    -fx-background-radius: 8 8 0 0;
+}
+
+.table-view .column-header,
+.table-view .filler {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent transparent rgba(255,255,255,0.08) transparent;
+    -fx-border-width: 0 0 1 0;
+    -fx-size: 38;
+}
+
+.table-view .column-header .label {
+    -fx-text-fill: #8593a6;
+    -fx-font-size: 11.5px;
+    -fx-font-weight: 700;
+    -fx-alignment: center-left;
+}
+
+.table-view .table-row-cell {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent transparent rgba(255,255,255,0.05) transparent;
+    -fx-border-width: 0 0 1 0;
+    -fx-cell-size: 46;
+}
+
+.table-view .table-row-cell:hover {
+    -fx-background-color: rgba(255,255,255,0.03);
+}
+
+.table-view .table-row-cell:selected {
+    -fx-background-color: rgba(52,216,230,0.10);
+}
+
+.table-view .table-cell {
+    -fx-text-fill: #cdd6e2;
+    -fx-font-size: 12.5px;
+    -fx-alignment: center-left;
+    -fx-border-color: transparent;
+    -fx-padding: 0 8 0 8;
+}
+
+/* ------- status badges */
+
+.badge {
+    -fx-padding: 3 10 3 10;
+    -fx-background-radius: 20;
+    -fx-font-size: 11px;
+    -fx-font-weight: 700;
+}
+
+.badge-on-track { -fx-background-color: rgba(70,211,154,0.16); -fx-text-fill: #46d39a; }
+.badge-at-risk  { -fx-background-color: rgba(255,174,92,0.16); -fx-text-fill: #ffae5c; }
+.badge-blocked  { -fx-background-color: rgba(255,107,129,0.16); -fx-text-fill: #ff6b81; }
+.badge-done     { -fx-background-color: rgba(123,140,170,0.16); -fx-text-fill: #aab6c8; }
+
+/* ------- progress bar */
+
+.progress-bar > .track {
+    -fx-background-color: rgba(255,255,255,0.08);
+    -fx-background-radius: 6;
+}
+
+.progress-bar > .bar {
+    -fx-background-color: linear-gradient(to right, #34d8e6, #2b8cf0);
+    -fx-background-radius: 6;
+    -fx-padding: 4;
+}
+
+/* ======================================================= member cards */
+
+.member-card {
+    -fx-cursor: hand;
+}
+
+.member-card:hover {
+    -fx-border-color: rgba(52,216,230,0.4);
+}
+
+.member-name { -fx-text-fill: #f5f7fb; -fx-font-size: 14px; -fx-font-weight: 700; }
+.member-role { -fx-text-fill: #8593a6; -fx-font-size: 12px; }
+.member-status { -fx-font-size: 11px; -fx-font-weight: 700; }
+.member-status.online  { -fx-text-fill: #46d39a; }
+.member-status.offline { -fx-text-fill: #6b7686; }
+
+/* =============================================================== forms */
+
+.form-row {
+    -fx-border-color: transparent transparent rgba(255,255,255,0.05) transparent;
+    -fx-border-width: 0 0 1 0;
+}
+
+.form-label {
+    -fx-text-fill: #aeb8c7;
+    -fx-font-size: 13px;
+    -fx-font-weight: 600;
+}
+
+.text-field,
+.combo-box {
+    -fx-background-color: rgba(255,255,255,0.05);
+    -fx-background-radius: 8;
+    -fx-border-color: rgba(255,255,255,0.08);
+    -fx-border-radius: 8;
+    -fx-border-width: 1;
+    -fx-text-fill: #e7ecf4;
+    -fx-font-size: 12.5px;
+    -fx-prompt-text-fill: #6b7686;
+}
+
+.text-field { -fx-padding: 7 12 7 12; }
+
+.text-field:focused,
+.combo-box:focused {
+    -fx-border-color: #2b8cf0;
+}
+
+.combo-box .list-cell {
+    -fx-text-fill: #e7ecf4;
+    -fx-background-color: transparent;
+    -fx-padding: 5 10 5 10;
+}
+
+.combo-box-popup .list-view {
+    -fx-background-color: #161b24;
+    -fx-border-color: rgba(255,255,255,0.1);
+    -fx-border-radius: 8;
+    -fx-background-radius: 8;
+}
+
+.combo-box-popup .list-cell:filled:hover {
+    -fx-background-color: rgba(52,216,230,0.12);
+}
+
+.check-box {
+    -fx-text-fill: #cdd6e2;
+    -fx-font-size: 13px;
+}
+
+.check-box .box {
+    -fx-background-color: rgba(255,255,255,0.06);
+    -fx-border-color: rgba(255,255,255,0.18);
+    -fx-border-radius: 4;
+    -fx-background-radius: 4;
+}
+
+.check-box:selected .mark {
+    -fx-background-color: #06131c;
+}
+
+.check-box:selected .box {
+    -fx-background-color: linear-gradient(to bottom right, #34d8e6, #2b8cf0);
+    -fx-border-color: transparent;
+}
+
+.slider .track {
+    -fx-background-color: rgba(255,255,255,0.08);
+    -fx-background-radius: 4;
+}
+
+.slider .thumb {
+    -fx-background-color: #34d8e6;
+}
+
+.slider .axis {
+    -fx-tick-label-fill: #6b7686;
+}
+
+/* ============================================================== charts */
+
+.chart {
+    -fx-background-color: transparent;
+    -fx-padding: 6;
+}
+
+.chart-title {
+    -fx-text-fill: #e7ecf4;
+    -fx-font-size: 14px;
+    -fx-font-weight: 700;
+}
+
+.chart-plot-background {
+    -fx-background-color: transparent;
+}
+
+.chart-vertical-grid-lines,
+.chart-horizontal-grid-lines {
+    -fx-stroke: rgba(255,255,255,0.05);
+}
+
+.chart-alternative-row-fill,
+.chart-alternative-column-fill {
+    -fx-background-color: transparent;
+}
+
+.axis {
+    -fx-tick-label-fill: #8593a6;
+    -fx-font-size: 11px;
+}
+
+.axis-label {
+    -fx-text-fill: #6b7686;
+}
+
+.chart .axis .axis-tick-mark,
+.chart .axis .axis-minor-tick-mark {
+    -fx-stroke: rgba(255,255,255,0.12);
+}
+
+.chart-legend {
+    -fx-background-color: transparent;
+}
+
+.chart-legend-item {
+    -fx-text-fill: #aeb8c7;
+}
+
+/* ============================================================ buttons */
+
+.accent-btn {
+    -fx-background-color: linear-gradient(to bottom right, #34d8e6, #2b8cf0);
+    -fx-text-fill: #06131c;
+    -fx-font-size: 13px;
+    -fx-font-weight: 700;
+    -fx-background-radius: 8;
+    -fx-padding: 8 18 8 18;
+    -fx-cursor: hand;
+}
+
+.accent-btn:hover {
+    -fx-background-color: linear-gradient(to bottom right, #4ee2ee, #3d9bff);
+}
+
+.ghost-btn {
+    -fx-background-color: transparent;
+    -fx-text-fill: #cfd6e2;
+    -fx-font-size: 13px;
+    -fx-font-weight: 600;
+    -fx-background-radius: 8;
+    -fx-border-color: rgba(255,255,255,0.16);
+    -fx-border-radius: 8;
+    -fx-border-width: 1;
+    -fx-padding: 8 18 8 18;
+    -fx-cursor: hand;
+}
+
+.ghost-btn:hover {
+    -fx-background-color: rgba(255,255,255,0.06);
+}
+
+/* ========================================================== separators */
+
+.separator *.line {
+    -fx-border-color: rgba(255,255,255,0.08);
+    -fx-border-width: 1 0 0 0;
+}
+
+/* =========================================================== status bar */
+
+.status-bar {
+    -fx-background-color: #0b0e13;
+    -fx-border-color: rgba(255,255,255,0.06) transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+}
+
+.status-bar .status-text {
+    -fx-text-fill: #8593a6;
+    -fx-font-size: 11.5px;
+}
+
+.status-sep {
+    -fx-padding: 0 2 0 2;
+}
+
+.status-sep *.line {
+    -fx-border-color: rgba(255,255,255,0.12);
+    -fx-border-width: 0 1 0 0;
+}
+
+.status-bar .state-dot {
+    -fx-min-width: 8;
+    -fx-min-height: 8;
+    -fx-max-width: 8;
+    -fx-max-height: 8;
+    -fx-background-color: #46d39a;
+    -fx-background-radius: 4;
+}
+
+/* =========================================================== scrollbars */
+
+.scroll-bar {
+    -fx-background-color: transparent;
+}
+
+.scroll-bar .thumb {
+    -fx-background-color: rgba(255,255,255,0.16);
+    -fx-background-radius: 6;
+}
+
+.scroll-bar .thumb:hover {
+    -fx-background-color: rgba(255,255,255,0.26);
+}
+
+.scroll-bar .track,
+.scroll-bar .track-background {
+    -fx-background-color: transparent;
+}
+
+.scroll-bar .increment-button,
+.scroll-bar .decrement-button,
+.scroll-bar .increment-arrow,
+.scroll-bar .decrement-arrow {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+}

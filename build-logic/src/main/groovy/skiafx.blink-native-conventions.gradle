@@ -1,0 +1,1237 @@
+/*
+ * skiafx.blink-native-conventions
+ *
+ * Drives the native "skia-fx-webview" engine build — the Chromium content
+ * layer (Blink + V8 + cc/viz + net) that replaces WebKit behind
+ * javafx.scene.web.WebView. Ported from jux-framework-blink's
+ * buildSrc/.../chromium-tools.gradle (Chromium 147.0.7727.56) and adapted
+ * to skia-fx's module layout + packaging conventions.
+ *
+ * Provenance: the C++ engine sources under
+ *   javafx.web/src/main/native-blink/engine
+ *   javafx.web/src/main/native-blink/stubs
+ * are copied from F:\DEV\jux-framework-blink (engine/ and stubs/) on
+ * 2026-05-30. The GN target names stay jux_* / //jux (our Chromium
+ * checkout is a fully isolated copy, so there is no collision); only the
+ * OUTPUT artifacts are renamed to skia-fx-webview.{dll,exe,pak} and the
+ * Java-facing bridge uses the skia-fx-webview name.
+ *
+ * Opt-in via -PbuildWebNative=true — the engine compile is the slowest
+ * task in the project (first build is hours; incremental is ninja-fast).
+ * A Java-only build skips it but still packs any previously-built engine.
+ *
+ * Workspace (fully isolated; gitignored). Default <repoRoot>/.chromium,
+ * override with -PchromiumHome=<dir>:
+ *   <chromiumHome>/depot_tools/
+ *   <chromiumHome>/chromium/src/           (the checkout)
+ *   <chromiumHome>/chromium/src/jux/       (our engine overlay, copied)
+ *   <chromiumHome>/chromium/src/out/<buildDir>/   (ninja output)
+ *
+ * Tasks (group 'chromium' / 'blink'):
+ *   seedChromium    — full isolated copy of the jux checkout (no re-download)
+ *   setupEnv        — fresh-machine download: depot_tools → fetch → checkout
+ *                     → gclient sync → runhooks (pinned chromium.version)
+ *   pullVersions    — list available Chromium releases from ChromiumDash
+ *   configureBuild  — copy engine/ + stubs/, patch src, write args.gn, gn gen
+ *   buildNatives    — ninja -C out/<buildDir> jux_all
+ *   copyNativeEngine + generateChecksums — stage skia-fx-webview.* for the jar
+ *
+ * See docs/WEB_MODULE_BUILD.md.
+ */
+
+import groovy.json.JsonSlurper
+import org.gradle.internal.os.OperatingSystem
+
+// ===========================================================================
+// Platform — auto-detected once at load time. Used by the ported tasks for
+// depot_tools command wrapping and the ChromiumDash query parameter.
+// ===========================================================================
+class Platform {
+    static final String WINDOWS = 'windows'
+    static final String LINUX   = 'linux'
+    static final String MAC     = 'mac'
+    static final String CURRENT = detect()
+
+    private static final Map<String, String> CHROMIUM_DASH_NAMES = [
+        (WINDOWS): 'Windows', (LINUX): 'Linux', (MAC): 'Mac',
+    ]
+    private static final Map<String, String> DISPLAY_NAMES = [
+        (WINDOWS): 'Windows', (LINUX): 'Linux', (MAC): 'macOS',
+    ]
+
+    private static String detect() {
+        def os = System.getProperty('os.name').toLowerCase()
+        if (os.contains('windows')) return WINDOWS
+        if (os.contains('mac') || os.contains('darwin')) return MAC
+        return LINUX
+    }
+    static String chromiumDashName(String p) { CHROMIUM_DASH_NAMES[p] }
+    static String displayName(String p)      { DISPLAY_NAMES[p] }
+
+    // depot_tools command prefix: on Windows .bat files need `cmd /c`.
+    static List<String> depotToolsCmd(File depotToolsDir, String cmd) {
+        if (CURRENT == WINDOWS) {
+            return ['cmd', '/c', new File(depotToolsDir, "${cmd}.bat").absolutePath]
+        }
+        return [new File(depotToolsDir, cmd).absolutePath]
+    }
+    // depot_tools first on PATH so its bundled Python/tools win.
+    static String buildPath(File depotToolsDir) {
+        return depotToolsDir.absolutePath + File.pathSeparator + System.getenv('PATH')
+    }
+    static String detectTargetCpu() {
+        def arch = System.getProperty('os.arch').toLowerCase()
+        if (arch.contains('aarch64') || arch.contains('arm64')) return 'arm64'
+        if (arch.contains('arm')) return 'arm'
+        if (arch.contains('64')) return 'x64'
+        return 'x86'
+    }
+}
+
+// ===========================================================================
+// SeedChromiumTask — full isolated copy of an existing checkout (depot_tools
+// + chromium) into <chromiumHome>, so we never re-download. Idempotent: skips
+// if the target already carries the pinned version's hooks marker.
+// ===========================================================================
+abstract class SeedChromiumTask extends DefaultTask {
+    @Input    abstract Property<String> getChromiumVersion()
+    @Input    abstract Property<String> getSourceCheckout()   // jux chromium dir
+    @Input    abstract Property<String> getSourceDepotTools() // jux depot_tools dir
+    @Internal abstract DirectoryProperty getWorkspaceDir()
+    @Inject   abstract ExecOperations getExecOperations()
+
+    @TaskAction
+    void execute() {
+        def ws = workspaceDir.get().asFile
+        def version = chromiumVersion.get()
+        def srcChromium = new File(sourceCheckout.get())
+        def srcDepot = new File(sourceDepotTools.get())
+        def dstChromium = new File(ws, 'chromium')
+        def dstDepot = new File(ws, 'depot_tools')
+        def hooksMarker = new File(dstChromium, 'src/.jux_hooks_version')
+
+        if (hooksMarker.exists() && hooksMarker.text.trim() == version) {
+            logger.lifecycle("[seedChromium] Workspace already seeded for ${version} at ${ws} — skipping.")
+            return
+        }
+        if (!srcChromium.exists()) {
+            throw new GradleException(
+                "Source Chromium checkout not found: ${srcChromium}.\n" +
+                "Set -PjuxCheckout=<dir> to the existing chromium/ checkout, or run " +
+                "./gradlew :javafx.web:setupEnv to download a fresh tree instead.")
+        }
+        ws.mkdirs()
+        logger.lifecycle("[seedChromium] Copying checkout (tens of GB; this is slow) ...")
+        logger.lifecycle("[seedChromium]   ${srcDepot}  ->  ${dstDepot}")
+        logger.lifecycle("[seedChromium]   ${srcChromium}  ->  ${dstChromium}")
+        // out/ is regenerated by configureBuild/buildNatives — exclude it to
+        // save tens of GB. Everything else (src, deps, toolchains) is copied.
+        if (srcDepot.exists()) copyTree(srcDepot, dstDepot, [])
+        copyTree(srcChromium, dstChromium, ['out'])
+        logger.lifecycle("[seedChromium] Done. Next: ./gradlew :javafx.web:configureBuild")
+    }
+
+    void copyTree(File from, File to, List<String> excludeTopLevel) {
+        to.mkdirs()
+        if (Platform.CURRENT == Platform.WINDOWS) {
+            // robocopy /MIR-less mirror with multithreading. Exit codes < 8
+            // are success for robocopy; map them to 0 so Gradle doesn't fail.
+            def cmd = ['robocopy', from.absolutePath, to.absolutePath,
+                       '/E', '/MT:16', '/R:1', '/W:1', '/NFL', '/NDL', '/NP']
+            excludeTopLevel.each { cmd += ['/XD', new File(from, it).absolutePath] }
+            def result = execOperations.exec {
+                commandLine cmd
+                ignoreExitValue = true
+            }
+            if (result.exitValue >= 8) {
+                throw new GradleException("robocopy failed (exit ${result.exitValue}) copying ${from}")
+            }
+        } else {
+            def cmd = ['rsync', '-a']
+            excludeTopLevel.each { cmd += ["--exclude=/${it}"] }
+            cmd += ["${from.absolutePath}/", "${to.absolutePath}/"]
+            execOperations.exec { commandLine cmd }
+        }
+    }
+}
+
+// ===========================================================================
+// SetupEnvTask — idempotent 5-phase download (fresh machine path). Identical
+// flow to jux; operates inside <chromiumHome>.
+// ===========================================================================
+abstract class SetupEnvTask extends DefaultTask {
+    @Input    abstract Property<String> getChromiumVersion()
+    @Input    abstract Property<String> getSyncJobs()
+    @Internal abstract DirectoryProperty getWorkspaceDir()
+    @Inject   abstract ExecOperations getExecOperations()
+
+    @TaskAction
+    void execute() {
+        def root = workspaceDir.get().asFile
+        def depotToolsDir = new File(root, 'depot_tools')
+        def chromiumDir = new File(root, 'chromium')
+        def srcDir = new File(chromiumDir, 'src')
+        def version = chromiumVersion.get()
+
+        logger.lifecycle("=== setupEnv: target Chromium ${version} (${Platform.displayName(Platform.CURRENT)}) ===")
+        chromiumDir.mkdirs()
+        cloneDepotTools(depotToolsDir)
+        fetchChromium(depotToolsDir, chromiumDir, srcDir)
+        checkoutVersion(srcDir, version)
+        gclientSync(depotToolsDir, srcDir, version)
+        gclientRunhooks(depotToolsDir, srcDir, version)
+        logger.lifecycle("=== setupEnv: complete ===")
+    }
+
+    void cloneDepotTools(File depotToolsDir) {
+        def exists = new File(depotToolsDir, 'gclient.bat').exists() ||
+                     new File(depotToolsDir, 'gclient').exists()
+        if (exists) { logger.lifecycle('[1/5] depot_tools present, skipping.'); return }
+        if (depotToolsDir.exists()) depotToolsDir.deleteDir()
+        logger.lifecycle('[1/5] Cloning depot_tools...')
+        execOperations.exec {
+            commandLine 'git', 'clone',
+                'https://chromium.googlesource.com/chromium/tools/depot_tools.git',
+                depotToolsDir.absolutePath
+        }
+    }
+
+    void fetchChromium(File depotToolsDir, File chromiumDir, File srcDir) {
+        def gclientFile = new File(chromiumDir, '.gclient')
+        if (new File(srcDir, '.gclient_entries').exists()) {
+            logger.lifecycle('[2/5] Chromium source already fetched, skipping.'); return
+        }
+        def path = Platform.buildPath(depotToolsDir)
+        def jobs = syncJobs.get()
+        if (!gclientFile.exists()) {
+            logger.lifecycle('[2/5] Fetching chromium (this takes a long time)...')
+            gclientFile.text = '''\
+solutions = [
+  {
+    "name": "src",
+    "url": "https://chromium.googlesource.com/chromium/src.git",
+    "managed": False,
+    "custom_deps": {},
+    "custom_vars": {},
+  },
+]
+'''
+        } else {
+            logger.lifecycle('[2/5] Resuming interrupted fetch...')
+        }
+        def cmd = Platform.depotToolsCmd(depotToolsDir, 'gclient') +
+                  ['sync', '--nohooks', '--force', "--jobs=${jobs}"]
+        execOperations.exec {
+            commandLine cmd
+            workingDir chromiumDir
+            environment 'PATH', path
+            if (Platform.CURRENT == Platform.WINDOWS) environment 'DEPOT_TOOLS_WIN_TOOLCHAIN', '0'
+        }
+    }
+
+    void checkoutVersion(File srcDir, String version) {
+        def current = execCapture(['git', 'describe', '--tags', '--exact-match', 'HEAD'], srcDir)
+        if (current == version) { logger.lifecycle("[3/5] Already on ${version}."); return }
+        logger.lifecycle("[3/5] Checking out ${version}...")
+        execOperations.exec { commandLine 'git', 'fetch', '--tags'; workingDir srcDir }
+        execOperations.exec { commandLine 'git', 'checkout', "tags/${version}"; workingDir srcDir }
+    }
+
+    void gclientSync(File depotToolsDir, File srcDir, String version) {
+        def marker = new File(srcDir, '.jux_synced_version')
+        if (marker.exists() && marker.text.trim() == version) {
+            logger.lifecycle("[4/5] gclient sync already complete for ${version}."); return
+        }
+        logger.lifecycle('[4/5] gclient sync (downloading dependencies)...')
+        def cmd = Platform.depotToolsCmd(depotToolsDir, 'gclient') +
+                  ['sync', '--with_branch_heads', '--with_tags', '--force', "--jobs=${syncJobs.get()}"]
+        execOperations.exec {
+            commandLine cmd
+            workingDir srcDir
+            environment 'PATH', Platform.buildPath(depotToolsDir)
+            if (Platform.CURRENT == Platform.WINDOWS) environment 'DEPOT_TOOLS_WIN_TOOLCHAIN', '0'
+        }
+        marker.text = version
+    }
+
+    void gclientRunhooks(File depotToolsDir, File srcDir, String version) {
+        def marker = new File(srcDir, '.jux_hooks_version')
+        if (marker.exists() && marker.text.trim() == version) {
+            logger.lifecycle("[5/5] gclient runhooks already complete for ${version}."); return
+        }
+        logger.lifecycle('[5/5] gclient runhooks...')
+        execOperations.exec {
+            commandLine Platform.depotToolsCmd(depotToolsDir, 'gclient') + ['runhooks']
+            workingDir srcDir
+            environment 'PATH', Platform.buildPath(depotToolsDir)
+            if (Platform.CURRENT == Platform.WINDOWS) environment 'DEPOT_TOOLS_WIN_TOOLCHAIN', '0'
+        }
+        marker.text = version
+    }
+
+    String execCapture(List<String> command, File workDir) {
+        def stdout = new ByteArrayOutputStream()
+        try {
+            execOperations.exec {
+                commandLine command; workingDir workDir
+                standardOutput = stdout; errorOutput = new ByteArrayOutputStream()
+            }
+            return stdout.toString().trim()
+        } catch (Exception ignored) { return '' }
+    }
+}
+
+// ===========================================================================
+// PullVersionsTask — list ChromiumDash releases for the configured channel.
+// ===========================================================================
+abstract class PullVersionsTask extends DefaultTask {
+    @Input abstract Property<String> getChannel()
+    @Input abstract Property<String> getCurrentVersion()
+
+    @TaskAction
+    void execute() {
+        def ch = channel.get().capitalize()
+        def url = "https://chromiumdash.appspot.com/fetch_releases?channel=${ch}" +
+                  "&platform=${Platform.chromiumDashName(Platform.CURRENT)}&num=50"
+        logger.lifecycle("Fetching ${ch} releases (${Platform.displayName(Platform.CURRENT)})...")
+        def json = fetchReleases(url)
+        def current = currentVersion.get()
+        logger.lifecycle(String.format('%-28s %-12s %-16s', 'VERSION', 'MILESTONE', 'REVISION'))
+        logger.lifecycle('-' * 56)
+        for (release in json) {
+            def marker = (release.version == current) ? ' <-- current' : ''
+            logger.lifecycle(String.format('%-28s %-12s %-16s%s',
+                release.version ?: 'unknown',
+                release.milestone?.toString() ?: '',
+                release.chromium_main_branch_position?.toString() ?: '', marker))
+        }
+        logger.lifecycle("\nCurrently configured: chromium.version=${current}")
+    }
+
+    private Object fetchReleases(String url) {
+        try {
+            def c = new URL(url).openConnection() as HttpURLConnection
+            c.requestMethod = 'GET'; c.connectTimeout = 15000; c.readTimeout = 30000
+            if (c.responseCode != 200) throw new GradleException("ChromiumDash HTTP ${c.responseCode}")
+            return new JsonSlurper().parse(c.inputStream)
+        } catch (IOException e) {
+            throw new GradleException("Failed to fetch releases: ${e.message}")
+        }
+    }
+}
+
+// ===========================================================================
+// ConfigureBuildTask — copy engine/ + stubs/, patch the source tree, write
+// args.gn, run gn gen. Engine/stubs sources come from javafx.web's
+// native-blink dir; the rest mirrors jux exactly (same Chromium version).
+// ===========================================================================
+abstract class ConfigureBuildTask extends DefaultTask {
+    @Input    abstract Property<String> getBuildType()
+    @Input    abstract Property<String> getBuildDir()
+    @Input    abstract Property<String> getProprietaryCodecs()
+    @Input    abstract Property<String> getHevcEnabled()
+    @Input    abstract Property<String> getDolbyVisionEnabled()
+    @Input    abstract Property<String> getEnablePdf()
+    @Input    abstract Property<String> getEnablePrinting()
+    @Input    abstract Property<String> getEnablePrintPreview()
+    // Every GN flag is overridable: keys are `chromium.gn.<flag>` (prefix
+    // stripped here), values emitted verbatim as `<flag> = <value>`. These win
+    // over the built-in defaults. `extraGnArgs` is appended raw for any flag
+    // not in the defaults map (the user must avoid duplicate assignments).
+    @Input @Optional abstract MapProperty<String, String> getGnOverrides()
+    @Input @Optional abstract Property<String> getExtraGnArgs()
+    @Input    abstract Property<String> getEngineSrc()   // native-blink/engine
+    @Input    abstract Property<String> getStubsSrc()    // native-blink/stubs
+    @Input @Optional abstract Property<String> getPatchesSrc()  // native-blink/patches (*.patch)
+    @Input @Optional abstract Property<String> getPrintPreviewSrc() // native-blink/print_preview (ported chrome sources)
+    @Internal abstract DirectoryProperty getWorkspaceDir()
+    @Inject   abstract ExecOperations getExecOperations()
+
+    @TaskAction
+    void execute() {
+        def root = workspaceDir.get().asFile
+        def depotToolsDir = new File(root, 'depot_tools')
+        def srcDir = new File(root, 'chromium/src')
+        def type = buildType.get().toLowerCase()
+        def outDir = new File(srcDir, "out/${buildDir.get()}")
+
+        if (type != 'debug' && type != 'release')
+            throw new GradleException("chromium.buildType must be 'debug' or 'release', got '${type}'")
+        if (!srcDir.exists())
+            throw new GradleException("Chromium source not found at ${srcDir}. Run seedChromium or setupEnv first.")
+
+        logger.lifecycle("=== configureBuild: ${type} build in out/${buildDir.get()} ===")
+
+        // Copy engine/ → chromium/src/jux/  (overlay GN target //jux:jux_engine)
+        def engineSrcDir = new File(engineSrc.get())
+        def juxGnDir = new File(srcDir, 'jux')
+        if (!engineSrcDir.exists())
+            throw new GradleException("engine sources not found at ${engineSrcDir}")
+        juxGnDir.mkdirs()
+        engineSrcDir.eachFile { f ->
+            def dest = new File(juxGnDir, f.name); dest.delete()
+            java.nio.file.Files.copy(f.toPath(), dest.toPath())
+        }
+        logger.lifecycle("Copied engine/ -> ${juxGnDir}")
+
+        // Copy print_preview/ (ported chrome print-preview sources + its BUILD.gn)
+        // → chromium/src/jux/print_preview/, recursively (it mirrors upstream
+        // subdirs). The jux_print_preview GN target only joins the build under
+        // enable_print_preview, so this is inert for the default engine build.
+        def ppRoot = printPreviewSrc.getOrNull()
+        if (ppRoot) {
+            def ppSrcDir = new File(ppRoot)
+            if (ppSrcDir.isDirectory()) {
+                def ppDest = new File(juxGnDir, 'print_preview')
+                ppSrcDir.eachFileRecurse { f ->
+                    if (f.isFile() && f.name != 'README.md') {
+                        def rel = ppSrcDir.toPath().relativize(f.toPath()).toString()
+                        def dest = new File(ppDest, rel)
+                        dest.parentFile.mkdirs(); dest.delete()
+                        java.nio.file.Files.copy(f.toPath(), dest.toPath())
+                    }
+                }
+                logger.lifecycle("Copied print_preview/ -> ${ppDest}")
+            }
+        }
+
+        // Copy stubs/ → chromium/src/  (replace pruned Google services).
+        def stubsDir = new File(stubsSrc.get())
+        if (stubsDir.exists()) copyStubs(stubsDir, srcDir)
+
+        patchRootBuildGn(srcDir)
+        patchBlinkCoreVisibility(srcDir)
+        patchContentBrowserVisibility(srcDir)
+        patchDelegatedFrameHost(srcDir)
+        patchTracingResources(srcDir)
+
+        // Apply reproducible unified-diff patches (javafx.web/.../patches/*.patch)
+        // to pristine upstream Chromium files via `git apply`. This is the
+        // patch-utils mechanism for larger, multi-file source edits (e.g. the
+        // print-preview port); the Groovy patches above stay for the legacy edits.
+        applyChromiumPatches(srcDir)
+
+        outDir.mkdirs()
+        def argsFile = new File(outDir, 'args.gn')
+        // Strip the `chromium.gn.` prefix from override keys.
+        def overrides = [:]
+        gnOverrides.getOrElse([:]).each { k, v ->
+            overrides[k.startsWith('chromium.gn.') ? k.substring('chromium.gn.'.length()) : k] = v
+        }
+        argsFile.text = generateArgs(type, proprietaryCodecs.get(), hevcEnabled.get(),
+            dolbyVisionEnabled.get(), enablePdf.get(), enablePrinting.get(), enablePrintPreview.get(),
+            overrides, extraGnArgs.getOrElse(''))
+        logger.lifecycle("Generated ${argsFile}\n${argsFile.text}")
+
+        logger.lifecycle('Running gn gen...')
+        execOperations.exec {
+            commandLine Platform.depotToolsCmd(depotToolsDir, 'gn') + ['gen', "out/${buildDir.get()}"]
+            workingDir srcDir
+            environment 'PATH', Platform.buildPath(depotToolsDir)
+            if (Platform.CURRENT == Platform.WINDOWS) environment 'DEPOT_TOOLS_WIN_TOOLCHAIN', '0'
+        }
+        logger.lifecycle("=== configureBuild: complete. Next: buildNatives ===")
+    }
+
+    void copyStubs(File stubsDir, File srcDir) {
+        // 'chrome' carries stub headers that satisfy chrome/browser includes
+        // pulled in by the in-place print-preview sources (e.g. browser_process.h,
+        // profiles/profile.h) without dragging the real chrome/browser. They
+        // overwrite the tree copies (we never build //chrome/browser), and a
+        // re-seed restores the originals. Only present when print preview is ported.
+        // Every top-level dir under stubs/ is merged into the tree (e.g.
+        // third_party, components, ash, chrome, rlz, …). 'node' is special-cased
+        // below. Dynamic so a new stub root (rlz, extensions, …) never needs a
+        // code change here.
+        (stubsDir.listFiles() ?: []).findAll {
+            it.isDirectory() && it.name != 'node'
+        }.each { s ->
+            s.eachFileRecurse { f ->
+                if (f.isFile()) {
+                    def dest = new File(srcDir, stubsDir.toPath().relativize(f.toPath()).toString())
+                    dest.parentFile.mkdirs(); dest.delete()
+                    java.nio.file.Files.copy(f.toPath(), dest.toPath())
+                }
+            }
+        }
+        def nodeStubDir = new File(stubsDir, 'node')
+        if (nodeStubDir.exists()) {
+            def nodeModulesDir = new File(srcDir, 'third_party/node/node_modules')
+            def nmPy = new File(nodeStubDir, 'node_modules.py')
+            if (nmPy.exists()) {
+                def dest = new File(srcDir, 'third_party/node/node_modules.py')
+                dest.delete(); java.nio.file.Files.copy(nmPy.toPath(), dest.toPath())
+            }
+            ['eslint', 'stylelint', 'ts-proto'].each { tool ->
+                def td = new File(nodeStubDir, tool)
+                if (td.exists()) td.eachFileRecurse { f ->
+                    if (f.isFile()) {
+                        def rel = td.toPath().relativize(f.toPath()).toString()
+                        def dest = new File(nodeModulesDir, "${tool}/${rel}")
+                        dest.parentFile.mkdirs(); dest.delete()
+                        java.nio.file.Files.copy(f.toPath(), dest.toPath())
+                    }
+                }
+            }
+            def rollupLink = new File(nodeModulesDir, 'rollup')
+            def rollupTarget = new File(nodeModulesDir, '@rollup/wasm-node')
+            if (!rollupLink.exists() && rollupTarget.exists()) {
+                if (Platform.CURRENT == Platform.WINDOWS) {
+                    ['cmd', '/c', 'mklink', '/J', rollupLink.absolutePath, rollupTarget.absolutePath]
+                        .execute().waitFor()
+                } else {
+                    java.nio.file.Files.createSymbolicLink(rollupLink.toPath(), rollupTarget.toPath())
+                }
+            }
+        }
+        logger.lifecycle("Copied stubs/ -> ${srcDir}")
+    }
+
+    // Applies every javafx.web/.../patches/*.patch (sorted by name) to the
+    // Chromium checkout via `git apply`. Idempotent: a patch that already
+    // reverse-applies cleanly is skipped, so re-running configureBuild is a
+    // no-op. The seeded checkout is NOT its own git repo (no .git — git resolves
+    // to the parent skia-fx repo, where /.chromium/ is ignored), so we use
+    // *plain* `git apply` (operates on the working tree without an object store)
+    // rather than `--3way` (needs the index; fails repo-less). Plain apply still
+    // HARD-FAILS on context drift after a version bump — the loud failure we
+    // want — it just can't emit 3-way conflict markers. `--reverse --check` and
+    // `--check` both work repo-less, so idempotency + pre-validation hold.
+    void applyChromiumPatches(File srcDir) {
+        def root = patchesSrc.getOrNull()
+        if (!root) return
+        def patchesRoot = new File(root)
+        if (!patchesRoot.isDirectory()) return
+        def patches = (patchesRoot.listFiles() ?: []).findAll {
+            it.isFile() && it.name.endsWith('.patch')
+        }.sort { it.name }
+        if (patches.isEmpty()) {
+            logger.lifecycle("No Chromium patches to apply (${patchesRoot}).")
+            return
+        }
+        // The seeded checkout has no .git of its own, so git climbs to the parent
+        // skia-fx repo (which ignores /.chromium/) and resolves patch paths against
+        // the WRONG tree — making both forward AND reverse --check spuriously pass
+        // (a pristine file looked "already applied", silently skipping the patch).
+        // `git init` makes srcDir its own toplevel so apply/check/reverse-check
+        // operate on the real checkout. Idempotent: a no-op on an existing repo.
+        // We never add/commit — plain `git apply` checks the working tree, not the
+        // index — so the repo stays empty and tiny.
+        if (!new File(srcDir, '.git').exists()) {
+            runGit(srcDir, ['init', '-q'], true)
+            logger.lifecycle("[patch] git-init'd ${srcDir} (self-contained patch target).")
+        }
+        patches.each { p ->
+            // Already applied? A clean reverse-apply means the change is in place.
+            if (runGit(srcDir, ['apply', '--reverse', '--check', p.absolutePath], true) == 0) {
+                logger.lifecycle("[patch] ${p.name} already applied — skipping.")
+                return
+            }
+            // Pre-validate so a drifted patch fails before half-applying.
+            if (runGit(srcDir, ['apply', '--check', p.absolutePath], true) != 0) {
+                throw new GradleException(
+                    "[patch] FAILED to apply ${p.name} (git apply --check failed). " +
+                    "Chromium source likely drifted for this version — re-author with " +
+                    "':javafx.web:genChromiumPatches -Ppatch.file=${p.name} -Ppatch.paths=<rel,paths>'.")
+            }
+            def rc = runGit(srcDir, ['apply', p.absolutePath], false)
+            if (rc != 0) {
+                throw new GradleException(
+                    "[patch] FAILED to apply ${p.name} (git apply exit ${rc}). " +
+                    "Chromium source likely drifted for this version — re-author with " +
+                    "':javafx.web:genChromiumPatches -Ppatch.file=${p.name} -Ppatch.paths=<rel,paths>'.")
+            }
+            logger.lifecycle("[patch] applied ${p.name}")
+        }
+    }
+
+    // NOT private: called from inside the patches.each {} closure in
+    // applyChromiumPatches — Groovy can't dispatch private methods through a
+    // closure's owner, so privacy here throws MissingMethodException at runtime.
+    int runGit(File srcDir, List<String> args, boolean quiet) {
+        def sink = quiet ? new ByteArrayOutputStream() : null
+        def result = execOperations.exec {
+            commandLine(['git'] + args)
+            workingDir srcDir
+            ignoreExitValue true
+            if (quiet) { standardOutput = sink; errorOutput = sink }
+        }
+        return result.exitValue
+    }
+
+    void patchRootBuildGn(File srcDir) {
+        def f = new File(srcDir, 'BUILD.gn')
+        // The group may already exist — either from a prior run here or because
+        // the seeded checkout was previously patched by jux (same overlay dir
+        // //jux). GN forbids duplicate definitions, so skip if present.
+        if (f.text.contains('group("jux_all")')) {
+            logger.lifecycle("root BUILD.gn already defines jux_all — skipping.")
+            return
+        }
+        f.append("""
+# --- skia-fx-webview patch ---
+group("jux_all") {
+  deps = [
+    "//jux:jux_engine",
+    "//jux:jux_engine_process",
+    "//jux:pak",
+  ]
+}
+""")
+        logger.lifecycle("Patched root BUILD.gn (jux_all group)")
+    }
+
+    void patchBlinkCoreVisibility(File srcDir) {
+        def f = new File(srcDir, 'third_party/blink/renderer/core/BUILD.gn')
+        if (!f.exists()) return
+        def text = f.text
+        def marker = '    # jux engine access'
+        if (text.contains(marker)) return
+        def original = '  visibility = [ "//third_party/blink/*" ]'
+        def patched =
+            '  visibility = [\n' +
+            '    "//third_party/blink/*",\n' +
+            marker + ' to renderer/core — jux DOM handler\n' +
+            '    "//jux/*",\n' +
+            '  ]'
+        if (text.contains(original)) {
+            f.text = text.replace(original, patched)
+            logger.lifecycle("Patched blink/renderer/core visibility for //jux/*")
+        } else {
+            logger.warn("Could not patch blink/renderer/core visibility — default line not found.")
+        }
+    }
+
+    // Allow //jux to depend on the internal //content/browser:browser target.
+    // The engine calls RenderWidgetHostViewBase::SetScaleOverrideForCapture
+    // (content/browser/renderer_host/) — the supported per-view device-scale
+    // override Chromium's own capture paths use — to render the off-screen
+    // WebView at the JavaFX HiDPI scale. That class lives in the "browser"
+    // source_set, whose visibility list omits embedders, so GN rejects the dep
+    // ("not in visibility list") without this. Idempotent: keyed on the marker.
+    void patchContentBrowserVisibility(File srcDir) {
+        def f = new File(srcDir, 'content/browser/BUILD.gn')
+        if (!f.exists()) return
+        def text = f.text
+        def marker = '    "//jux/*",  # jux engine: SetScaleOverrideForCapture'
+        if (text.contains(marker)) return
+        // Anchor on the first visibility entry of source_set("browser").
+        def anchor = '    ":content_sms_parser_fuzzer",'
+        if (text.contains(anchor)) {
+            f.text = text.replace(anchor, anchor + '\n' + marker)
+            logger.lifecycle("Patched content/browser visibility for //jux/*")
+        } else {
+            logger.warn("Could not patch content/browser visibility — anchor not found.")
+        }
+    }
+
+    // Drag-resize gap fix — identical to jux (same Chromium version). Three
+    // idempotent steps; see jux chromium-tools.gradle for the full rationale.
+    void patchDelegatedFrameHost(File srcDir) {
+        def f = new File(srcDir, 'content/browser/renderer_host/delegated_frame_host.cc')
+        if (!f.exists()) return
+        def text = f.text
+        def deadlineMarker = '// skia-fx-webview: deadline driven by drag flag'
+        def stretchMarker = '// skia-fx-webview: stretch on resize during drag'
+
+        if (!text.contains('#include <atomic>')) {
+            if (text.contains('#include <vector>'))
+                text = text.replace('#include <vector>', '#include <vector>\n#include <atomic>')
+        }
+        if (!text.contains(deadlineMarker)) {
+            def fnOriginal =
+                'cc::DeadlinePolicy DelegatedFrameHostClient::GetResizeDeadlinePolicy() const {\n' +
+                '  return cc::DeadlinePolicy::UseSpecifiedDeadline(0u);\n' +
+                '}'
+            def fnPatched =
+                '}  // namespace content\n\n' +
+                'namespace jux {\n' +
+                'namespace {\n' +
+                'std::atomic<uint32_t> g_jux_resize_deadline_frames{0};\n' +
+                '}  // namespace\n\n' +
+                'void SetJuxResizeDeadlineFrames(uint32_t frames) {\n' +
+                '  g_jux_resize_deadline_frames.store(frames, std::memory_order_release);\n' +
+                '}\n\n' +
+                'uint32_t GetJuxResizeDeadlineFrames() {\n' +
+                '  return g_jux_resize_deadline_frames.load(std::memory_order_acquire);\n' +
+                '}\n\n' +
+                'bool ShouldJuxStretchSurfaceOnResize() {\n' +
+                '  return GetJuxResizeDeadlineFrames() > 0u;\n' +
+                '}\n' +
+                '}  // namespace jux\n\n' +
+                'namespace content {\n\n' +
+                'cc::DeadlinePolicy DelegatedFrameHostClient::GetResizeDeadlinePolicy() const {\n' +
+                '  ' + deadlineMarker + '.\n' +
+                '  return cc::DeadlinePolicy::UseSpecifiedDeadline(\n' +
+                '      jux::GetJuxResizeDeadlineFrames());\n' +
+                '}'
+            if (text.contains(fnOriginal)) text = text.replace(fnOriginal, fnPatched)
+            else logger.warn("delegated_frame_host.cc: deadline body not found.")
+        }
+        if (!text.contains(stretchMarker)) {
+            def stretchOriginal = '        deadline_policy, false /* stretch_content_to_fill_bounds */);'
+            def stretchPatched =
+                '        deadline_policy,\n' +
+                '        ' + stretchMarker + '.\n' +
+                '        jux::ShouldJuxStretchSurfaceOnResize() /* stretch_content_to_fill_bounds */);'
+            if (text.contains(stretchOriginal)) text = text.replace(stretchOriginal, stretchPatched)
+            else logger.warn("delegated_frame_host.cc: stretch call site not found.")
+        }
+        f.text = text
+        logger.lifecycle("Patched delegated_frame_host.cc (drag-resize)")
+    }
+
+    // The catapult generate_about_tracing chain is unwired in this checkout
+    // (it produces no about_tracing.html), and jux commented out the
+    // //content/browser/tracing:resources dep — but tracing_ui.cc stays in
+    // //content/browser sources and #includes the grit-generated
+    // tracing_resources.h, so a clean build fails. We don't ship
+    // chrome://tracing, so feed grit tiny stub html/js (header/map generate
+    // cleanly, tracing_ui.cc compiles + links) and re-enable the dep.
+    // Idempotent via the 'skiafx_about_tracing_stub' marker.
+    void patchTracingResources(File srcDir) {
+        // 1. Stub source files.
+        def stubDir = new File(srcDir, 'content/browser/tracing/skiafx_stub')
+        stubDir.mkdirs()
+        new File(stubDir, 'about_tracing.html').text = '''<!doctype html>
+<!-- skia-fx stub: chrome://tracing is not shipped. This lets grit generate
+     the tracing resource header/map that tracing_ui.cc links against. -->
+<html><head><meta charset="utf-8"><title>tracing (disabled)</title></head>
+<body><p>chrome://tracing is not available in this build.</p>
+<script src="chrome://tracing/about_tracing.js"></script></body></html>
+'''
+        new File(stubDir, 'about_tracing.js').text =
+            '// skia-fx stub: chrome://tracing is not shipped.\n'
+
+        // 2. content/browser/tracing/BUILD.gn — swap the catapult generator
+        //    for a copy of the stubs into target_gen_dir.
+        def tracingGn = new File(srcDir, 'content/browser/tracing/BUILD.gn')
+        if (tracingGn.exists()) {
+            def t = tracingGn.text
+            if (!t.contains('skiafx_about_tracing_stub')) {
+                t = t.replace('generate_grd("build_grd") {',
+                    'copy("skiafx_about_tracing_stub") {\n' +
+                    '  sources = [\n' +
+                    '    "skiafx_stub/about_tracing.html",\n' +
+                    '    "skiafx_stub/about_tracing.js",\n' +
+                    '  ]\n' +
+                    '  outputs = [ "$target_gen_dir/{{source_file_part}}" ]\n' +
+                    '}\n\n' +
+                    'generate_grd("build_grd") {')
+                t = t.replace(
+                    'deps = [ "//third_party/catapult/tracing:generate_about_tracing" ]',
+                    'deps = [ ":skiafx_about_tracing_stub" ]')
+                tracingGn.text = t
+                logger.lifecycle("Patched content/browser/tracing/BUILD.gn (stub about_tracing)")
+            }
+        }
+
+        // 3. content/browser/BUILD.gn — re-enable the resources dep jux cut.
+        def cbGn = new File(srcDir, 'content/browser/BUILD.gn')
+        if (cbGn.exists()) {
+            def t = cbGn.text
+            def juxCommented =
+                '# "//content/browser/tracing:resources",  # jux patch: requires ts-proto'
+            if (t.contains(juxCommented)) {
+                t = t.replace(juxCommented,
+                    '"//content/browser/tracing:resources",  # skia-fx: re-enabled (stub about_tracing)')
+                cbGn.text = t
+                logger.lifecycle("Patched content/browser/BUILD.gn (re-enable tracing:resources)")
+            }
+        }
+    }
+
+    // args.gn generation. Builds an ordered defaults map of verified
+    // Chromium-147 flags, then lets `gnOverrides` (every -Pchromium.gn.<flag>)
+    // replace any value, and appends `extraGnArgs` raw. So every GN arg is
+    // configurable; nothing here is hard-coded beyond the defaults.
+    private static String generateArgs(String type, String proprietaryCodecs, String hevcEnabled,
+            String dolbyVisionEnabled, String enablePdf, String enablePrinting, String enablePrintPreview,
+            Map<String, String> gnOverrides, String extraGnArgs) {
+        def isDebug = type == 'debug'
+        def propCodecs = proprietaryCodecs?.equalsIgnoreCase('true')
+        def hevc = propCodecs && hevcEnabled?.equalsIgnoreCase('true')
+        def dolbyVision = hevc && dolbyVisionEnabled?.equalsIgnoreCase('true')
+        def pdf = enablePdf?.equalsIgnoreCase('true')
+        def printing = enablePrinting?.equalsIgnoreCase('true')
+        def printPreview = printing && enablePrintPreview?.equalsIgnoreCase('true')
+
+        // LinkedHashMap preserves emission order. Values are GN literals
+        // (true/false/"string"/number) emitted verbatim as `key = value`.
+        def m = new LinkedHashMap<String, String>()
+        // Build mode
+        m['is_debug'] = "${isDebug}"
+        m['symbol_level'] = isDebug ? '1' : '0'
+        if (!isDebug) {
+            m['is_official_build'] = 'true'
+            m['chrome_pgo_phase'] = '0'
+            m['blink_symbol_level'] = '0'
+            m['v8_symbol_level'] = '0'
+            m['exclude_unwind_tables'] = 'true'
+            m['optimize_for_size'] = 'true'
+        }
+        m['is_component_build'] = 'false'
+        m['win_console_app'] = 'false'
+        m['target_cpu'] = "\"${Platform.detectTargetCpu()}\""
+        // Content-layer features (engine references //printing)
+        m['enable_pdf'] = "${pdf}"
+        m['enable_printing'] = "${printing}"
+        m['enable_print_preview'] = "${printPreview}"
+        if (printPreview) {
+            // The ported chrome print code gates whole branches behind these. We
+            // run in-process (no OOP print backend service) and without enterprise
+            // content analysis, which drops that coupling from the port. Only
+            // emitted with print preview on, so the default build is untouched.
+            m['enable_oop_printing'] = 'false'
+            m['enterprise_content_analysis'] = 'false'
+            m['enterprise_local_content_analysis'] = 'false'
+            m['enterprise_cloud_content_analysis'] = 'false'
+            // The print-preview Polymer UI embeds the PDF viewer resources.
+            // ink2 (annotation) + save-to-drive default to enable_pdf; leaving
+            // them at their default keeps the PDF-viewer TS module graph internally
+            // consistent (disabling them left dangling imports). chrome_grit_defines
+            // in stubs/.../features.gni forwards the same values via $var.
+            // NOTE: enabling the internal PDF plugin (//pdf) later will require
+            // ink2=false + guarding the ink2-only imports (e.g. ExtendedKeyEvent
+            // in pdf_viewer.ts) since third_party/ink source is absent.
+        }
+        // Chrome browser UI / features above content layer
+        m['enable_vr'] = 'false'; m['enable_openxr'] = 'false'
+        m['enable_remoting'] = 'false'; m['enable_paint_preview'] = 'false'
+        m['enable_mdns'] = 'false'; m['enable_media_remoting'] = 'false'
+        // Google services / telemetry
+        m['enable_reporting'] = 'false'; m['enable_bound_session_credentials'] = 'false'
+        m['google_api_key'] = '""'; m['google_default_client_id'] = '""'
+        m['google_default_client_secret'] = '""'; m['use_official_google_api_keys'] = 'false'
+        // Chrome-level subsystems
+        m['safe_browsing_mode'] = '0'
+        m['enable_extensions_core'] = 'false'; m['enable_extensions'] = 'false'
+        m['enable_guest_view'] = 'false'; m['enable_supervised_users'] = 'false'
+        m['enable_screen_ai_service'] = 'false'
+        // GPU software fallback
+        m['angle_enable_swiftshader'] = 'true'; m['enable_swiftshader_vulkan'] = 'true'
+        // Misc disable
+        m['enable_pseudolocales'] = 'false'; m['enable_resource_allowlist_generation'] = 'false'
+        m['enable_ipc_fuzzer'] = 'false'; m['enable_widevine'] = 'false'
+        m['enable_webrtc'] = 'false'; m['enable_nacl'] = 'false'
+        m['enable_spellcheck'] = 'false'; m['enable_back_forward_cache'] = 'false'
+        m['build_with_tflite_lib'] = 'false'; m['webnn_use_tflite'] = 'false'
+        // Size reduction
+        m['icu_use_data_file'] = 'true'
+        m['icu_data_filter_file'] = '"//jux/icu_filter.json"'
+        m['angle_enable_gl'] = 'false'; m['angle_enable_gl_desktop_backend'] = 'false'
+        m['angle_enable_metal'] = 'false'
+        m['enable_av1_decoder'] = 'false'; m['enable_dav1d_decoder'] = 'false'
+        m['enable_web_bluetooth'] = 'false'; m['enable_webusb'] = 'false'
+        m['enable_webhid'] = 'false'; m['enable_webxr'] = 'false'
+        // Codecs
+        m['proprietary_codecs'] = "${propCodecs}"
+        m['ffmpeg_branding'] = propCodecs ? '"Chrome"' : '"Chromium"'
+        if (propCodecs) {
+            m['enable_hls_demuxer'] = 'false'; m['enable_mse_mpeg2ts_stream_parser'] = 'false'
+            m['enable_hevc_parser_and_hw_decoder'] = "${hevc}"
+            m['enable_platform_dolby_vision'] = "${dolbyVision}"
+            m['enable_platform_encrypted_dolby_vision'] = "${dolbyVision}"
+            m['enable_platform_ac3_eac3_audio'] = 'false'; m['enable_platform_ac4_audio'] = 'false'
+            m['enable_platform_mpeg_h_audio'] = 'false'; m['enable_platform_dts_audio'] = 'false'
+            m['enable_platform_iamf_audio'] = 'false'
+        }
+
+        // Apply per-flag overrides (-Pchromium.gn.<flag>=<value>); they win.
+        if (gnOverrides) gnOverrides.each { k, v -> m[k] = v }
+
+        def sb = new StringBuilder()
+        sb.append('# =============================================================================\n')
+        sb.append('# skia-fx-webview — GN build configuration (Chromium 147; flags verified).\n')
+        sb.append('# Generated by configureBuild. Every flag is overridable via\n')
+        sb.append('# -Pchromium.gn.<flag>=<value> or -Pchromium.extraGnArgs=. Do not edit.\n')
+        sb.append('# =============================================================================\n')
+        m.each { k, v -> sb.append("${k} = ${v}\n") }
+        if (extraGnArgs?.trim()) {
+            sb.append('\n# --- extraGnArgs (-Pchromium.extraGnArgs) ---\n')
+            sb.append(extraGnArgs.trim()).append('\n')
+        }
+        return sb.toString()
+    }
+}
+
+// ===========================================================================
+// BuildNativesTask — ninja -C out/<buildDir> jux_all.
+// ===========================================================================
+abstract class BuildNativesTask extends DefaultTask {
+    @Input             abstract Property<String> getBuildDir()
+    @Input  @Optional  abstract Property<String> getBuildJobs()
+    @Internal          abstract DirectoryProperty getWorkspaceDir()
+    @Inject            abstract ExecOperations getExecOperations()
+
+    @TaskAction
+    void execute() {
+        def root = workspaceDir.get().asFile
+        def depotToolsDir = new File(root, 'depot_tools')
+        def srcDir = new File(root, 'chromium/src')
+        def outDir = new File(srcDir, "out/${buildDir.get()}")
+        if (!new File(outDir, 'args.gn').exists())
+            throw new GradleException("No args.gn at ${outDir}. Run configureBuild first.")
+        if (!new File(srcDir, 'jux/BUILD.gn').exists())
+            throw new GradleException("jux/BUILD.gn missing. Run configureBuild to copy the engine overlay.")
+
+        def ninjaCmd = resolveNinjaCmd(depotToolsDir, srcDir)
+        def cmd = ninjaCmd.clone()
+        if (buildJobs.isPresent() && buildJobs.get()) cmd += ['-j', buildJobs.get()]
+        cmd += ['-C', "out/${buildDir.get()}", 'jux_all']
+
+        logger.lifecycle("=== buildNatives: ${cmd.join(' ')} ===")
+        execOperations.exec {
+            commandLine cmd
+            workingDir srcDir
+            environment 'PATH', Platform.buildPath(depotToolsDir)
+            if (Platform.CURRENT == Platform.WINDOWS) environment 'DEPOT_TOOLS_WIN_TOOLCHAIN', '0'
+        }
+        logger.lifecycle("=== buildNatives: complete. Output: ${outDir} ===")
+    }
+
+    private static List<String> resolveNinjaCmd(File depotToolsDir, File srcDir) {
+        if (Platform.CURRENT == Platform.WINDOWS) {
+            def bundled = new File(srcDir, 'third_party/ninja/ninja.exe')
+            if (bundled.exists()) return [bundled.absolutePath]
+            return ['cmd', '/c', new File(depotToolsDir, 'ninja.bat').absolutePath]
+        }
+        def bundled = new File(srcDir, 'third_party/ninja/ninja')
+        if (bundled.exists()) return [bundled.absolutePath]
+        def ninja = new File(depotToolsDir, 'ninja')
+        return ninja.exists() ? [ninja.absolutePath] : ['ninja']
+    }
+}
+
+// ===========================================================================
+// Wiring
+// ===========================================================================
+def os = OperatingSystem.current()
+def hostPlatform = os.windows ? 'win' : os.macOsX ? 'mac' : 'linux'
+def hostArch = (System.getProperty('os.arch') in ['x86_64', 'amd64']) ? 'x64' : 'arm64'
+
+def gp = { String key, String dflt -> providers.gradleProperty(key).orElse(dflt).get() }
+
+// The ~109 com.sun.webkit.dom.* wrapper classes (org.w3c.dom impls that
+// WebEngine.getDocument() returns) now live in the standard source root
+// (src/main/java/com/sun/webkit/dom/) — relocated when the legacy WebKit
+// native tree was removed — so no extra source dir is needed here. P4
+// rewires their bodies to the Blink node-id DomBridge.
+
+// Workspace (isolated, gitignored). Default <repoRoot>/.chromium.
+def chromiumHome = providers.gradleProperty('chromiumHome')
+        .orElse(rootProject.layout.projectDirectory.dir('.chromium').asFile.absolutePath).get()
+def workspaceDirFile = new File(chromiumHome)
+def buildDirName = gp('chromium.buildDir', 'skiafxweb')
+def engineSrcDir   = layout.projectDirectory.dir('src/main/native-blink/engine').asFile
+def stubsSrcDir    = layout.projectDirectory.dir('src/main/native-blink/stubs').asFile
+def patchesSrcDir  = layout.projectDirectory.dir('src/main/native-blink/patches').asFile
+def printPreviewSrcDir = layout.projectDirectory.dir('src/main/native-blink/print_preview').asFile
+
+// Where ninja drops the engine artifacts, and where we stage them for the jar.
+def engineOutDir = new File(workspaceDirFile, "chromium/src/out/${buildDirName}")
+def distDir = layout.buildDirectory.dir("native/blink-${hostPlatform}-${hostArch}/dist").get().asFile
+
+// Runtime artifacts to bundle, by PATTERN (not a fixed list) so every shared
+// library Chromium emits — ANGLE (libEGL/libGLESv2), D3D/DXC (d3dcompiler_47,
+// dxcompiler, dxil), SwiftShader/Vulkan (vk_swiftshader, vulkan-1), VC runtime,
+// etc. — is picked up automatically. We include all libs + resources +
+// snapshots and the engine executable, then exclude the build-tool exes
+// (mksnapshot, torque, protoc, …) and debug/test-only layers.
+def engineIncludes = [
+    'skia-fx-webview', 'skia-fx-webview.exe',  // engine subprocess (Win + *nix)
+    '*.dll', '*.so', '*.so.*', '*.dylib',      // all shared libraries
+    '*.pak', '*.dat', '*.bin',                 // resources, ICU, V8 snapshots
+]
+def engineExcludes = [
+    // Vulkan validation/mock layers — debug/test only (the validation layer
+    // alone is ~18 MB). vk_swiftshader / vulkan-1 are kept (real GPU fallback).
+    'VkLayer_*', 'VkICD_*',
+    // Link/debug artifacts that share an extension with runtime libs.
+    '*.dll.lib', '*.pdb', '*.exp', '*.ilk',
+    // Build/debug symbol tooling — copied into out for build tools, NOT engine
+    // runtime deps (Crashpad doesn't load dbghelp; msdia/symsrv are PDB tools).
+    'msdia140.dll', 'symsrv.dll', 'dbghelp.dll', 'dbgcore.dll',
+    // VC++ CRT redistributables — engine is built /MT (static CRT), so these
+    // are never loaded. (jux ships none of these and renders fine.)
+    'msvcp140*.dll', 'vcruntime140*.dll', 'vccorlib140.dll',
+]
+
+// ===========================================================================
+// GenChromiumPatchesTask — authoring helper: capture edits made to pristine
+// Chromium files in the checkout as a reproducible unified-diff patch under
+// native-blink/patches/. Usage:
+//   ./gradlew :javafx.web:genChromiumPatches \
+//       -Ppatch.file=0001-content-webui-print.patch \
+//       -Ppatch.paths=content/browser/BUILD.gn,content/public/browser/foo.h
+// The generated patch is re-applied by configureBuild via `git apply` (see
+// applyChromiumPatches). Paths are src-relative; commas separate multiple.
+// ===========================================================================
+abstract class GenChromiumPatchesTask extends DefaultTask {
+    @Internal abstract DirectoryProperty getWorkspaceDir()
+    @Input    abstract Property<String> getPatchesDir()
+    @Input @Optional abstract Property<String> getPristineRoot()
+    @Input @Optional abstract Property<String> getPatchFile()
+    @Input @Optional abstract Property<String> getPatchPaths()
+    @Inject   abstract ExecOperations getExecOperations()
+
+    @TaskAction
+    void execute() {
+        def srcDir = new File(workspaceDir.get().asFile, 'chromium/src')
+        if (!srcDir.exists())
+            throw new GradleException("Chromium src not found at ${srcDir}. Run seedChromium/setupEnv first.")
+        // The checkout is NOT a git repo (see applyChromiumPatches), so `git diff`
+        // there resolves to the parent skia-fx repo (which ignores /.chromium/) and
+        // sees nothing. Instead we `git diff --no-index <pristine> <modified>` per
+        // path against the pinned-version pristine tree (the same checkout
+        // seedChromium copied FROM), then normalize the headers to repo-relative
+        // a/<path> b/<path> so the result re-applies with default -p1 at srcDir.
+        def pristine = pristineRoot.getOrNull()
+        if (!pristine)
+            throw new GradleException("Provide -PpristineRoot=<dir> (or -PjuxCheckout) — the pinned-version pristine chromium/src to diff against.")
+        def pristineDir = new File(pristine)
+        if (!pristineDir.isDirectory())
+            throw new GradleException("Pristine chromium/src not found at ${pristineDir}.")
+        def outName = patchFile.getOrNull()
+        if (!outName)
+            throw new GradleException("Provide -Ppatch.file=NNNN-name.patch")
+        def paths = (patchPaths.getOrNull() ?: '').split(',').collect { it.trim() }.findAll { it }
+        if (paths.isEmpty())
+            throw new GradleException("Provide -Ppatch.paths=<src-relative paths, comma-separated>")
+
+        def buf = new StringBuilder()
+        paths.each { rel ->
+            def a = new File(pristineDir, rel)
+            def b = new File(srcDir, rel)
+            def aArg = a.exists() ? a.absolutePath.replace('\\', '/') : '/dev/null'
+            def bArg = b.exists() ? b.absolutePath.replace('\\', '/') : '/dev/null'
+            def out = new ByteArrayOutputStream()
+            // --no-index returns exit 1 when files differ — not an error here.
+            execOperations.exec {
+                commandLine(['git', 'diff', '--no-color', '--no-index', '--', aArg, bArg])
+                workingDir srcDir
+                standardOutput = out
+                ignoreExitValue true
+            }
+            def raw = out.toString('UTF-8')
+            if (raw.trim().isEmpty()) return  // identical — nothing for this path
+            // Normalize the file headers to repo-relative paths so `git apply`
+            // (plain, repo-less, -p1 at srcDir) lands on the right files.
+            def fixed = raw.readLines().collect { line ->
+                if (line.startsWith('diff --git '))
+                    return "diff --git a/${rel} b/${rel}".toString()
+                if (line.startsWith('--- '))
+                    return (line.contains('/dev/null') ? '--- /dev/null' : "--- a/${rel}".toString())
+                if (line.startsWith('+++ '))
+                    return (line.contains('/dev/null') ? '+++ /dev/null' : "+++ b/${rel}".toString())
+                return line
+            }.join('\n')
+            buf.append(fixed).append('\n')
+        }
+        if (buf.length() == 0) {
+            logger.lifecycle("[genPatch] No changes under ${paths} (vs ${pristineDir}) — nothing written.")
+            return
+        }
+        def pf = new File(patchesDir.get(), outName)
+        pf.parentFile.mkdirs()
+        pf.text = buf.toString()
+        logger.lifecycle("[genPatch] Wrote ${pf} (${buf.toString().readLines().size()} lines) from: ${paths.join(', ')}")
+    }
+}
+
+// --- Tasks (registered unconditionally; heavy ones are explicit/opt-in) ---
+
+tasks.register('seedChromium', SeedChromiumTask) {
+    group = 'chromium'
+    description = 'Full isolated copy of an existing Chromium checkout (no re-download).'
+    chromiumVersion = providers.gradleProperty('chromium.version')
+    sourceCheckout = providers.gradleProperty('juxCheckout')
+            .orElse('F:/DEV/jux-framework-blink/chromium')
+    sourceDepotTools = providers.gradleProperty('juxDepotTools')
+            .orElse('F:/DEV/jux-framework-blink/depot_tools')
+    workspaceDir = layout.dir(provider { workspaceDirFile })
+}
+
+tasks.register('setupEnv', SetupEnvTask) {
+    group = 'chromium'
+    description = 'Downloads + configures the Chromium tree at the pinned version (fresh machine).'
+    chromiumVersion = providers.gradleProperty('chromium.version')
+    syncJobs = providers.gradleProperty('chromium.syncJobs')
+    workspaceDir = layout.dir(provider { workspaceDirFile })
+}
+
+tasks.register('pullVersions', PullVersionsTask) {
+    group = 'chromium'
+    description = 'Lists available Chromium releases from ChromiumDash.'
+    channel = providers.gradleProperty('chromium.channel')
+    currentVersion = providers.gradleProperty('chromium.version')
+}
+
+tasks.register('configureBuild', ConfigureBuildTask) {
+    group = 'chromium'
+    description = 'Copies engine/stubs, patches src, writes args.gn, runs gn gen.'
+    buildType = providers.gradleProperty('chromium.buildType')
+    buildDir = providers.gradleProperty('chromium.buildDir').orElse('skiafxweb')
+    proprietaryCodecs = providers.gradleProperty('chromium.codecs.proprietary')
+    hevcEnabled = providers.gradleProperty('chromium.codecs.hevc')
+    dolbyVisionEnabled = providers.gradleProperty('chromium.codecs.dolbyVision')
+    // PDF + printing dropped by default for size. On Windows the printing
+    // stack requires enable_pdf, so the two go together; the engine's print
+    // command handlers are guarded by SFXWEB_ENABLE_PRINTING and compile to
+    // no-ops. Re-enable BOTH together:
+    //   -Pchromium.feature.pdf=true -Pchromium.feature.printing=true
+    // (and define SFXWEB_ENABLE_PRINTING + restore //printing in the engine).
+    enablePdf = providers.gradleProperty('chromium.feature.pdf').orElse('false')
+    enablePrinting = providers.gradleProperty('chromium.feature.printing').orElse('false')
+    enablePrintPreview = providers.gradleProperty('chromium.feature.printPreview').orElse('false')
+    // Every GN flag is overridable via -Pchromium.gn.<flag>=<value>, plus a
+    // raw -Pchromium.extraGnArgs= escape hatch for flags not in the defaults.
+    gnOverrides = providers.gradlePropertiesPrefixedBy('chromium.gn.')
+    extraGnArgs = providers.gradleProperty('chromium.extraGnArgs').orElse('')
+    engineSrc = engineSrcDir.absolutePath
+    stubsSrc = stubsSrcDir.absolutePath
+    patchesSrc = patchesSrcDir.absolutePath
+    printPreviewSrc = printPreviewSrcDir.absolutePath
+    workspaceDir = layout.dir(provider { workspaceDirFile })
+}
+
+tasks.register('buildNatives', BuildNativesTask) {
+    group = 'chromium'
+    description = 'Compiles the skia-fx-webview engine via ninja (incremental).'
+    buildDir = providers.gradleProperty('chromium.buildDir').orElse('skiafxweb')
+    buildJobs = providers.gradleProperty('chromium.buildJobs')
+    workspaceDir = layout.dir(provider { workspaceDirFile })
+}
+
+tasks.register('genChromiumPatches', GenChromiumPatchesTask) {
+    group = 'chromium'
+    description = 'Capture edits to pristine Chromium files as a patch: ' +
+        '-Ppatch.file=NNNN-name.patch -Ppatch.paths=relA,relB (re-applied by configureBuild).'
+    patchesDir = patchesSrcDir.absolutePath
+    // Pristine baseline to diff against = the pinned-version chromium/src that
+    // seedChromium copied FROM (default: the local jux reference checkout).
+    pristineRoot = providers.gradleProperty('pristineRoot')
+            .orElse(providers.gradleProperty('juxCheckout').map { it + '/src' })
+            .orElse('F:/DEV/jux-framework-blink/chromium/src')
+    patchFile = providers.gradleProperty('patch.file')
+    patchPaths = providers.gradleProperty('patch.paths')
+    workspaceDir = layout.dir(provider { workspaceDirFile })
+}
+
+// Headless end-to-end smoke test of the Blink IPC bridge: spawns the engine
+// straight from its build-output dir (no jar packaging needed), loads a page,
+// and round-trips executeScript. Run:
+//   ./gradlew :javafx.web:runBlinkSmoke
+//   ./gradlew :javafx.web:runBlinkSmoke -Pwebsmoke.url=https://example.com
+def engineDistForSmoke = new File(workspaceDirFile, "chromium/src/out/${buildDirName}")
+tasks.register('runBlinkSmoke', JavaExec) {
+    group = 'chromium'
+    description = 'Headless smoke test of the skia-fx-webview Blink IPC bridge.'
+    dependsOn tasks.named('compileJava')
+    javaLauncher.set(javaToolchains.launcherFor {
+        languageVersion = JavaLanguageVersion.of(25)
+    })
+    mainClass = 'com.sun.webkit.blink.BlinkSmokeMain'
+    classpath = sourceSets.main.runtimeClasspath
+    jvmArgs = ['--enable-preview', '--enable-native-access=ALL-UNNAMED']
+    systemProperty 'skia.webview.engineDir', engineDistForSmoke.absolutePath
+    systemProperty 'skia.webview.engineVerbose',
+        providers.gradleProperty('websmoke.verbose').orElse('true').get()
+    def smokeSwitches = providers.gradleProperty('websmoke.switches').getOrNull()
+    if (smokeSwitches) {
+        systemProperty 'skia.webview.switches', smokeSwitches
+    }
+    if (providers.gradleProperty('websmoke.show').isPresent()) {
+        systemProperty 'skia.webview.showWindow', providers.gradleProperty('websmoke.show').get()
+    }
+    def smokeUrl = providers.gradleProperty('websmoke.url').getOrNull()
+    if (smokeUrl) {
+        args(smokeUrl)
+    }
+    def smokeProbe = providers.gradleProperty('websmoke.probe').getOrNull()
+    if (smokeProbe) {
+        systemProperty 'websmoke.probe', smokeProbe
+    }
+    def smokeDump = providers.gradleProperty('websmoke.dumpFrame').getOrNull()
+    if (smokeDump) {
+        systemProperty 'websmoke.dumpFrame', smokeDump
+    }
+}
+
+// Stage engine artifacts for jar packaging.
+def copyNativeEngine = tasks.register('copyNativeEngine', Copy) {
+    group = 'chromium'
+    description = 'Stages skia-fx-webview engine artifacts for the jar.'
+    from(engineOutDir) {
+        include engineIncludes
+        exclude engineExcludes
+    }
+    into distDir
+}
+
+// SHA-256 manifest (checksums.properties at jar root; reused by NativeLibLoader).
+def checksumsDir = layout.buildDirectory.dir("generated/checksums/blink-${hostPlatform}-${hostArch}")
+def checksumsFile = checksumsDir.map { it.file('checksums.properties') }
+def generateChecksums = tasks.register('generateChecksums') {
+    group = 'build'
+    description = 'Generate SHA-256 checksums.properties for the skia-fx-webview engine artifacts.'
+    dependsOn copyNativeEngine
+    def srcDir = distDir
+    inputs.dir(srcDir).optional(true).withPropertyName('distDir')
+    outputs.file(checksumsFile).withPropertyName('checksumsFile')
+    doLast {
+        def sb = new StringBuilder()
+        if (srcDir.exists()) {
+            def entries = []
+            srcDir.eachFileRecurse(groovy.io.FileType.FILES) { f ->
+                if (f.name == 'checksums.properties') return
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                def buf = new byte[8192]
+                f.withInputStream { ins -> int n; while ((n = ins.read(buf)) != -1) digest.update(buf, 0, n) }
+                def hex = digest.digest().collect { String.format('%02x', it & 0xff) }.join()
+                entries << "/${f.name}=${hex}".toString()
+            }
+            entries.sort().each { sb.append(it).append('\n') }
+        }
+        def out = checksumsFile.get().asFile
+        out.parentFile.mkdirs()
+        out.text = sb.toString()
+        logger.lifecycle("Generated engine checksums manifest: ${out}")
+    }
+}
+
+// Pack engine artifacts + manifest at the jar root (NativeLibLoader extracts).
+tasks.withType(Jar).configureEach {
+    dependsOn generateChecksums
+    from(distDir)  // pack the whole staged runtime bundle at the jar root
+    from(checksumsDir) { include 'checksums.properties' }
+}
+
+// Note: the off-screen Blink frame is composited via
+// openjfx_skia_surface_draw_bgra, a C-ABI export ON the graphics module's
+// openjfx_skia_shared library (already loaded by the Skia pipeline). There is
+// no separate javafx.web native helper to build or package.
+
+def buildWebNative = gp('buildWebNative', 'false').toLowerCase() == 'true'
+if (!buildWebNative) {
+    logger.lifecycle "[skia-fx] javafx.web Blink engine build skipped " +
+            "(-PbuildWebNative=true to enable). Any prior build/native/blink-" +
+            "${hostPlatform}-${hostArch}/dist artifacts will still be packed. " +
+            "See docs/WEB_MODULE_BUILD.md."
+    return
+}
+
+// Under the gate: wire the full engine chain into assemble (and thus the
+// root `buildAll`, which fans out to every module's :assemble). The chain is
+// configureBuild -> buildNatives -> copyNativeEngine -> generateChecksums.
+// buildNatives depends on configureBuild so a clean buildAll re-copies the
+// engine overlay + re-runs gn gen before compiling (the checkout must already
+// be seeded — configureBuild fails with a clear message otherwise).
+tasks.named('buildNatives').configure { dependsOn 'configureBuild'; mustRunAfter 'configureBuild' }
+copyNativeEngine.configure { mustRunAfter 'buildNatives' }
+tasks.named('assemble').configure { dependsOn buildNatives, copyNativeEngine }
+tasks.withType(Jar).configureEach { dependsOn copyNativeEngine }
+generateChecksums.configure { dependsOn copyNativeEngine }
+
+logger.lifecycle "[skia-fx] javafx.web Blink engine build wired " +
+        "(host=${hostPlatform}-${hostArch}, workspace=${chromiumHome}, out=${buildDirName})"

@@ -1,0 +1,312 @@
+diff --git a/chrome/browser/ui/webui/print_preview/print_preview_handler.h b/chrome/browser/ui/webui/print_preview/print_preview_handler.h
+index bfd224f..dfc9041 100644
+--- a/chrome/browser/ui/webui/print_preview/print_preview_handler.h
++++ b/chrome/browser/ui/webui/print_preview/print_preview_handler.h
+@@ -22,6 +22,8 @@
+ #include "build/build_config.h"
+ #include "components/enterprise/buildflags/buildflags.h"
+ #include "components/prefs/pref_service.h"
++// skia-fx: ENABLE_EXTENSIONS guard for extension_printer_handler_ (off in jux).
++#include "extensions/buildflags/buildflags.h"
+ #include "components/printing/common/print.mojom.h"
+ #include "content/public/browser/web_ui_message_handler.h"
+ #include "mojo/public/cpp/bindings/associated_remote.h"
+@@ -289,7 +291,11 @@ class PrintPreviewHandler : public content::WebUIMessageHandler {
+ 
+   // Handles requests for extension printers. Created lazily by calling
+   // GetPrinterHandler().
++  // skia-fx: only built with the extensions system (enable_extensions=false in
++  // the jux engine), else it's an unused private field (-Wunused-private-field).
++#if BUILDFLAG(ENABLE_EXTENSIONS)
+   std::unique_ptr<PrinterHandler> extension_printer_handler_;
++#endif
+ 
+   // Handles requests for printing to PDF. Created lazily by calling
+   // GetPrinterHandler().
+diff --git a/chrome/browser/ui/webui/print_preview/print_preview_handler.cc b/chrome/browser/ui/webui/print_preview/print_preview_handler.cc
+index 5fba296..05530af 100644
+--- a/chrome/browser/ui/webui/print_preview/print_preview_handler.cc
++++ b/chrome/browser/ui/webui/print_preview/print_preview_handler.cc
+@@ -11,7 +11,10 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include "ash/constants/ash_features.h"
++// skia-fx: dead include "ash/constants/ash_features.h" removed (no ash:: use;
++// ChromeOS-only header, pruned from the desktop checkout). extensions/buildflags
++// added for the ENABLE_EXTENSIONS guard around the extension printer handler.
++#include "extensions/buildflags/buildflags.h"
+ #include "base/check.h"
+ #include "base/dcheck_is_on.h"
+ #include "base/feature_list.h"
+@@ -23,29 +26,37 @@
+ #include "base/time/time.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+-#include "chrome/browser/app_mode/app_mode_utils.h"
++// skia-fx: app_mode_utils.h removed — the jux engine never runs in forced app
++// (kiosk) mode, so isInAppKioskMode is hard false (see below).
+ #include "chrome/browser/bad_message.h"
+ #include "chrome/browser/browser_process.h"
+-#include "chrome/browser/printing/background_printing_manager.h"
++// skia-fx: background_printing_manager.h removed — no hide-preview-to-background
++// in the off-screen OSR model (the engine owns the preview WebContents).
+ #include "chrome/browser/printing/prefs_util.h"
+ #include "chrome/browser/printing/print_error_dialog.h"
+ #include "chrome/browser/printing/print_job_manager.h"
+ #include "chrome/browser/printing/print_preview_dialog_controller.h"
+ #include "chrome/browser/printing/print_preview_sticky_settings.h"
+ #include "chrome/browser/printing/print_view_manager.h"
+-#include "chrome/browser/printing/printer_manager_dialog.h"
++// skia-fx: printer_manager_dialog.h removed — "Manage printers" is a no-op in
++// the engine for now (see HandleManagePrinters).
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/ui/browser_finder.h"
+-#include "chrome/browser/ui/browser_tabstrip.h"
+-#include "chrome/browser/ui/chrome_pages.h"
+-#include "chrome/browser/ui/ui_features.h"
++// skia-fx: dead include "chrome/browser/ui/browser_finder.h" removed (no
++// chrome::Find* use; the jux engine has no chrome Browser/tab-strip).
++// skia-fx: dead include "chrome/browser/ui/browser_tabstrip.h" removed (no
++// tab-strip use; the jux engine has no chrome Browser/tab-strip).
++// skia-fx: dead include "chrome/browser/ui/chrome_pages.h" removed (no
++// chrome::Show* use here; the jux engine has no chrome Browser UI pages).
++// skia-fx: dead include "chrome/browser/ui/ui_features.h" removed (no
++// features:: use here).
+ #include "chrome/browser/ui/webui/print_preview/pdf_printer_handler.h"
+ #include "chrome/browser/ui/webui/print_preview/policy_settings.h"
+ #include "chrome/browser/ui/webui/print_preview/print_preview_metrics.h"
+ #include "chrome/browser/ui/webui/print_preview/print_preview_ui.h"
+ #include "chrome/browser/ui/webui/print_preview/print_preview_utils.h"
+ #include "chrome/browser/ui/webui/print_preview/printer_handler.h"
+-#include "chrome/common/crash_keys.h"
++// skia-fx: dead include "chrome/common/crash_keys.h" removed (no crash_keys::
++// use here).
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/printing/printer_capabilities.h"
+ #include "chrome/common/webui_url_constants.h"
+@@ -428,6 +439,7 @@ PrintPreviewHandler::PrintPreviewHandler() {
+ PrintPreviewHandler::~PrintPreviewHandler() = default;
+ 
+ void PrintPreviewHandler::RegisterMessages() {
++  LOG(ERROR) << "[skia-fx] PrintPreviewHandler::RegisterMessages (handler ready)";
+   web_ui()->RegisterMessageCallback(
+       "getPrinters",
+       base::BindRepeating(&PrintPreviewHandler::HandleGetPrinters,
+@@ -452,6 +464,16 @@ void PrintPreviewHandler::RegisterMessages() {
+       "closePrintPreviewDialog",
+       base::BindRepeating(&PrintPreviewHandler::HandleClosePreviewDialog,
+                           base::Unretained(this)));
++  // skia-fx: after a SUCCESSFUL print/save the frontend's NativeLayer.dialogClose()
++  // sends 'dialogClose' (only Cancel sends 'closePrintPreviewDialog'). Upstream let
++  // the ConstrainedWebDialogUI base class handle 'dialogClose', but our
++  // PrintPreviewUI is a plain WebUIController with no such base, so without this
++  // registration the message is dropped and the off-screen preview never closes
++  // after printing. Route it through the same teardown as Cancel.
++  web_ui()->RegisterMessageCallback(
++      "dialogClose",
++      base::BindRepeating(&PrintPreviewHandler::HandleClosePreviewDialog,
++                          base::Unretained(this)));
+   web_ui()->RegisterMessageCallback(
+       "hidePreview",
+       base::BindRepeating(&PrintPreviewHandler::HandleHidePreview,
+@@ -585,6 +607,8 @@ void PrintPreviewHandler::HandleGetPrinters(const base::ListValue& args) {
+   CHECK(!callback_id.empty());
+   int type = args[1].GetInt();
+   mojom::PrinterType printer_type = static_cast<mojom::PrinterType>(type);
++  LOG(ERROR) << "[skia-fx] HandleGetPrinters cb=" << callback_id
++             << " type=" << type;
+ 
+   // Immediately resolve the callback without fetching printers if the printer
+   // type is on the deny list.
+@@ -632,6 +656,8 @@ void PrintPreviewHandler::HandleGetPrinterCapabilities(
+     return;
+   }
+ 
++  LOG(ERROR) << "[skia-fx] HandleGetPrinterCapabilities cb=" << callback_id
++             << " printer=" << *printer_name << " type=" << *type;
+   PrinterHandler* handler = GetPrinterHandler(printer_type);
+   handler->StartGetCapability(
+       *printer_name,
+@@ -664,7 +690,15 @@ void PrintPreviewHandler::HandleGetPreview(const base::ListValue& args) {
+       initiator
+           ? PrintViewManager::FromWebContents(initiator)->print_preview_rfh()
+           : nullptr;
++  LOG(ERROR) << "[skia-fx] HandleGetPreview req=" << request_id
++             << " initiator=" << initiator << " rfh=" << rfh;
+   if (!rfh) {
++    LOG(ERROR) << "[skia-fx] HandleGetPreview: rfh NULL -> closing dialog "
++                  "(initiator="
++               << initiator << ", pvm="
++               << (initiator ? PrintViewManager::FromWebContents(initiator)
++                             : nullptr)
++               << ")";
+     ReportUserActionHistogram(UserActionBuckets::kInitiatorClosed);
+     print_preview_ui()->OnClosePrintPreviewDialog();
+     return;
+@@ -697,6 +731,9 @@ void PrintPreviewHandler::HandleGetPreview(const base::ListValue& args) {
+     print_render_frame_->SetPrintPreviewUI(
+         print_preview_ui()->BindPrintPreviewUI());
+   }
++  LOG(ERROR) << "[skia-fx] HandleGetPreview: issuing PrintPreview mojo to "
++                "renderer (req="
++             << request_id << ")";
+   print_render_frame_->PrintPreview(settings.Clone());
+   last_preview_settings_ = std::move(settings);
+ }
+@@ -865,6 +902,13 @@ void PrintPreviewHandler::HandleShowSystemDialog(
+ void PrintPreviewHandler::HandleClosePreviewDialog(
+     const base::ListValue& /*args*/) {
+   ReportUserActionHistogram(UserActionBuckets::kCancel);
++  // skia-fx: Cancel sends chrome.send('closePrintPreviewDialog'). Upstream relied
++  // on ConstrainedWebDialogUI's 'dialogClose' to tear the dialog down, but our
++  // PrintPreviewUI is a plain WebUIController, so we must trigger the teardown
++  // here: OnClosePrintPreviewDialog() → jux::ClosePrintPreview() destroys the
++  // off-screen preview WebContents and restores the initiator. Without this the
++  // app transitions to CLOSING (blank) but the preview is never closed.
++  print_preview_ui()->OnClosePrintPreviewDialog();
+ }
+ 
+ void PrintPreviewHandler::GetLocaleInformation(base::DictValue* settings) {
+@@ -901,6 +945,8 @@ void PrintPreviewHandler::HandleGetInitialSettings(
+   CHECK(args[0].is_string());
+   const std::string& callback_id = args[0].GetString();
+   CHECK(!callback_id.empty());
++  LOG(ERROR) << "[skia-fx] HandleGetInitialSettings cb=" << callback_id
++             << " — enumerating default printer";
+ 
+   AllowJavascript();
+ 
+@@ -935,6 +981,8 @@ void PrintPreviewHandler::SendInitialSettings(
+     const std::string& callback_id,
+     base::DictValue policies,
+     const std::string& default_printer) {
++  LOG(ERROR) << "[skia-fx] SendInitialSettings cb=" << callback_id
++             << " default_printer=\"" << default_printer << "\"";
+   const mojom::RequestPrintPreviewParams* request_params = GetRequestParams();
+   mojom::RequestPrintPreviewParams dummy_params;
+   if (!request_params) {
+@@ -979,7 +1027,8 @@ void PrintPreviewHandler::SendInitialSettings(
+   initial_settings.Set(kDestinationsManaged, destinations_managed);
+ 
+   initial_settings.Set(kIsInKioskAutoPrintMode, SilentPrintingEnabled());
+-  initial_settings.Set(kIsInAppKioskMode, IsRunningInForcedAppMode());
++  // skia-fx: never forced-app/kiosk mode in the jux engine.
++  initial_settings.Set(kIsInAppKioskMode, false);
+   const std::string rules_str =
+       prefs->GetString(prefs::kPrintPreviewDefaultDestinationSelectionRules);
+   if (rules_str.empty()) {
+@@ -1012,12 +1061,13 @@ void PrintPreviewHandler::SendPrinterCapabilities(
+   base::DictValue* settings = settings_info.FindDict(kSettingCapabilities);
+   if (settings) {
+     FilterContinuousFeedMediaSizes(*settings);
+-    VLOG(1) << "Get printer capabilities finished";
++    LOG(ERROR) << "[skia-fx] SendPrinterCapabilities OK cb=" << callback_id;
+     ResolveJavascriptCallback(base::Value(callback_id), settings_info);
+     return;
+   }
+ 
+-  VLOG(1) << "Get printer capabilities failed";
++  LOG(ERROR) << "[skia-fx] SendPrinterCapabilities FAILED (no caps) cb="
++             << callback_id;
+   RejectJavascriptCallback(base::Value(callback_id), base::Value());
+ }
+ 
+@@ -1162,6 +1212,10 @@ void PrintPreviewHandler::ClearInitiatorDetails() {
+ 
+ PrinterHandler* PrintPreviewHandler::GetPrinterHandler(
+     mojom::PrinterType printer_type) {
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++  // skia-fx: extension printers require the extensions system, which the jux
++  // engine does not build (enable_extensions=false). Compiled out; the WebUI
++  // never offers an extension destination. See jux print_preview port.
+   if (printer_type == mojom::PrinterType::kExtension) {
+     if (!extension_printer_handler_) {
+       extension_printer_handler_ = PrinterHandler::CreateForExtensionPrinters(
+@@ -1169,6 +1223,7 @@ PrinterHandler* PrintPreviewHandler::GetPrinterHandler(
+     }
+     return extension_printer_handler_.get();
+   }
++#endif
+   if (printer_type == mojom::PrinterType::kPdf) {
+     if (!pdf_printer_handler_) {
+       pdf_printer_handler_ = PrinterHandler::CreateForPdfPrinter(
+@@ -1223,16 +1278,9 @@ void PrintPreviewHandler::OnPrintResult(const std::string& callback_id,
+   } else {
+     RejectJavascriptCallback(base::Value(callback_id), error);
+   }
+-  // Remove the preview dialog from the background printing manager if it is
+-  // being stored there. Since the PDF has been sent and the callback is
+-  // resolved or rejected, it is no longer needed and can be destroyed.
+-  BackgroundPrintingManager* background_printing_manager =
+-      g_browser_process->background_printing_manager();
+-  if (background_printing_manager->HasPrintPreviewDialog(
+-          preview_web_contents())) {
+-    background_printing_manager->OnPrintRequestCancelled(
+-        preview_web_contents());
+-  }
++  // skia-fx: no BackgroundPrintingManager in the off-screen OSR model — the
++  // engine owns the preview WebContents lifecycle, so there is nothing to
++  // release back to a background store here.
+ }
+ 
+ void PrintPreviewHandler::BadMessageReceived() {
+@@ -1263,7 +1311,9 @@ void PrintPreviewHandler::HandleManagePrinters(const base::ListValue& args) {
+   }
+   local_printer_->ShowSystemPrintSettings(base::DoNothing());
+ #else
+-  printing::PrinterManagerDialog::ShowPrinterManagerDialog();
++  // skia-fx: the OS printer-management dialog launcher (PrinterManagerDialog,
++  // chrome desktop UI) is not wired into the engine yet. The "Manage printers"
++  // link is a no-op for now; a jux-side launcher can be added in M5.
+ #endif
+ }
+ 
+diff --git a/chrome/browser/ui/webui/print_preview/printer_handler.cc b/chrome/browser/ui/webui/print_preview/printer_handler.cc
+index 53de238..3135e49 100644
+--- a/chrome/browser/ui/webui/print_preview/printer_handler.cc
++++ b/chrome/browser/ui/webui/print_preview/printer_handler.cc
+@@ -6,9 +6,14 @@
+ 
+ #include "build/build_config.h"
+ #include "build/buildflag.h"
+-#include "chrome/browser/ui/webui/print_preview/extension_printer_handler.h"
+ #include "chrome/browser/ui/webui/print_preview/pdf_printer_handler.h"
+ #include "chrome/common/buildflags.h"
++#include "extensions/buildflags/buildflags.h"
++// skia-fx: extension printers need the extensions system (enable_extensions=
++// false in the jux engine), so the handler + its include are gated off.
++#if BUILDFLAG(ENABLE_EXTENSIONS)
++#include "chrome/browser/ui/webui/print_preview/extension_printer_handler.h"
++#endif
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+ #include "chrome/browser/ui/webui/print_preview/local_printer_handler_chromeos.h"
+@@ -18,11 +23,13 @@
+ 
+ namespace printing {
+ 
++#if BUILDFLAG(ENABLE_EXTENSIONS)
+ // static
+ std::unique_ptr<PrinterHandler> PrinterHandler::CreateForExtensionPrinters(
+     Profile* profile) {
+   return std::make_unique<ExtensionPrinterHandler>(profile);
+ }
++#endif
+ 
+ // static
+ std::unique_ptr<PrinterHandler> PrinterHandler::CreateForLocalPrinters(
+diff --git a/chrome/browser/ui/webui/print_preview/pdf_printer_handler.cc b/chrome/browser/ui/webui/print_preview/pdf_printer_handler.cc
+index b5e5f8b..739e8c9 100644
+--- a/chrome/browser/ui/webui/print_preview/pdf_printer_handler.cc
++++ b/chrome/browser/ui/webui/print_preview/pdf_printer_handler.cc
+@@ -19,7 +19,8 @@
+ #include "base/task/thread_pool.h"
+ #include "base/values.h"
+ #include "build/build_config.h"
+-#include "chrome/browser/app_mode/app_mode_utils.h"
++// skia-fx: dead include "chrome/browser/app_mode/app_mode_utils.h" removed
++// (no app-mode use here; pulls the kiosk cone, pruned from the checkout).
+ #include "chrome/browser/browser_process.h"
+ #include "chrome/browser/download/download_prefs.h"
+ #include "chrome/browser/platform_util.h"

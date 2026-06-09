@@ -1,0 +1,106 @@
+/*
+ * skiafx.java-conventions
+ *
+ * Java compilation policy for every JVM subproject:
+ *   - JDK 25 toolchain (auto-provisioned via Foojay resolver).
+ *   - --release 25 (no older JVM target).
+ *   - UTF-8 sources, deterministic output, lint enabled but not -Werror
+ *     during phase 0 (we'll tighten this once the surface is stable).
+ *   - Reproducible jars (no timestamps).
+ *   - Javadoc as a first-class artifact.
+ *
+ * The Implementation-Version manifest attribute carries the skia-fx
+ * overlay version (e.g. "25.0.0-skia-fx-0.1.0-SNAPSHOT") while the
+ * jar filename stays the bare upstream JFX version — drop-in
+ * compatibility with stock OpenJFX SDKs.
+ */
+
+plugins {
+    id 'java-library'
+}
+
+def libs = project.extensions.getByType(VersionCatalogsExtension).named('libs')
+def javaVersion = providers.gradleProperty('javaVersion')
+    .orElse(libs.findVersion('java').get().requiredVersion)
+    .get()
+def javafxVersion = libs.findVersion('javafx').get().requiredVersion
+def skiafxVersion = providers.gradleProperty('skiafxVersion')
+    .orElse(libs.findVersion('skiafx').get().requiredVersion)
+    .get()
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(javaVersion as int)
+    }
+    // Javadoc + sources jars intentionally NOT enabled here:
+    //   - Javadoc generation hits a JDK 25 javadoc internal-exception
+    //     on JFX's @see cross-module references (an upstream OpenJDK
+    //     bug, not anything in our code).
+    //   - Per-module sourcesJar adds noise to sdk/ without an
+    //     immediate consumer. Re-enable per-module with
+    //     `java { withSourcesJar() }` in that module's build.gradle.
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.release.set(javaVersion as int)
+    options.encoding = 'UTF-8'
+    options.compilerArgs.addAll([
+        '-Xlint:all',
+        '-Xlint:-serial',          // we don't ship Serializable across versions
+        '-Xlint:-processing',      // annotation processors are noisy here
+        // `-module` warns about exports targeting a module not yet on
+        // the compile module-path. JavaFX's intra-module exports
+        // (controls→web, graphics→swing/web/media, …) point at modules
+        // that javac CAN'T see when compiling the producer because the
+        // consumer is downstream — adding it to the producer's
+        // compileClasspath would create a real circular dependency.
+        // Upstream OpenJFX emits the same warnings; suppressing here.
+        '-Xlint:-module',
+        '--enable-preview',        // JDK 25 preview features available where needed
+    ])
+    // Per-frame allocation discipline (CLAUDE.md): keep this off so we don't
+    // accidentally rely on synthetic accessor methods in hot paths.
+    options.fork = true
+}
+
+tasks.withType(JavaExec).configureEach {
+    jvmArgs '--enable-preview'
+}
+
+tasks.withType(Test).configureEach {
+    jvmArgs '--enable-preview'
+    useJUnitPlatform()
+}
+
+tasks.withType(Javadoc).configureEach {
+    options.encoding = 'UTF-8'
+    options.addBooleanOption('html5', true)
+    options.addStringOption('Xdoclint:none', '-quiet')
+    // Public-API modules get full Javadoc; internal modules tolerate gaps.
+}
+
+tasks.withType(Jar).configureEach {
+    // Reproducible jars: no timestamps, sorted entries.
+    preserveFileTimestamps = false
+    reproducibleFileOrder = true
+    duplicatesStrategy = DuplicatesStrategy.FAIL
+    manifest {
+        attributes(
+            'Implementation-Title':    project.name,
+            // The jar filename uses project.version (bare upstream JFX
+            // release — e.g. 25.0.0 — for drop-in compatibility).
+            // Implementation-Version carries the skia-fx overlay so the
+            // delta is visible at runtime without breaking
+            // module-path or pom.xml consumers.
+            'Implementation-Version':  "${javafxVersion}-skia-fx-${skiafxVersion}",
+            'Implementation-Vendor':   'skia-fx',
+            'Specification-Title':     project.name,
+            'Specification-Version':   javafxVersion.tokenize('.')[0],  // "25"
+            'Specification-Vendor':    'Oracle Corporation',             // matches upstream JFX
+        )
+    }
+}
+
+// JaCoCo will be re-added once it ships a release supporting Java 25
+// class files (major version 69). 0.8.12 fails to instrument; revisit
+// when 0.8.13+ is out.

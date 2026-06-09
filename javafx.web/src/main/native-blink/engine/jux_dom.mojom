@@ -1,0 +1,289 @@
+// Copyright 2026 Xtreme Software Solutions. All rights reserved.
+//
+// Mojo interfaces used by the Jux engine to drive Blink's DOM from the
+// browser process (where Java-side commands land via the shared memory
+// ring buffer) and to forward DOM events back to the browser process for
+// emission to Java.
+//
+// Topology:
+//   Java  ↔ shared-memory rings ↔ CommandDispatcher (browser)
+//                                     │
+//                                     ▼
+//                           JuxDomHandler (browser-facing Remote)
+//                                     │  Mojo
+//                                     ▼
+//                          JuxDomHandlerImpl (renderer)
+//                                     │
+//                                     ▼
+//                          blink::WebDocument / WebElement
+//
+// Events flow back through JuxDomClient (renderer → browser remote).
+
+module jux.mojom;
+
+import "mojo/public/mojom/base/string16.mojom";
+
+// A single node in the DOM tree as serialised across the Mojo boundary.
+// Element nodes carry tag/id/class; text nodes carry the text string.
+struct DomNode {
+  // Stable identifier assigned by the renderer. Used by Java to refer
+  // to the node in subsequent commands. Zero is reserved as "none".
+  int64 node_id;
+
+  // The parent node's id, or 0 if this is the document element's root.
+  int64 parent_id;
+
+  // True if this node is a Text node (non-element).
+  bool is_text;
+
+  // Tag name in upper-case (e.g. "DIV"). Empty for text nodes.
+  string tag;
+
+  // Value of the id attribute, or empty string.
+  string id_attr;
+
+  // Value of the class attribute (space-separated), or empty string.
+  string class_attr;
+
+  // Text content for text nodes. Empty for element nodes (the tree walk
+  // does not dump element innerText, only explicit Text children).
+  string text;
+};
+
+// (code, node_id) pair subscribed from the browser so the renderer can
+// watch the named DOM node and push its current viewport-DIP rect back.
+// `code` is the Win32 HT* code the browser wants for that element
+// (HTMINBUTTON=8, HTMAXBUTTON=9, HTCLOSE=20, ...).
+struct HitSpotNode {
+  uint32 code;
+  int64 node_id;
+};
+
+// Viewport-DIP rect for a single hit-spot, pushed from the renderer to
+// the browser after layout changes. Rect is in client-area device-
+// independent pixels — the same coordinate space that Win32 WM_NCHITTEST
+// maths in once the caller has done a ScreenToClient conversion.
+struct HitSpotRect {
+  uint32 code;
+  double x;
+  double y;
+  double w;
+  double h;
+};
+
+// Mutation record forwarded from the renderer's MutationObserver to
+// the browser when the DOM changes from a source other than Java (for
+// example script-driven mutations, or HTML parsing from a later
+// setInnerHTML). Only fired for nodes the browser already knows about
+// — the renderer-side observer drops records targeting unwalked nodes
+// to avoid id-space pollution.
+struct MutationRecord {
+  // 0 = attributes, 1 = childList, 2 = characterData
+  int32 type;
+
+  // Engine node id of the target (the element for attribute /
+  // childList mutations, the text node for characterData).
+  int64 target_node_id;
+
+  // Only for type=0 (attributes). Old/new values may be empty.
+  string attribute_name;
+  string old_value;
+  string new_value;
+
+  // Only for type=1 (childList). Ids of nodes added / removed at the
+  // target. Unknown ids are skipped on the renderer side.
+  array<int64> added_ids;
+  array<int64> removed_ids;
+
+  // Only for type=2 (characterData). Old/new character data.
+  string old_text;
+  string new_text;
+};
+
+// One option of a native <select> popup surfaced to Java. `group` is the
+// enclosing <optgroup> label (empty if none).
+struct JuxSelectItem {
+  string label;
+  string value;
+  bool enabled;
+  string group;
+};
+
+// Browser → renderer interface. The browser calls these when the Java
+// application issues DOM commands via the shared memory command ring.
+// All methods are fire-and-forget except RequestDomTree, which returns
+// the full document snapshot.
+interface JuxDomHandler {
+  // Hands the renderer a remote it can use to post DOM events back to
+  // the browser. Called once after the pipe is first bound (per
+  // RenderFrame). The browser binds its JuxDomClientImpl's receiver to
+  // this remote end.
+  SetClient(pending_remote<JuxDomClient> client);
+
+  // Walks the current primary main frame's document and returns every
+  // element and text node in document order. Called once per page load
+  // (triggered from the browser after DidFinishLoad), and again on
+  // explicit request from Java.
+  RequestDomTree() => (array<DomNode> nodes);
+
+  // Registers a named DOM event listener on a specific node. When the
+  // event fires in Blink, the renderer calls JuxDomClient.OnDomEvent on
+  // the paired remote. event_type is the lowercase DOM event name, e.g.
+  // "click", "keydown", "input".
+  AddEventListener(int64 node_id, string event_type);
+
+  // Removes a previously-registered listener.
+  RemoveEventListener(int64 node_id, string event_type);
+
+  // DOM manipulation. node_id refers to the caller-assigned id that was
+  // reserved from the Java side (Java's allocator); for CreateElement it
+  // is the id that the new node should take.
+  CreateElement(int64 node_id, string tag);
+  RemoveElement(int64 node_id);
+  SetAttribute(int64 node_id, string name, string value);
+  RemoveAttribute(int64 node_id, string name);
+  SetTextContent(int64 node_id, string text);
+  SetInnerHtml(int64 node_id, string html);
+  AppendChild(int64 parent_id, int64 child_id);
+  InsertBefore(int64 parent_id, int64 child_id, int64 ref_id);
+
+  // Inline style mutation. For AddClass/RemoveClass, pass a single
+  // class-name token (no whitespace).
+  SetStyleProperty(int64 node_id, string prop, string value);
+  AddClass(int64 node_id, string class_name);
+  RemoveClass(int64 node_id, string class_name);
+
+  // Stylesheet injection. The engine keeps a map of ids to <style>
+  // elements; adding again with the same id replaces the previous one.
+  AddStylesheet(uint32 id, string css);
+  RemoveStylesheet(uint32 id);
+
+  // Registers the set of DOM nodes that back the custom-chrome hit
+  // spots on the browser's WndProc subclass. The renderer looks each
+  // node up, calls Element::getBoundingClientRect on every layout
+  // tick, and posts OnHitSpotRects with the full list. An empty array
+  // clears the subscription (useful when the window toggles back to
+  // native chrome).
+  SetHitSpotNodes(array<HitSpotNode> nodes);
+
+  // Drives Blink's :hover pseudo-class on the element registered at
+  // `code` (one of the HT* codes passed to SetHitSpotNodes). Called
+  // from the browser when the user's cursor enters or leaves the
+  // corresponding custom-chrome overlay HWND — the overlay covers
+  // the HTML button and eats real mouse moves, so Blink would never
+  // hit-test the button on its own and the author's CSS `:hover`
+  // rules would never fire. This poke into Node::SetHovered makes
+  // the real :hover state-machine match the overlay's mouse state
+  // without any JS eval or custom attribute.
+  SetHitSpotHovered(uint32 code, bool hovered);
+
+  // Answers a native <select> popup the renderer opened via
+  // JuxDomClient.OnSelectPopup. `indices` are the option indices to select
+  // (empty = cancelled / no change). For single selects only the first index
+  // is used. The renderer applies the selection and dispatches `input`+`change`.
+  SelectPopupResponse(uint32 popup_id, array<int32> indices);
+
+  // Answers an <input type=color> picker the renderer opened via
+  // JuxDomClient.OnColorChooser. `chosen`=false cancels (no change). `rgba` is
+  // packed 0xRRGGBBAA (alpha ignored for color inputs). The renderer sets the
+  // input value and dispatches `input`+`change`.
+  ColorChooserResponse(uint32 chooser_id, bool chosen, uint32 rgba);
+
+  // Tells the renderer which form popups the app overrides. For an overridden
+  // control the renderer intercepts the click (preventDefault) and surfaces the
+  // request to Java (OnSelectPopup/OnColorChooser); otherwise it leaves the event
+  // alone so Blink opens its own native page-popup.
+  SetPopupOverrides(bool select_overridden, bool color_overridden);
+
+  // ── JavaScript object bridge (netscape.javascript.JSObject) ──────────
+  // Operate on a live V8 object kept alive in the renderer's per-page table,
+  // keyed by `object_id` (0 = the global window). Values are tagged bytes per
+  // jux_js_value.h (symmetric with JSValueCodec.java). Reply-bearing ops return
+  // (value, error): a non-empty `error` is a JS exception (Java throws
+  // JSException). JsRelease is fire-and-forget, driven by the Java wrapper's
+  // Cleaner when the JSObject is garbage-collected.
+  JsGetMember(int32 object_id, string name) => (array<uint8> value, string error);
+  JsSetMember(int32 object_id, string name, array<uint8> value) => (string error);
+  JsRemoveMember(int32 object_id, string name) => (string error);
+  JsGetSlot(int32 object_id, int32 index) => (array<uint8> value, string error);
+  JsSetSlot(int32 object_id, int32 index, array<uint8> value) => (string error);
+  JsCall(int32 object_id, string name, uint32 argc, array<uint8> args)
+      => (array<uint8> value, string error);
+  JsEval(int32 object_id, string script) => (array<uint8> value, string error);
+  JsRelease(int32 object_id);
+
+  // Resolves the JS Promise returned by a host-proxy call (slice B). `call_id`
+  // matches the one carried by the OnJavaCall that started the call. `ok` true
+  // → resolve with `value` (tagged bytes per jux_js_value.h); `ok` false →
+  // reject with `error`. Driven by the Java method's return value/exception.
+  ResolveJavaCall(int32 call_id, bool ok, array<uint8> value, string error);
+};
+
+// Renderer → browser interface. The renderer-side DomHandlerImpl calls
+// these when an event registered via AddEventListener fires, or when a
+// tree-walk delivers elements/text. Everything is fire-and-forget so the
+// renderer never blocks on the browser.
+interface JuxDomClient {
+  // Fired when a registered DOM event reaches its registration target.
+  // `payload` is event-type-specific binary blob (little-endian). The
+  // browser side knows how to interpret it per event_type.
+  OnDomEvent(int64 node_id,
+              string event_type,
+              array<uint8> payload);
+
+  // Fired when the rendered page invokes window.print(). user_initiated
+  // is true if the call was driven by a user gesture (e.g. Ctrl+P).
+  // The browser responds by showing the native OS print dialog.
+  OnScriptedPrint(bool user_initiated);
+
+  // Fired when non-Java DOM mutations (typically from JS or parser)
+  // affect nodes the browser already knows about. Records are batched
+  // per MutationObserver delivery so the Java side can apply them in
+  // order.
+  OnMutations(array<MutationRecord> records);
+
+  // Viewport-DIP rects for the currently registered hit-spot nodes.
+  // Fired whenever a layout tick shows a change against the prior
+  // rect set (including the initial set-all fire). The browser uses
+  // the array to drive jux::SetChromeHitSpots, which in turn updates
+  // the snap-layout overlay HWND.
+  OnHitSpotRects(array<HitSpotRect> rects);
+
+  // Fired on a document-level `contextmenu` (right-click). The WebView is
+  // off-screen and shows no native menu — the browser forwards this to Java
+  // so the application can present its own ContextMenu. `x`/`y` are viewport
+  // (client) coordinates; `flags` bit0 = the target is editable; `link`/`src`
+  // are the resolved href / media source under the cursor (empty if none);
+  // `selection` is the current selection text.
+  OnContextMenu(double x, double y, uint32 flags,
+                string link, string src, string selection);
+
+  // Fired when the nearest `title` attribute under the pointer changes (the
+  // off-screen view has no native tooltip). Empty string clears the tooltip.
+  OnTooltipChanged(string text);
+
+  // Fired when the user opens a native <select> (the off-screen view shows no
+  // native popup). The browser forwards this to Java so the application can
+  // present its own list. `flags` bit0 = multiple-select; `selected_index` is
+  // the current selection; `x`/`y`/`w`/`h` are the select's viewport rect (for
+  // anchoring). Answer via JuxDomHandler.SelectPopupResponse.
+  OnSelectPopup(uint32 popup_id, uint32 flags, int32 selected_index,
+                double x, double y, double w, double h,
+                array<JuxSelectItem> items);
+
+  // Fired when the user activates an <input type=color> (the off-screen view
+  // shows no native picker). `initial_rgba` is the input's current value packed
+  // 0xRRGGBBAA; `suggestions` are any <datalist> colors. Answer via
+  // JuxDomHandler.ColorChooserResponse.
+  OnColorChooser(uint32 chooser_id, uint32 initial_rgba,
+                 array<uint32> suggestions);
+
+  // Fired when JS invokes a method on a Java object that was exposed via
+  // JSObject.setMember (slice B). `java_id` identifies the Java object; `args`
+  // are `argc` tagged values per jux_js_value.h. The JS call returns a Promise;
+  // `call_id` correlates the eventual JuxDomHandler.ResolveJavaCall that settles
+  // it with the Java method's return value/exception (see
+  // docs/WEBVIEW_JS_BRIDGE.md). The Java method runs on the FX thread.
+  OnJavaCall(int32 java_id, int32 call_id, string name, uint32 argc,
+             array<uint8> args);
+};

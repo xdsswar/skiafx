@@ -1,0 +1,2719 @@
+/*
+ * Copyright (c) 2011, 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package javafx.scene.web;
+
+import com.sun.javafx.logging.PlatformLogger;
+import com.sun.javafx.scene.web.Debugger;
+import com.sun.javafx.scene.web.Printable;
+import com.sun.javafx.tk.TKPulseListener;
+import com.sun.javafx.tk.Toolkit;
+import com.sun.javafx.webkit.*;
+import com.sun.javafx.webkit.prism.PrismGraphicsManager;
+import com.sun.javafx.webkit.prism.PrismInvoker;
+import com.sun.javafx.webkit.prism.theme.PrismRenderer;
+import com.sun.javafx.webkit.theme.RenderThemeImpl;
+import com.sun.javafx.webkit.theme.Renderer;
+import com.sun.webkit.*;
+import com.sun.webkit.blink.BlinkPage;
+import com.sun.webkit.graphics.WCGraphicsManager;
+import com.sun.webkit.network.URLs;
+import com.sun.webkit.network.Util;
+import javafx.animation.AnimationTimer;
+import javafx.application.Platform;
+import javafx.beans.InvalidationListener;
+import javafx.beans.property.*;
+import javafx.util.Subscription;
+import javafx.concurrent.Worker;
+import javafx.event.EventHandler;
+import javafx.event.EventType;
+import javafx.geometry.Point2D;
+import javafx.geometry.Rectangle2D;
+import javafx.scene.control.ContextMenu;
+import javafx.scene.control.MenuItem;
+import javafx.scene.control.SeparatorMenuItem;
+import javafx.scene.paint.Color;
+import javafx.print.JobSettings;
+import javafx.print.PageLayout;
+import javafx.print.PageRange;
+import javafx.print.PrinterJob;
+import javafx.scene.Node;
+import javafx.stage.DirectoryChooser;
+import javafx.stage.FileChooser;
+import javafx.stage.Window;
+import javafx.util.Callback;
+import org.w3c.dom.Document;
+
+import java.io.BufferedInputStream;
+import java.io.File;
+import java.io.IOException;
+import static java.lang.String.format;
+import java.lang.ref.WeakReference;
+import java.net.MalformedURLException;
+import java.net.URLConnection;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.Base64;
+import java.util.List;
+import java.util.function.Consumer;
+import java.util.Objects;
+import javafx.scene.input.Clipboard;
+import javafx.scene.input.ClipboardContent;
+
+import static com.sun.webkit.LoadListenerClient.*;
+
+/**
+ * {@code WebEngine} is a non-visual object capable of managing one Web page
+ * at a time. It loads Web pages, creates their document models, applies
+ * styles as necessary, and runs JavaScript on pages. It provides access
+ * to the document model of the current page, and enables two-way
+ * communication between a Java application and JavaScript code of the page.
+ *
+ * <p><b>Loading Web Pages</b></p>
+ * <p>The {@code WebEngine} class provides two ways to load content into a
+ * {@code WebEngine} object:
+ * <ul>
+ * <li>From an arbitrary URL using the {@link #load} method. This method uses
+ *     the {@code java.net} package for network access and protocol handling.
+ * <li>From an in-memory String using the
+ *     {@link #loadContent(java.lang.String, java.lang.String)} and
+ *     {@link #loadContent(java.lang.String)} methods.
+ * </ul>
+ * <p>Loading always happens on a background thread. Methods that initiate
+ * loading return immediately after scheduling a background job. To track
+ * progress and/or cancel a job, use the {@link javafx.concurrent.Worker}
+ * instance available from the {@link #getLoadWorker} method.
+ *
+ * <p>The following example changes the stage title when loading completes
+ * successfully:
+ * <pre>{@code
+    import javafx.concurrent.Worker.State;
+    final Stage stage;
+    webEngine.getLoadWorker().stateProperty().addListener(
+        new ChangeListener<State>() {
+            public void changed(ObservableValue ov, State oldState, State newState) {
+                if (newState == State.SUCCEEDED) {
+                    stage.setTitle(webEngine.getLocation());
+                }
+            }
+        });
+    webEngine.load("http://javafx.com");
+ * }</pre>
+ *
+ * <p><b>User Interface Callbacks</b></p>
+ * <p>A number of user interface callbacks may be registered with a
+ * {@code WebEngine} object. These callbacks are invoked when a script running
+ * on the page requests a user interface operation to be performed, for
+ * example, opens a popup window or changes status text. A {@code WebEngine}
+ * object cannot handle such requests internally, so it passes the request to
+ * the corresponding callbacks. If no callback is defined for a specific
+ * operation, the request is silently ignored.
+ *
+ * <p>The table below shows JavaScript user interface methods and properties
+ * with their corresponding {@code WebEngine} callbacks:
+ * <table border="1">
+ * <caption>JavaScript Callback Table</caption>
+ * <tr>
+ *     <th scope="col">JavaScript method/property</th>
+ *     <th scope="col">WebEngine callback</th>
+ * </tr>
+ * <tr><th scope="row">{@code window.alert()}</th><td>{@code onAlert}</td></tr>
+ * <tr><th scope="row">{@code window.confirm()}</th><td>{@code confirmHandler}</td></tr>
+ * <tr><th scope="row">{@code window.open()}</th><td>{@code createPopupHandler}</td></tr>
+ * <tr><th scope="row">{@code window.open()} and<br>
+ *         {@code window.close()}</th><td>{@code onVisibilityChanged}</td></tr>
+ * <tr><th scope="row">{@code window.prompt()}</th><td>{@code promptHandler}</td></tr>
+ * <tr><th scope="row">Setting {@code window.status}</th><td>{@code onStatusChanged}</td></tr>
+ * <tr><th scope="row">Setting any of the following:<br>
+ *         {@code window.innerWidth}, {@code window.innerHeight},<br>
+ *         {@code window.outerWidth}, {@code window.outerHeight},<br>
+ *         {@code window.screenX}, {@code window.screenY},<br>
+ *         {@code window.screenLeft}, {@code window.screenTop}</th>
+ *         <td>{@code onResized}</td></tr>
+ * </table>
+ *
+ * <p>The following example shows a callback that resizes a browser window:
+ * <pre>{@code
+    Stage stage;
+    webEngine.setOnResized(
+        new EventHandler<WebEvent<Rectangle2D>>() {
+            public void handle(WebEvent<Rectangle2D> ev) {
+                Rectangle2D r = ev.getData();
+                stage.setWidth(r.getWidth());
+                stage.setHeight(r.getHeight());
+            }
+        });
+ * }</pre>
+ *
+ * <p><b>Access to Document Model</b></p>
+ * <p>The {@code WebEngine} objects create and manage a Document Object Model
+ * (DOM) for their Web pages. The model can be accessed and modified using
+ * Java DOM Core classes. The {@link #getDocument()} method provides access
+ * to the root of the model. Additionally DOM Event specification is supported
+ * to define event handlers in Java code.
+ *
+ * <p>The following example attaches a Java event listener to an element of
+ * a Web page. Clicking on the element causes the application to exit:
+ * <pre>{@code
+    EventListener listener = new EventListener() {
+        public void handleEvent(Event ev) {
+            Platform.exit();
+        }
+    };
+
+    Document doc = webEngine.getDocument();
+    Element el = doc.getElementById("exit-app");
+    ((EventTarget) el).addEventListener("click", listener, false);
+ * }</pre>
+ *
+ * <p><b>Evaluating JavaScript expressions</b></p>
+ * <p>It is possible to execute arbitrary JavaScript code in the context of
+ * the current page using the {@link #executeScript} method. For example:
+ * <pre>{@code
+    webEngine.executeScript("history.back()");
+ * }</pre>
+ *
+ * <p>The execution result is returned to the caller,
+ * as described in the next section.
+ *
+ * <p><b>Mapping JavaScript values to Java objects</b></p>
+ *
+ * JavaScript values are represented using the obvious Java classes:
+ * null becomes Java null; a boolean becomes a {@code java.lang.Boolean};
+ * and a string becomes a {@code java.lang.String}.
+ * A number can be {@code java.lang.Double} or a {@code java.lang.Integer},
+ * depending.
+ * The undefined value maps to a specific unique String
+ * object whose value is {@code "undefined"}.
+ * <p>
+ * If the result is a
+ * JavaScript object, it is wrapped as an instance of the
+ * {@link netscape.javascript.JSObject} class.
+ * (As a special case, if the JavaScript object is
+ * a {@code JavaRuntimeObject} as discussed in the next section,
+ * then the original Java object is extracted instead.)
+ * The {@code JSObject} class is a proxy that provides access to
+ * methods and properties of its underlying JavaScript object.
+ * The most commonly used {@code JSObject} methods are
+ * {@link netscape.javascript.JSObject#getMember getMember}
+ * (to read a named property),
+ * {@link netscape.javascript.JSObject#setMember setMember}
+ * (to set or define a property),
+ * and {@link netscape.javascript.JSObject#call call}
+ * (to call a function-valued property).
+ * <p>
+ * A DOM {@code Node} is mapped to an object that both extends
+ * {@code JSObject} and implements the appropriate DOM interfaces.
+ * To get a {@code JSObject} object for a {@code Node} just do a cast:
+ * <pre>
+ * JSObject jdoc = (JSObject) webEngine.getDocument();
+ * </pre>
+ * <p>
+ * In some cases the context provides a specific Java type that guides
+ * the conversion.
+ * For example if setting a Java {@code String} field from a JavaScript
+ * expression, then the JavaScript value is converted to a string.
+ *
+ * <p><b>Mapping Java objects to JavaScript values</b></p>
+ *
+ * The arguments of the {@code JSObject} methods {@code setMember} and
+ * {@code call} pass Java objects to the JavaScript environment.
+ * This is roughly the inverse of the JavaScript-to-Java mapping
+ * described above:
+ * Java {@code String},  {@code Number}, or {@code Boolean} objects
+ * are converted to the obvious JavaScript values. A  {@code JSObject}
+ * object is converted to the original wrapped JavaScript object.
+ * Otherwise a {@code JavaRuntimeObject} is created.  This is
+ * a JavaScript object that acts as a proxy for the Java object,
+ * in that accessing properties of the {@code JavaRuntimeObject}
+ * causes the Java field or method with the same name to be accessed.
+ * <p> Note that the Java objects bound using
+ * {@link netscape.javascript.JSObject#setMember JSObject.setMember},
+ * {@link netscape.javascript.JSObject#setSlot JSObject.setSlot}, and
+ * {@link netscape.javascript.JSObject#call JSObject.call}
+ * are implemented using weak references. This means that the Java object
+ * can be garbage collected, causing subsequent accesses to the JavaScript
+ * objects to have no effect.
+ *
+ * <p><b>Calling back to Java from JavaScript</b></p>
+ *
+ * <p>The {@link netscape.javascript.JSObject#setMember JSObject.setMember}
+ * method is useful to enable upcalls from JavaScript
+ * into Java code, as illustrated by the following example. The Java code
+ * establishes a new JavaScript object named {@code app}. This object has one
+ * public member, the method {@code exit}.
+ * <pre><code>
+public class JavaApplication {
+    public void exit() {
+        Platform.exit();
+    }
+}
+...
+JavaApplication javaApp = new JavaApplication();
+JSObject window = (JSObject) webEngine.executeScript("window");
+window.setMember("app", javaApp);
+ * </code></pre>
+ * You can then refer to the object and the method from your HTML page:
+ * <pre>{@code
+    <a href="" onclick="app.exit()">Click here to exit application</a>
+ * }</pre>
+ * <p>When a user clicks the link the application is closed.
+ * <p>
+ * Note that in the above example, the application holds a reference
+ * to the {@code JavaApplication} instance. This is required for the callback
+ * from JavaScript to execute the desired method.
+ * <p> In the following example, the application does not hold a reference
+ * to the Java object:
+ * <pre><code>
+ * JSObject window = (JSObject) webEngine.executeScript("window");
+ * window.setMember("app", new JavaApplication());
+ * </code></pre>
+ * <p> In this case, since the property value is a local object, {@code "new JavaApplication()"},
+ * the value may be garbage collected in next GC cycle.
+ * <p>
+ * When a user clicks the link, it does not guarantee to execute the callback method {@code exit}.
+ * <p>
+ * If there are multiple Java methods with the given name,
+ * then the engine selects one matching the number of parameters
+ * in the call.  (Varargs are not handled.) An unspecified one is
+ * chosen if there are multiple ones with the correct number of parameters.
+ * <p>
+ * You can pick a specific overloaded method by listing the
+ * parameter types in an "extended method name", which has the
+ * form <code>"<var>method_name</var>(<var>param_type1</var>,...,<var>param_typen</var>)"</code>.  Typically you'd write the JavaScript expression:
+ * <pre>
+ * <code><var>receiver</var>["<var>method_name</var>(<var>param_type1</var>,...,<var>param_typeN</var>)"](<var>arg1</var>,...,<var>argN</var>)</code>
+ * </pre>
+ *
+ * <p>
+ * The Java class and method must both be declared public.
+ * </p>
+ *
+ * <p><b>Deploying an Application as a Module</b></p>
+ * <p>
+ * If any Java class passed to JavaScript is in a named module, then it must
+ * be reflectively accessible to the {@code javafx.web} module.
+ * A class is reflectively accessible if the module
+ * {@link Module#isOpen(String,Module) opens} the containing package to at
+ * least the {@code javafx.web} module.
+ * Otherwise, the method will not be called, and no error or
+ * warning will be produced.
+ * </p>
+ * <p>
+ * For example, if {@code com.foo.MyClass} is in the {@code foo.app} module,
+ * the {@code module-info.java} might
+ * look like this:
+ * </p>
+ *
+<pre>{@code module foo.app {
+    opens com.foo to javafx.web;
+}}</pre>
+ *
+ * <p>
+ * Alternatively, a class is reflectively accessible if the module
+ * {@link Module#isExported(String) exports} the containing package
+ * unconditionally.
+ * </p>
+ *
+ * <p>
+ * Starting with JavaFX 14, <a href="https://tools.ietf.org/html/rfc7540">HTTP/2</a> support has been added to WebEngine.
+ * This is achieved by using {@link java.net.http.HttpClient} instead of {@link URLConnection}. HTTP/2 is activated
+ * by default when JavaFX 14 (or later) is used with JDK 12 (or later).
+ * </p>
+ *
+ * <p><b>Threading</b></p>
+ * <p>{@code WebEngine} objects must be created and accessed solely from the
+ * JavaFX Application thread. This rule also applies to any DOM and JavaScript
+ * objects obtained from the {@code WebEngine} object.
+ * @since JavaFX 2.0
+ */
+final public class WebEngine {
+    static {
+        Accessor.setPageAccessor(w -> w == null ? null : w.getPage());
+
+        Invoker.setInvoker(new PrismInvoker());
+        Renderer.setRenderer(new PrismRenderer());
+        WCGraphicsManager.setGraphicsManager(new PrismGraphicsManager());
+        CursorManager.setCursorManager(new CursorManagerImpl());
+        com.sun.webkit.EventLoop.setEventLoop(new EventLoopImpl());
+        ThemeClient.setDefaultRenderTheme(new RenderThemeImpl());
+        Utilities.setUtilities(new UtilitiesImpl());
+    }
+
+    private static final PlatformLogger logger =
+            PlatformLogger.getLogger(WebEngine.class.getName());
+
+    /**
+     * The number of instances of this class.
+     * Used to start and stop the pulse timer.
+     */
+    private static int instanceCount = 0;
+
+    /**
+     * The node associated with this engine. There is a one-to-one correspondence
+     * between the WebView and its WebEngine (although not all WebEngines have
+     * a WebView, every WebView has one and only one WebEngine).
+     */
+    private final ObjectProperty<WebView> view = new SimpleObjectProperty<>(this, "view");
+
+    /**
+     * The Worker which shows progress of the web engine as it loads pages.
+     */
+    private final LoadWorker loadWorker = new LoadWorker();
+
+    /**
+     * The object that provides interaction with the native webkit core.
+     */
+    private final WebPage page;
+
+    private final SelfDisposer disposer;
+
+    private final DebuggerImpl debugger = new DebuggerImpl();
+
+    private boolean userDataDirectoryApplied = false;
+
+
+    /**
+     * Returns a {@link javafx.concurrent.Worker} object that can be used to
+     * track loading progress.
+     *
+     * @return the {@code Worker} object
+     */
+    public final Worker<Void> getLoadWorker() {
+        return loadWorker;
+    }
+
+
+    /*
+     * The final document. This may be null if no document has been loaded.
+     */
+    private final DocumentProperty document = new DocumentProperty();
+
+    public final Document getDocument() { return document.getValue(); }
+
+    /**
+     * Document object for the current Web page. The value is {@code null}
+     * if the Web page failed to load.
+     *
+     * @return the document property
+     */
+    public final ReadOnlyObjectProperty<Document> documentProperty() {
+        return document;
+    }
+
+
+    /*
+     * The location of the current page. This may return null.
+     */
+    private final ReadOnlyStringWrapper location = new ReadOnlyStringWrapper(this, "location");
+
+    public final String getLocation() { return location.getValue(); }
+
+    /**
+     * URL of the current Web page. If the current page has no URL,
+     * the value is an empty String.
+     *
+     * @return the location property
+     */
+    public final ReadOnlyStringProperty locationProperty() { return location.getReadOnlyProperty(); }
+
+    private void updateLocation(String value) {
+        this.location.set(value);
+        this.document.invalidate(false);
+        this.title.set(null);
+    }
+
+
+    /*
+     * The page title.
+     */
+    private final ReadOnlyStringWrapper title = new ReadOnlyStringWrapper(this, "title");
+
+    public final String getTitle() { return title.getValue(); }
+
+    /**
+     * Title of the current Web page. If the current page has no title,
+     * the value is {@code null}. This property will be updated
+     * asynchronously some time after the page is loaded. Applications
+     * should not rely on any particular timing, but should listen for
+     * changes to this property, or bind to it, to know when it has
+     * been updated.
+     *
+     * @return the title property
+     */
+    public final ReadOnlyStringProperty titleProperty() { return title.getReadOnlyProperty(); }
+
+    private void updateTitle() {
+        title.set(page.getTitle(page.getMainFrame()));
+    }
+
+    //
+    // Settings
+
+    /**
+     * Specifies whether JavaScript execution is enabled.
+     *
+     * @defaultValue true
+     * @since JavaFX 2.2
+     */
+    private BooleanProperty javaScriptEnabled;
+
+    public final void setJavaScriptEnabled(boolean value) {
+        javaScriptEnabledProperty().set(value);
+    }
+
+    public final boolean isJavaScriptEnabled() {
+        return javaScriptEnabled == null ? true : javaScriptEnabled.get();
+    }
+
+    public final BooleanProperty javaScriptEnabledProperty() {
+        if (javaScriptEnabled == null) {
+            javaScriptEnabled = new BooleanPropertyBase(true) {
+                @Override public void invalidated() {
+                    checkThread();
+                    page.setJavaScriptEnabled(get());
+                }
+
+                @Override public Object getBean() {
+                    return WebEngine.this;
+                }
+
+                @Override public String getName() {
+                    return "javaScriptEnabled";
+                }
+            };
+        }
+        return javaScriptEnabled;
+    }
+
+    /**
+     * Location of the user stylesheet as a string URL.
+     *
+     * <p>This should be a local URL, i.e. either {@code 'data:'},
+     * {@code 'file:'}, {@code 'jar:'}, or {@code 'jrt:'}. Remote URLs are not allowed
+     * for security reasons.
+     *
+     * @defaultValue null
+     * @since JavaFX 2.2
+     */
+    private StringProperty userStyleSheetLocation;
+
+    public final void setUserStyleSheetLocation(String value) {
+        userStyleSheetLocationProperty().set(value);
+    }
+
+    public final String getUserStyleSheetLocation() {
+        return userStyleSheetLocation == null ? null : userStyleSheetLocation.get();
+    }
+
+    private byte[] readFully(BufferedInputStream in) throws IOException {
+        final int BUF_SIZE = 4096;
+        int outSize = 0;
+        final List<byte[]> outList = new ArrayList<>();
+        byte[] buffer = new byte[BUF_SIZE];
+
+        while (true) {
+            int nBytes = in.read(buffer);
+            if (nBytes < 0) break;
+
+            byte[] chunk;
+            if (nBytes == buffer.length) {
+                chunk = buffer;
+                buffer = new byte[BUF_SIZE];
+            } else {
+                chunk = new byte[nBytes];
+                System.arraycopy(buffer, 0, chunk, 0, nBytes);
+            }
+            outList.add(chunk);
+            outSize += nBytes;
+        }
+
+        final byte[] out = new byte[outSize];
+        int outPos = 0;
+        for (byte[] chunk : outList) {
+            System.arraycopy(chunk, 0, out, outPos, chunk.length);
+            outPos += chunk.length;
+        }
+
+        return out;
+    }
+
+    public final StringProperty userStyleSheetLocationProperty() {
+        if (userStyleSheetLocation == null) {
+            userStyleSheetLocation = new StringPropertyBase(null) {
+                private final static String DATA_PREFIX = "data:text/css;charset=utf-8;base64,";
+
+                @Override public void invalidated() {
+                    checkThread();
+                    String url = get();
+                    String dataUrl;
+                    if (url == null || url.length() <= 0) {
+                        dataUrl = null;
+                    } else if (url.startsWith(DATA_PREFIX)) {
+                        dataUrl = url;
+                    } else if (url.startsWith("file:") ||
+                               url.startsWith("jar:")  ||
+                               url.startsWith("jrt:")  ||
+                               url.startsWith("data:"))
+                    {
+                        try {
+                            URLConnection conn = URLs.newURL(url).openConnection();
+                            conn.connect();
+
+                            BufferedInputStream in =
+                                    new BufferedInputStream(conn.getInputStream());
+                            byte[] inBytes = readFully(in);
+                            String out = Base64.getMimeEncoder().encodeToString(inBytes);
+                            dataUrl = DATA_PREFIX + out;
+                        } catch (IOException e) {
+                            throw new RuntimeException(e);
+                        }
+                    } else {
+                        throw new IllegalArgumentException("Invalid stylesheet URL");
+                    }
+                    page.setUserStyleSheetLocation(dataUrl);
+                }
+
+                @Override public Object getBean() {
+                    return WebEngine.this;
+                }
+
+                @Override public String getName() {
+                    return "userStyleSheetLocation";
+                }
+            };
+        }
+        return userStyleSheetLocation;
+    }
+
+    /**
+     * Specifies the directory to be used by this {@code WebEngine}
+     * to store local user data.
+     *
+     * <p>If the value of this property is not {@code null},
+     * the {@code WebEngine} will attempt to store local user data
+     * in the respective directory.
+     * If the value of this property is {@code null},
+     * the {@code WebEngine} will attempt to store local user data
+     * in an automatically selected system-dependent user- and
+     * application-specific directory.
+     *
+     * <p>When a {@code WebEngine} is about to start loading a web
+     * page or executing a script for the first time, it checks whether
+     * it can actually use the directory specified by this property.
+     * If the check fails for some reason, the {@code WebEngine} invokes
+     * the {@link WebEngine#onErrorProperty WebEngine.onError} event handler,
+     * if any, with a {@link WebErrorEvent} describing the reason.
+     * If the invoked event handler modifies the {@code userDataDirectory}
+     * property, the {@code WebEngine} retries with the new value as soon
+     * as the handler returns. If the handler does not modify the
+     * {@code userDataDirectory} property (which is the default),
+     * the {@code WebEngine} continues without local user data.
+     *
+     * <p>Once the {@code WebEngine} has started loading a web page or
+     * executing a script, changes made to this property have no effect
+     * on where the {@code WebEngine} stores or will store local user
+     * data.
+     *
+     * <p>Currently, the directory specified by this property is used
+     * only to store the data that backs the {@code window.localStorage}
+     * objects. In the future, more types of data can be added.
+     *
+     * @defaultValue {@code null}
+     * @since JavaFX 8.0
+     */
+    private final ObjectProperty<File> userDataDirectory =
+            new SimpleObjectProperty<>(this, "userDataDirectory");
+
+    public final File getUserDataDirectory() {
+        return userDataDirectory.get();
+    }
+
+    public final void setUserDataDirectory(File value) {
+        userDataDirectory.set(value);
+    }
+
+    public final ObjectProperty<File> userDataDirectoryProperty() {
+        return userDataDirectory;
+    }
+
+    /**
+     * Specifies user agent ID string. This string is the value of the
+     * {@code User-Agent} HTTP header.
+     *
+     * @defaultValue system dependent
+     * @since JavaFX 8.0
+     */
+    private StringProperty userAgent;
+
+    public final void setUserAgent(String value) {
+        userAgentProperty().set(value);
+    }
+
+    public final String getUserAgent() {
+        return userAgent == null ? page.getUserAgent() : userAgent.get();
+    }
+
+    public final StringProperty userAgentProperty() {
+        if (userAgent == null) {
+            userAgent = new StringPropertyBase(page.getUserAgent()) {
+                @Override public void invalidated() {
+                    checkThread();
+                    page.setUserAgent(get());
+                }
+
+                @Override public Object getBean() {
+                    return WebEngine.this;
+                }
+
+                @Override public String getName() {
+                    return "userAgent";
+                }
+            };
+        }
+        return userAgent;
+    }
+
+    private final ObjectProperty<EventHandler<WebEvent<String>>> onAlert
+            = new SimpleObjectProperty<>(this, "onAlert");
+
+    public final EventHandler<WebEvent<String>> getOnAlert() { return onAlert.get(); }
+
+    public final void setOnAlert(EventHandler<WebEvent<String>> handler) { onAlert.set(handler); }
+
+    /**
+     * JavaScript {@code alert} handler property. This handler is invoked
+     * when a script running on the Web page calls the {@code alert} function.
+     * @return the onAlert property
+     */
+    public final ObjectProperty<EventHandler<WebEvent<String>>> onAlertProperty() { return onAlert; }
+
+
+    private final ObjectProperty<EventHandler<WebEvent<String>>> onStatusChanged
+            = new SimpleObjectProperty<>(this, "onStatusChanged");
+
+    public final EventHandler<WebEvent<String>> getOnStatusChanged() { return onStatusChanged.get(); }
+
+    public final void setOnStatusChanged(EventHandler<WebEvent<String>> handler) { onStatusChanged.set(handler); }
+
+    /**
+     * JavaScript status handler property. This handler is invoked when
+     * a script running on the Web page sets {@code window.status} property.
+     * @return the onStatusChanged property
+     */
+    public final ObjectProperty<EventHandler<WebEvent<String>>> onStatusChangedProperty() { return onStatusChanged; }
+
+
+    private final ObjectProperty<EventHandler<WebEvent<Rectangle2D>>> onResized
+            = new SimpleObjectProperty<>(this, "onResized");
+
+    public final EventHandler<WebEvent<Rectangle2D>> getOnResized() { return onResized.get(); }
+
+    public final void setOnResized(EventHandler<WebEvent<Rectangle2D>> handler) { onResized.set(handler); }
+
+    /**
+     * JavaScript window resize handler property. This handler is invoked
+     * when a script running on the Web page moves or resizes the
+     * {@code window} object.
+     * @return the onResized property
+     */
+    public final ObjectProperty<EventHandler<WebEvent<Rectangle2D>>> onResizedProperty() { return onResized; }
+
+
+    private final ObjectProperty<EventHandler<WebEvent<Boolean>>> onVisibilityChanged
+            = new SimpleObjectProperty<>(this, "onVisibilityChanged");
+
+    public final EventHandler<WebEvent<Boolean>> getOnVisibilityChanged() { return onVisibilityChanged.get(); }
+
+    public final void setOnVisibilityChanged(EventHandler<WebEvent<Boolean>> handler) { onVisibilityChanged.set(handler); }
+
+    /**
+     * JavaScript window visibility handler property. This handler is invoked
+     * when a script running on the Web page changes visibility of the
+     * {@code window} object.
+     * @return the onVisibilityChanged property
+     */
+    public final ObjectProperty<EventHandler<WebEvent<Boolean>>> onVisibilityChangedProperty() { return onVisibilityChanged; }
+
+
+    private final ObjectProperty<Callback<PopupFeatures, WebEngine>> createPopupHandler
+            = new SimpleObjectProperty<>(this, "createPopupHandler",
+            p -> WebEngine.this);
+
+    public final Callback<PopupFeatures, WebEngine> getCreatePopupHandler() { return createPopupHandler.get(); }
+
+    public final void setCreatePopupHandler(Callback<PopupFeatures, WebEngine> handler) { createPopupHandler.set(handler); }
+
+    /**
+     * JavaScript popup handler property. This handler is invoked when a script
+     * running on the Web page requests a popup to be created.
+     * <p>To satisfy this request a handler may create a new {@code WebEngine},
+     * attach a visibility handler and optionally a resize handler, and return
+     * the newly created engine. To block the popup, a handler should return
+     * {@code null}.
+     * <p>By default, a popup handler is installed that opens popups in this
+     * {@code WebEngine}.
+     *
+     * @return the createPopupHandler property
+     *
+     * @see PopupFeatures
+     */
+    public final ObjectProperty<Callback<PopupFeatures, WebEngine>> createPopupHandlerProperty() { return createPopupHandler; }
+
+
+    private final ObjectProperty<Callback<String, Boolean>> confirmHandler
+            = new SimpleObjectProperty<>(this, "confirmHandler");
+
+    public final Callback<String, Boolean> getConfirmHandler() { return confirmHandler.get(); }
+
+    public final void setConfirmHandler(Callback<String, Boolean> handler) { confirmHandler.set(handler); }
+
+    /**
+     * JavaScript {@code confirm} handler property. This handler is invoked
+     * when a script running on the Web page calls the {@code confirm} function.
+     * <p>An implementation may display a dialog box with Yes and No options,
+     * and return the user's choice.
+     *
+     * @return the confirmHandler property
+     */
+    public final ObjectProperty<Callback<String, Boolean>> confirmHandlerProperty() { return confirmHandler; }
+
+
+    private final ObjectProperty<Callback<PromptData, String>> promptHandler
+            = new SimpleObjectProperty<>(this, "promptHandler");
+
+    public final Callback<PromptData, String> getPromptHandler() { return promptHandler.get(); }
+
+    public final void setPromptHandler(Callback<PromptData, String> handler) { promptHandler.set(handler); }
+
+    /**
+     * JavaScript {@code prompt} handler property. This handler is invoked
+     * when a script running on the Web page calls the {@code prompt} function.
+     * <p>An implementation may display a dialog box with an text field,
+     * and return the user's input.
+     *
+     * @return the promptHandler property
+     * @see PromptData
+     */
+    public final ObjectProperty<Callback<PromptData, String>> promptHandlerProperty() { return promptHandler; }
+
+    private final ObjectProperty<ColorChooserHandler> colorChooserHandler
+            = new SimpleObjectProperty<>(this, "colorChooserHandler");
+
+    public final ColorChooserHandler getColorChooserHandler() { return colorChooserHandler.get(); }
+
+    public final void setColorChooserHandler(ColorChooserHandler handler) { colorChooserHandler.set(handler); }
+
+    /**
+     * Color chooser handler property. Invoked on the JavaFX Application Thread
+     * when the page focuses an {@code <input type="color">} control. Because the
+     * {@link WebView} renders off-screen, there is no native picker, so an
+     * application that wants a working color input must set this handler and
+     * answer the {@link ColorChooser}. If {@code null}, the request is cancelled.
+     *
+     * @return the colorChooserHandler property
+     * @see ColorChooser
+     * @since 25
+     */
+    public final ObjectProperty<ColorChooserHandler> colorChooserHandlerProperty() { return colorChooserHandler; }
+
+    private final ObjectProperty<SelectPopupHandler> selectPopupHandler
+            = new SimpleObjectProperty<>(this, "selectPopupHandler");
+
+    public final SelectPopupHandler getSelectPopupHandler() { return selectPopupHandler.get(); }
+
+    public final void setSelectPopupHandler(SelectPopupHandler handler) { selectPopupHandler.set(handler); }
+
+    /**
+     * Select-popup handler property. Invoked on the JavaFX Application Thread
+     * when the page opens an HTML {@code <select>} drop-down. Because the
+     * {@link WebView} renders off-screen, there is no native popup, so an
+     * application that wants working {@code <select>} controls must set this
+     * handler and answer the {@link SelectPopup}. If {@code null}, the drop-down
+     * is cancelled.
+     *
+     * @return the selectPopupHandler property
+     * @see SelectPopup
+     * @since 25
+     */
+    public final ObjectProperty<SelectPopupHandler> selectPopupHandlerProperty() { return selectPopupHandler; }
+
+    private final ObjectProperty<FileChooserHandler> fileChooserHandler
+            = new SimpleObjectProperty<>(this, "fileChooserHandler");
+
+    public final FileChooserHandler getFileChooserHandler() { return fileChooserHandler.get(); }
+
+    public final void setFileChooserHandler(FileChooserHandler handler) { fileChooserHandler.set(handler); }
+
+    /**
+     * File chooser handler property. Invoked on the JavaFX Application Thread
+     * when the page activates an {@code <input type="file">} control. If
+     * {@code null} (the default), a built-in JavaFX {@link javafx.stage.FileChooser}
+     * is shown automatically — single- or multi-select per the control — so file
+     * inputs work out of the box. Set a handler to present a custom picker or
+     * supply files programmatically by answering the {@link FileChooserRequest}.
+     *
+     * @return the fileChooserHandler property
+     * @see FileChooserRequest
+     * @since 25
+     */
+    public final ObjectProperty<FileChooserHandler> fileChooserHandlerProperty() { return fileChooserHandler; }
+
+    // Response routing for the off-screen chooser requests above. Package-private
+    // so the public token classes (ColorChooser/SelectPopup) can resume the page
+    // without ever referencing com.sun.* engine types.
+    void respondColorChooser(int id, boolean chosen, int rgba) {
+        if (page != null) {
+            page.respondColorChooser(id, chosen, rgba);
+        }
+    }
+
+    void respondSelectPopup(int id, boolean accepted, int[] indices) {
+        if (page != null) {
+            page.respondSelectPopup(id, accepted, indices);
+        }
+    }
+
+    void respondFileChooser(int id, String[] paths) {
+        if (page != null) {
+            page.respondFileChooser(id, paths);
+        }
+    }
+
+    /**
+     * Default file-input handling when no {@link FileChooserHandler} is set:
+     * show a built-in JavaFX {@link javafx.stage.FileChooser} (or
+     * {@link javafx.stage.DirectoryChooser}) sized to the control, owned by the
+     * WebView's window, and answer the request with the picked file(s). Runs on
+     * the FX thread (the request is dispatched there). Files are handed back by
+     * native path, so the engine streams large uploads straight from disk.
+     */
+    void showDefaultFileChooser(FileChooserRequest req) {
+        WebView wv = view.get();
+        var scene = wv == null ? null : wv.getScene();
+        Window owner = scene == null ? null : scene.getWindow();
+        switch (req.getMode()) {
+            case DIRECTORY -> {
+                DirectoryChooser dc = new DirectoryChooser();
+                if (!req.getTitle().isEmpty()) {
+                    dc.setTitle(req.getTitle());
+                }
+                File dir = dc.showDialog(owner);
+                req.choose(dir == null ? List.of() : List.of(dir));
+            }
+            case SAVE -> {
+                FileChooser fc = new FileChooser();
+                applyAcceptFilters(fc, req);
+                if (!req.getTitle().isEmpty()) {
+                    fc.setTitle(req.getTitle());
+                }
+                if (!req.getInitialFileName().isEmpty()) {
+                    fc.setInitialFileName(req.getInitialFileName());
+                }
+                File f = fc.showSaveDialog(owner);
+                req.choose(f == null ? List.of() : List.of(f));
+            }
+            case OPEN_MULTIPLE -> {
+                FileChooser fc = new FileChooser();
+                applyAcceptFilters(fc, req);
+                if (!req.getTitle().isEmpty()) {
+                    fc.setTitle(req.getTitle());
+                }
+                List<File> files = fc.showOpenMultipleDialog(owner);
+                req.choose(files == null ? List.of() : files);
+            }
+            default -> {
+                FileChooser fc = new FileChooser();
+                applyAcceptFilters(fc, req);
+                if (!req.getTitle().isEmpty()) {
+                    fc.setTitle(req.getTitle());
+                }
+                File f = fc.showOpenDialog(owner);
+                req.choose(f == null ? List.of() : List.of(f));
+            }
+        }
+    }
+
+    /**
+     * Shows a JavaFX {@link javafx.stage.FileChooser} save dialog (owned by the
+     * WebView's Stage) so the engine can write a print-to-PDF document, and sends
+     * the chosen path back. Runs on the FX thread (the request is dispatched
+     * there). Cancelling answers with an empty path. The engine, which holds the
+     * PDF bytes, writes the file — nothing is copied across the boundary.
+     */
+    void requestPdfSave(int requestId, String defaultName) {
+        WebView wv = view.get();
+        var scene = wv == null ? null : wv.getScene();
+        Window owner = scene == null ? null : scene.getWindow();
+        FileChooser fc = new FileChooser();
+        fc.getExtensionFilters().addAll(
+                new FileChooser.ExtensionFilter("PDF Document", "*.pdf"),
+                new FileChooser.ExtensionFilter("All Files", "*.*"));
+        if (defaultName != null && !defaultName.isEmpty()) {
+            fc.setInitialFileName(defaultName);
+        }
+        File f = fc.showSaveDialog(owner);
+        page.respondSavePdf(requestId, f == null ? "" : f.getAbsolutePath());
+    }
+
+    /**
+     * Translates the page's {@code accept} filters into JavaFX extension
+     * filters. Extension tokens ({@code ".pdf"}) become {@code *.pdf}; MIME
+     * tokens ({@code image/*}) are skipped (the OS dialog can't map them
+     * reliably) — an "All Files" entry is always added so nothing is blocked.
+     */
+    private static void applyAcceptFilters(FileChooser fc, FileChooserRequest req) {
+        List<String> exts = new ArrayList<>();
+        for (String a : req.getAcceptFilters()) {
+            String t = a.trim();
+            if (t.startsWith(".") && t.length() > 1) {
+                exts.add("*" + t);
+            }
+        }
+        if (!exts.isEmpty()) {
+            fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("Allowed", exts));
+        }
+        fc.getExtensionFilters().add(new FileChooser.ExtensionFilter("All Files", "*.*"));
+    }
+
+    private final ObjectProperty<PermissionHandler> permissionHandler
+            = new SimpleObjectProperty<>(this, "permissionHandler");
+
+    public final PermissionHandler getPermissionHandler() { return permissionHandler.get(); }
+
+    public final void setPermissionHandler(PermissionHandler handler) { permissionHandler.set(handler); }
+
+    /**
+     * Permission handler property. Invoked on the JavaFX Application Thread when
+     * a page requests a capability (geolocation, notifications, camera/microphone,
+     * clipboard, MIDI, screen capture). If {@code null}, requests are denied.
+     *
+     * @return the permissionHandler property
+     * @see PermissionRequest
+     * @since 25
+     */
+    public final ObjectProperty<PermissionHandler> permissionHandlerProperty() { return permissionHandler; }
+
+    private final ObjectProperty<AuthHandler> authHandler
+            = new SimpleObjectProperty<>(this, "authHandler");
+
+    public final AuthHandler getAuthHandler() { return authHandler.get(); }
+
+    public final void setAuthHandler(AuthHandler handler) { authHandler.set(handler); }
+
+    /**
+     * HTTP authentication handler property. Invoked on the JavaFX Application
+     * Thread on a server ({@code 401}) or proxy ({@code 407}) challenge. If
+     * {@code null}, the challenge is cancelled and the load fails.
+     *
+     * @return the authHandler property
+     * @see AuthRequest
+     * @since 25
+     */
+    public final ObjectProperty<AuthHandler> authHandlerProperty() { return authHandler; }
+
+    private final ObjectProperty<DownloadHandler> downloadHandler
+            = new SimpleObjectProperty<>(this, "downloadHandler");
+
+    public final DownloadHandler getDownloadHandler() { return downloadHandler.get(); }
+
+    public final void setDownloadHandler(DownloadHandler handler) { downloadHandler.set(handler); }
+
+    /**
+     * Download handler property. Invoked on the JavaFX Application Thread when a
+     * page starts a download, so the application can choose a target file. If
+     * {@code null}, downloads are denied.
+     *
+     * @return the downloadHandler property
+     * @see DownloadRequest
+     * @since 25
+     */
+    public final ObjectProperty<DownloadHandler> downloadHandlerProperty() { return downloadHandler; }
+
+    private final ObjectProperty<DownloadProgressHandler> downloadProgressHandler
+            = new SimpleObjectProperty<>(this, "downloadProgressHandler");
+
+    public final DownloadProgressHandler getDownloadProgressHandler() { return downloadProgressHandler.get(); }
+
+    public final void setDownloadProgressHandler(DownloadProgressHandler handler) { downloadProgressHandler.set(handler); }
+
+    /**
+     * Download progress handler property. Receives progress and completion
+     * notifications for accepted downloads, on the JavaFX Application Thread.
+     *
+     * @return the downloadProgressHandler property
+     * @see Download
+     * @since 25
+     */
+    public final ObjectProperty<DownloadProgressHandler> downloadProgressHandlerProperty() { return downloadProgressHandler; }
+
+    void respondPermission(int id, boolean granted) {
+        if (page != null) {
+            page.respondPermission(id, granted);
+        }
+    }
+
+    void respondAuth(int id, boolean supplied, String user, String pass) {
+        if (page != null) {
+            page.respondAuth(id, supplied, user, pass);
+        }
+    }
+
+    void respondDownload(int id, boolean accepted, String path) {
+        if (page != null) {
+            page.respondDownload(id, accepted, path);
+        }
+    }
+
+    void cancelDownload(int id) {
+        if (page != null) {
+            page.cancelDownloadById(id);
+        }
+    }
+
+    /** Context of the most recent right-click; never null (empty before any). */
+    private volatile ContextMenuContext contextMenuContext =
+        new ContextMenuContext(false, "", "", "");
+
+    /** App hook to add/remove items on the one reused context menu (may be null). */
+    private Consumer<ContextMenu> contextMenuCustomizer;
+
+    /**
+     * Sets a customizer that may add or remove {@link javafx.scene.control.MenuItem}s
+     * on the WebView's single context menu. There is exactly one reused
+     * {@code ContextMenu} per WebView; on each right-click it is populated with the
+     * built-in default items (Copy / Open Link / Back / Reload, per the current
+     * {@link #getContextMenuContext()}), then this customizer runs to add/remove
+     * items, then the WebView shows it. Pass {@code null} to clear. Invoked on the
+     * JavaFX Application Thread.
+     *
+     * @param customizer the menu customizer, or {@code null} for default items only
+     * @since 25
+     */
+    public final void setContextMenuCustomizer(Consumer<ContextMenu> customizer) {
+        this.contextMenuCustomizer = customizer;
+    }
+
+    /**
+     * Returns the context-menu customizer, or {@code null} if none.
+     * @return the customizer
+     * @since 25
+     */
+    public final Consumer<ContextMenu> getContextMenuCustomizer() {
+        return contextMenuCustomizer;
+    }
+
+    /**
+     * Returns the page context of the most recent right-click — the selected text,
+     * the link / image under the cursor, and whether the target is editable.
+     *
+     * <p>Read it inside a {@linkplain #setContextMenuCustomizer customizer}: the
+     * WebView's single context menu is shown only after the engine reports the hit
+     * context, so this is already populated for the current right-click.
+     *
+     * @return the current context-menu context (never {@code null})
+     * @see ContextMenuContext
+     * @see #setContextMenuCustomizer(java.util.function.Consumer)
+     * @since 25
+     */
+    public final ContextMenuContext getContextMenuContext() { return contextMenuContext; }
+
+    private final ObjectProperty<FullscreenHandler> fullscreenHandler
+            = new SimpleObjectProperty<>(this, "fullscreenHandler");
+
+    public final FullscreenHandler getFullscreenHandler() { return fullscreenHandler.get(); }
+
+    public final void setFullscreenHandler(FullscreenHandler handler) { fullscreenHandler.set(handler); }
+
+    /**
+     * Fullscreen handler property. Invoked on the JavaFX Application Thread when
+     * a page requests a fullscreen transition. If {@code null}, the request is
+     * denied.
+     *
+     * @return the fullscreenHandler property
+     * @see FullscreenRequest
+     * @since 25
+     */
+    public final ObjectProperty<FullscreenHandler> fullscreenHandlerProperty() { return fullscreenHandler; }
+
+    void respondFullscreen(int id, boolean allowed) {
+        if (page != null) {
+            page.respondFullscreen(id, allowed);
+        }
+    }
+
+    private final ReadOnlyStringWrapper faviconUrl =
+            new ReadOnlyStringWrapper(this, "faviconUrl", "");
+
+    public final String getFaviconUrl() { return faviconUrl.get(); }
+
+    /**
+     * The URL of the current page's favicon, or an empty string if none. Updated
+     * on the JavaFX Application Thread as the page reports its icon; the
+     * application can load it with {@code new Image(getFaviconUrl())}.
+     *
+     * @return the faviconUrl property
+     * @since 25
+     */
+    public final ReadOnlyStringProperty faviconUrlProperty() { return faviconUrl.getReadOnlyProperty(); }
+
+    void setFaviconUrl(String url) { faviconUrl.set(url == null ? "" : url); }
+
+    private final ReadOnlyStringWrapper toolTipText =
+            new ReadOnlyStringWrapper(this, "toolTipText", "");
+
+    public final String getToolTipText() { return toolTipText.get(); }
+
+    /**
+     * The tooltip text for the element currently under the pointer, or an empty
+     * string when none. Since the off-screen engine shows no native tooltip, the
+     * application can bind a {@code Tooltip} on the {@link WebView} to this
+     * property. Updated on the JavaFX Application Thread.
+     *
+     * @return the toolTipText property
+     * @since 25
+     */
+    public final ReadOnlyStringProperty toolTipTextProperty() { return toolTipText.getReadOnlyProperty(); }
+
+    void setToolTipText(String text) { toolTipText.set(text == null ? "" : text); }
+
+    /** One registered (filter, interceptor) pair, in registration order. */
+    private record InterceptorReg(NetworkFilter filter, NetworkInterceptor interceptor) { }
+
+    /**
+     * Registered network interceptors, consulted in registration order.
+     * {@code CopyOnWriteArrayList} because the public {@code Network} entry points
+     * ({@code add}/{@code Subscription.unsubscribe}/{@code clear}) carry no thread
+     * contract and may be called off the FX thread, while {@code matchNetworkInterceptor}
+     * iterates on the FX thread per request — snapshot iteration avoids a
+     * {@code ConcurrentModificationException} / torn read.
+     */
+    private final List<InterceptorReg> networkInterceptors = new CopyOnWriteArrayList<>();
+
+    /** Lazily-created {@link Network} facade — the public network entry point. */
+    private Network network;
+
+    /**
+     * Returns this engine's {@link Network} facade, the entry point for network
+     * interception (inspect / block / redirect / modify requests and responses).
+     * The same instance is returned for the life of the engine.
+     *
+     * <p>Example:
+     * <pre>{@code
+     * Subscription sub = engine.getNetwork().add(
+     *     NetworkFilter.builder().includeUrlPattern("*://host/api/*").build(),
+     *     new NetworkInterceptor() {
+     *         public void onRequest(NetworkExchange ex) {
+     *             if (ex.request().url().contains("/ads/")) ex.block();
+     *             else ex.proceed();
+     *         }
+     *     });
+     * // later:
+     * sub.unsubscribe();
+     * }</pre>
+     *
+     * @return this engine's network facade
+     * @see Network
+     * @see NetworkInterceptor
+     * @since 25
+     */
+    public final Network getNetwork() {
+        if (network == null) {
+            network = new NetworkImpl(this);
+        }
+        return network;
+    }
+
+    // --- package-private registry, fronted by the Network facade --------------
+    // The public surface is getNetwork(); these are the operations NetworkImpl
+    // delegates to. For each intercepted request the FIRST registered interceptor
+    // whose filter matches owns the decision; the engine is armed with the union
+    // of all filters, so only potentially-interesting requests cross to Java.
+
+    /** Adds a registration and returns a Subscription that removes exactly it. */
+    Subscription addInterceptor(NetworkFilter filter, NetworkInterceptor interceptor) {
+        Objects.requireNonNull(interceptor, "interceptor");
+        InterceptorReg reg = new InterceptorReg(
+            filter != null ? filter : NetworkFilter.matchAll(), interceptor);
+        networkInterceptors.add(reg);
+        rearmNetwork();
+        // Identity removal: a duplicate (filter, interceptor) pair is a distinct
+        // registration, so each Subscription removes only its own.
+        return () -> {
+            if (networkInterceptors.removeIf(r -> r == reg)) {
+                rearmNetwork();
+            }
+        };
+    }
+
+    /** Unmodifiable snapshot of registered interceptors, in registration order. */
+    List<NetworkInterceptor> interceptorSnapshot() {
+        List<NetworkInterceptor> out = new ArrayList<>(networkInterceptors.size());
+        for (InterceptorReg r : networkInterceptors) {
+            out.add(r.interceptor());
+        }
+        return Collections.unmodifiableList(out);
+    }
+
+    /** Removes all interceptors; disarms engine interception. */
+    void clearInterceptors() {
+        if (!networkInterceptors.isEmpty()) {
+            networkInterceptors.clear();
+            rearmNetwork();
+        }
+    }
+
+    // Re-arms (or disarms) the engine with the union of all filters.
+    private void rearmNetwork() {
+        if (page == null) {
+            return;
+        }
+        if (networkInterceptors.isEmpty()) {
+            page.disarmNetworkInterception();
+            return;
+        }
+        List<NetworkFilter> filters = new ArrayList<>(networkInterceptors.size());
+        for (InterceptorReg r : networkInterceptors) {
+            filters.add(r.filter());
+        }
+        page.armNetworkInterception(NetworkFilter.union(filters).serialize());
+    }
+
+    // The first interceptor whose filter accepts this request in `phase`, or null.
+    NetworkInterceptor matchNetworkInterceptor(String url, ResourceType type,
+            String method, NetworkFilter.Phase phase) {
+        for (InterceptorReg r : networkInterceptors) {
+            if (r.filter().matches(url, type, method, phase)) {
+                return r.interceptor();
+            }
+        }
+        return null;
+    }
+
+    // Routes a NetworkExchange terminal decision to the engine (package-private
+    // so the public token never references com.sun.* types).
+    void resolveNetwork(int interceptId, int phase, int action, byte[] tail) {
+        if (page != null) {
+            page.resolveNetwork(interceptId, phase, action, tail);
+        }
+    }
+
+    // Routes an onBodyChunk BodyEdit back to the engine (kind: 0=pass, 1=replace,
+    // 2=drop). Package-private so the public token never references com.sun.*.
+    void resolveBodyEdit(int interceptId, int chunkSeq, int kind, byte[] replacement) {
+        if (page != null) {
+            page.resolveBodyEdit(interceptId, chunkSeq, kind, replacement);
+        }
+    }
+
+    /**
+     * The event handler called when an error occurs.
+     *
+     * @defaultValue {@code null}
+     * @since JavaFX 8.0
+     */
+    private final ObjectProperty<EventHandler<WebErrorEvent>> onError =
+            new SimpleObjectProperty<>(this, "onError");
+
+    public final EventHandler<WebErrorEvent> getOnError() {
+        return onError.get();
+    }
+
+    public final void setOnError(EventHandler<WebErrorEvent> handler) {
+        onError.set(handler);
+    }
+
+    public final ObjectProperty<EventHandler<WebErrorEvent>> onErrorProperty() {
+        return onError;
+    }
+
+
+    /**
+     * Creates a new engine.
+     */
+    public WebEngine() {
+        this(null, false);
+    }
+
+    /**
+     * Creates a new engine and loads a Web page into it.
+     *
+     * @param url the URL of the web page to load
+     */
+    public WebEngine(String url) {
+        this(url, true);
+    }
+
+    private WebEngine(String url, boolean callLoad) {
+        checkThread();
+        Accessor accessor = new AccessorImpl(this);
+        page = new WebPage(
+            new WebPageClientImpl(accessor),
+            new UIClientImpl(accessor),
+            null,
+            new InspectorClientImpl(this),
+            new ThemeClientImpl(accessor),
+            false);
+        page.addLoadListenerClient(new PageLoadListener(this));
+
+        history = new WebHistory(page);
+
+        // Native-by-default popups: tell the engine which of select / color /
+        // context-menu the app overrides (handler installed) so it suppresses its
+        // native UI for those and surfaces the request to Java. Re-push whenever a
+        // handler is set or cleared, and once now for the initial state.
+        InvalidationListener overrideListener = o -> updatePopupOverrides();
+        selectPopupHandler.addListener(overrideListener);
+        colorChooserHandler.addListener(overrideListener);
+        updatePopupOverrides();
+
+        disposer = new SelfDisposer(page);
+        Disposer.addRecord(this, disposer);
+
+        if (callLoad) {
+            load(url);
+        }
+
+        if (instanceCount == 0 &&
+            Timer.getMode() == Timer.Mode.PLATFORM_TICKS)
+        {
+            PulseTimer.start();
+        }
+        instanceCount++;
+    }
+
+    /**
+     * Pushes the current popup-override state (whether select / color has an app
+     * handler) to the engine so it knows whether to show its native UI or surface
+     * the request to the app. The context menu is always handled foreground (the
+     * engine never shows a native menu), so its bit is always {@code true}.
+     */
+    private void updatePopupOverrides() {
+        if (page != null) {
+            page.setPopupOverrides(
+                getSelectPopupHandler() != null,
+                getColorChooserHandler() != null,
+                /*contextMenu handled foreground:*/ true);
+        }
+    }
+
+    /**
+     * Loads a Web page into this engine. This method starts asynchronous
+     * loading and returns immediately.
+     * @param url URL of the web page to load
+     */
+    public void load(String url) {
+        checkThread();
+        loadWorker.cancelAndReset();
+
+        if (url == null || url.equals("") || url.equals("about:blank")) {
+            url = "";
+        } else {
+            // verify and, if possible, adjust the url on the Java
+            // side, otherwise it may crash native code
+            try {
+                url = Util.adjustUrlForWebKit(url);
+            } catch (MalformedURLException e) {
+                loadWorker.dispatchLoadEvent(getMainFrame(),
+                        PAGE_STARTED, url, null, 0.0, 0);
+                loadWorker.dispatchLoadEvent(getMainFrame(),
+                        LOAD_FAILED, url, null, 0.0, MALFORMED_URL);
+                return;
+            }
+        }
+        applyUserDataDirectory();
+        page.open(page.getMainFrame(), url);
+    }
+
+    /**
+     * Loads the given HTML content directly. This method is useful when you have an HTML
+     * String composed in memory, or loaded from some system which cannot be reached via
+     * a URL (for example, the HTML text may have come from a database). As with
+     * {@link #load(String)}, this method is asynchronous.
+     *
+     * @param content the HTML content to load
+     */
+    public void loadContent(String content) {
+        loadContent(content, "text/html");
+    }
+
+    /**
+     * Loads the given content directly. This method is useful when you have content
+     * composed in memory, or loaded from some system which cannot be reached via
+     * a URL (for example, the SVG text may have come from a database). As with
+     * {@link #load(String)}, this method is asynchronous. This method also allows you to
+     * specify the content type of the string being loaded, and so may optionally support
+     * other types besides just HTML.
+     *
+     * @param content the HTML content to load
+     * @param contentType the type of content to load
+     */
+    public void loadContent(String content, String contentType) {
+        checkThread();
+        loadWorker.cancelAndReset();
+        applyUserDataDirectory();
+        page.load(page.getMainFrame(), content, contentType);
+    }
+
+    /**
+     * Reloads the current page, whether loaded from URL or directly from a String in
+     * one of the {@code loadContent} methods.
+     */
+    public void reload() {
+        // TODO what happens if this is called while currently loading a page?
+        checkThread();
+        page.refresh(page.getMainFrame());
+    }
+
+    private final WebHistory history;
+
+    /**
+     * Returns the session history object.
+     *
+     * @return history object
+     * @since JavaFX 2.2
+     */
+    public WebHistory getHistory() {
+        return history;
+    }
+
+    /**
+     * Executes a script in the context of the current page.
+     *
+     * @param script the script
+     * @return execution result, converted to a Java object using the following
+     * rules:
+     * <ul>
+     * <li>JavaScript Int32 is converted to {@code java.lang.Integer}
+     * <li>Other JavaScript numbers to {@code java.lang.Double}
+     * <li>JavaScript string to {@code java.lang.String}
+     * <li>JavaScript boolean to {@code java.lang.Boolean}
+     * <li>JavaScript {@code null} to {@code null}
+     * <li>Most JavaScript objects get wrapped as
+     *     {@code netscape.javascript.JSObject}
+     * <li>JavaScript JSNode objects get mapped to instances of
+     *     {@code netscape.javascript.JSObject}, that also implement
+     *     {@code org.w3c.dom.Node}
+     * <li>A special case is the JavaScript class {@code JavaRuntimeObject}
+     *     which is used to wrap a Java object as a JavaScript value - in this
+     *     case we just extract the original Java value.
+     * </ul>
+     */
+    public Object executeScript(String script) {
+        checkThread();
+        applyUserDataDirectory();
+        return page.executeScript(page.getMainFrame(), script);
+    }
+
+    private long getMainFrame() {
+        return page.getMainFrame();
+    }
+
+    WebPage getPage() {
+        return page;
+    }
+
+    void setView(WebView view) {
+        this.view.setValue(view);
+    }
+
+    private void stop() {
+        checkThread();
+        page.stop(page.getMainFrame());
+    }
+
+    private void applyUserDataDirectory() {
+        if (userDataDirectoryApplied) {
+            return;
+        }
+        userDataDirectoryApplied = true;
+        File nominalUserDataDir = getUserDataDirectory();
+        while (true) {
+            File userDataDir;
+            String displayString;
+            if (nominalUserDataDir == null) {
+                userDataDir = defaultUserDataDirectory();
+                displayString = format("null (%s)", userDataDir);
+            } else {
+                userDataDir = nominalUserDataDir;
+                displayString = userDataDir.toString();
+            }
+            logger.fine("Trying to apply user data directory [{0}]", displayString);
+            String errorMessage;
+            EventType<WebErrorEvent> errorType;
+            Throwable error;
+            try {
+                userDataDir = DirectoryLock.canonicalize(userDataDir);
+                File localStorageDir = new File(userDataDir, "localstorage");
+                File[] dirs = new File[] {
+                    userDataDir,
+                    localStorageDir,
+                };
+                for (File dir : dirs) {
+                    createDirectories(dir);
+                    // Additional security check to make sure the caller
+                    // has permission to write to the target directory
+                    File test = new File(dir, ".test");
+                    if (test.createNewFile()) {
+                        test.delete();
+                    }
+                }
+                disposer.userDataDirectoryLock = new DirectoryLock(userDataDir);
+
+                page.setLocalStorageDatabasePath(localStorageDir.getPath());
+                page.setLocalStorageEnabled(true);
+
+                logger.fine("User data directory [{0}] has "
+                        + "been applied successfully", displayString);
+                return;
+
+            } catch (DirectoryLock.DirectoryAlreadyInUseException ex) {
+                errorMessage = "User data directory [%s] is already in use";
+                errorType = WebErrorEvent.USER_DATA_DIRECTORY_ALREADY_IN_USE;
+                error = ex;
+            } catch (IOException ex) {
+                errorMessage = "An I/O error occurred while setting up "
+                        + "user data directory [%s]";
+                errorType = WebErrorEvent.USER_DATA_DIRECTORY_IO_ERROR;
+                error = ex;
+            } catch (SecurityException ex) {
+                errorMessage = "A security error occurred while setting up "
+                        + "user data directory [%s]";
+                errorType = WebErrorEvent.USER_DATA_DIRECTORY_SECURITY_ERROR;
+                error = ex;
+            }
+
+            errorMessage = format(errorMessage, displayString);
+            logger.fine("{0}, calling error handler", errorMessage);
+            File oldNominalUserDataDir = nominalUserDataDir;
+            fireError(errorType, errorMessage, error);
+            nominalUserDataDir = getUserDataDirectory();
+            if (Objects.equals(nominalUserDataDir, oldNominalUserDataDir)) {
+                logger.fine("Error handler did not modify user data directory, "
+                        + "continuing without user data directory");
+                return;
+            } else {
+                logger.fine("Error handler has set user data directory to [{0}], "
+                        + "retrying", nominalUserDataDir);
+                continue;
+            }
+        }
+    }
+
+    private static File defaultUserDataDirectory() {
+        return new File(
+                com.sun.glass.ui.Application.GetApplication()
+                        .getDataDirectory(),
+                "webview");
+    }
+
+    private static void createDirectories(File directory) throws IOException {
+        Path path = directory.toPath();
+        try {
+            Files.createDirectories(path, PosixFilePermissions.asFileAttribute(
+                    PosixFilePermissions.fromString("rwx------")));
+        } catch (UnsupportedOperationException ex) {
+            Files.createDirectories(path);
+        }
+    }
+
+    private void fireError(EventType<WebErrorEvent> eventType, String message,
+                           Throwable exception)
+    {
+        EventHandler<WebErrorEvent> handler = getOnError();
+        if (handler != null) {
+            handler.handle(new WebErrorEvent(this, eventType,
+                                             message, exception));
+        }
+    }
+
+    // for testing purposes only
+    void dispose() {
+        disposer.dispose();
+    }
+
+    private static final class SelfDisposer implements DisposerRecord {
+        private WebPage page;
+        private DirectoryLock userDataDirectoryLock;
+
+        private SelfDisposer(WebPage page) {
+            this.page = page;
+        }
+
+        @Override public void dispose() {
+            if (page == null) {
+                return;
+            }
+            page.dispose();
+            page = null;
+            if (userDataDirectoryLock != null) {
+                userDataDirectoryLock.close();
+            }
+            instanceCount--;
+            if (instanceCount == 0 &&
+                Timer.getMode() == Timer.Mode.PLATFORM_TICKS)
+            {
+                PulseTimer.stop();
+            }
+        }
+    }
+
+    // --- Context menu (one reused JavaFX menu the WebView owns) -------------------
+    // Driven solely by the engine's HandleContextMenu signal, which Chromium fires
+    // ONLY when the page didn't preventDefault() the contextmenu event. So a page
+    // with its own context menu (canvas apps, editors, games) suppresses ours
+    // automatically — its menu renders in the page frame and we show nothing. On a
+    // normal right-click we populate the single reused menu with the built-in
+    // default items (per getContextMenuContext()), let the app's customizer add /
+    // remove items, and show it. Single reused instance ⇒ popup window made once
+    // (no per-right-click video hitch). All on the FX thread.
+    private ContextMenu contextMenu;
+
+    /**
+     * Engine-side trigger (browser delegate's HandleContextMenu): the page allowed
+     * the default context menu, with the hit-tested context. Stores the context and
+     * shows the single reused menu at the click point.
+     */
+    void fireContextMenuFromEngine(double x, double y, int flags,
+            String linkUrl, String srcUrl, String selection) {
+        WebView view = this.view.get();
+        if (view == null || !view.isContextMenuEnabled()) {
+            return;
+        }
+        boolean editable = (flags & 0x1) != 0;
+        contextMenuContext = new ContextMenuContext(editable, selection, linkUrl, srcUrl);
+        Point2D p = view.localToScreen(x, y);
+        double screenX = p != null ? p.getX() : x;
+        double screenY = p != null ? p.getY() : y;
+        ContextMenu menu = reusedContextMenu();
+        menu.getItems().setAll(buildDefaultItems());
+        Consumer<ContextMenu> customizer = contextMenuCustomizer;
+        if (customizer != null) {
+            // The app "overrides" by adding / removing MenuItems on this one menu.
+            customizer.accept(menu);
+        }
+        if (menu.getItems().isEmpty()) {
+            menu.hide();
+            return;
+        }
+        if (menu.isShowing()) {
+            menu.hide();   // reposition the single instance at the new point
+        }
+        menu.show(view, screenX, screenY);
+    }
+
+    /** The single reused context-menu instance (lazy; native popup window made once). */
+    private ContextMenu reusedContextMenu() {
+        if (contextMenu == null) {
+            contextMenu = new ContextMenu();
+            contextMenu.setAutoHide(true);
+        }
+        return contextMenu;
+    }
+
+    /** Dismisses the context menu, if showing (page click / scroll). */
+    void hideContextMenu() {
+        if (contextMenu != null && contextMenu.isShowing()) {
+            contextMenu.hide();
+        }
+    }
+
+    // Blink editor command codes — must match jux_command_types.h ordering and
+    // the WebView keyboard intercept.
+    static final int EDIT_COPY = 0;
+    static final int EDIT_CUT = 1;
+    static final int EDIT_PASTE = 2;
+    static final int EDIT_SELECT_ALL = 3;
+    static final int EDIT_UNDO = 4;
+    static final int EDIT_REDO = 5;
+    static final int EDIT_DELETE = 6;
+
+    /** Runs a Blink editor command on the focused frame (clipboard / selection). */
+    void execEditingCommand(int cmd) {
+        if (page != null) {
+            page.execEditingCommand(cmd);
+        }
+    }
+
+    /**
+     * Builds the default context-menu items for the current
+     * {@link #getContextMenuContext()}: editing commands (Cut / Copy / Paste /
+     * Delete / Select All) appropriate to the click target, link / image actions,
+     * then Back / Reload.
+     */
+    private List<MenuItem> buildDefaultItems() {
+        ContextMenuContext ctx = contextMenuContext;
+        boolean editable = ctx.isEditable();
+        boolean hasSelection = !ctx.getSelectedText().isEmpty();
+        List<MenuItem> items = new ArrayList<>(10);
+
+        if (editable && hasSelection) {
+            items.add(item("Cut", () -> execEditingCommand(EDIT_CUT)));
+        }
+        if (hasSelection) {
+            items.add(item("Copy", () -> execEditingCommand(EDIT_COPY)));
+        }
+        if (editable) {
+            items.add(item("Paste", () -> execEditingCommand(EDIT_PASTE)));
+        }
+        if (editable && hasSelection) {
+            items.add(item("Delete", () -> execEditingCommand(EDIT_DELETE)));
+        }
+        items.add(item("Select All", () -> execEditingCommand(EDIT_SELECT_ALL)));
+
+        String link = ctx.getLinkUrl();
+        if (!link.isEmpty()) {
+            items.add(new SeparatorMenuItem());
+            items.add(item("Open Link", () -> load(link)));
+            items.add(item("Copy Link Address", () -> copyToClipboard(link)));
+        }
+        String img = ctx.getImageUrl();
+        if (!img.isEmpty()) {
+            if (link.isEmpty()) {
+                items.add(new SeparatorMenuItem());
+            }
+            items.add(item("Copy Image Address", () -> copyToClipboard(img)));
+        }
+
+        items.add(new SeparatorMenuItem());
+        items.add(item("Back", () -> {
+            try {
+                getHistory().go(-1);
+            } catch (IndexOutOfBoundsException ignore) {
+                // no previous entry
+            }
+        }));
+        items.add(item("Reload", this::reload));
+        return items;
+    }
+
+    private static MenuItem item(String label, Runnable action) {
+        MenuItem mi = new MenuItem(label);
+        mi.setMnemonicParsing(false);
+        mi.setOnAction(ev -> action.run());
+        return mi;
+    }
+
+    private static void copyToClipboard(String text) {
+        if (text == null) {
+            return;
+        }
+        ClipboardContent content = new ClipboardContent();
+        content.putString(text);
+        Clipboard.getSystemClipboard().setContent(content);
+    }
+
+    private static final class AccessorImpl extends Accessor {
+        private final WeakReference<WebEngine> engine;
+
+        private AccessorImpl(WebEngine w) {
+            this.engine = new WeakReference<>(w);
+        }
+
+        @Override public WebEngine getEngine() {
+            return engine.get();
+        }
+
+        @Override public WebPage getPage() {
+            WebEngine w = getEngine();
+            return w == null ? null : w.page;
+        }
+
+        @Override public WebView getView() {
+            WebEngine w = getEngine();
+            return w == null ? null : w.view.get();
+        }
+
+        @Override public void addChild(Node child) {
+            WebView view = getView();
+            if (view != null) {
+                view.getChildren().add(child);
+            }
+        }
+
+        @Override public void removeChild(Node child) {
+            WebView view = getView();
+            if (view != null) {
+                view.getChildren().remove(child);
+            }
+        }
+
+        @Override public void addViewListener(InvalidationListener l) {
+            WebEngine w = getEngine();
+            if (w != null) {
+                w.view.addListener(l);
+            }
+        }
+
+        @Override public void openColorChooser(int id, int initialRgba, int[] suggestionsRgba) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            List<Color> suggestions = new ArrayList<>();
+            if (suggestionsRgba != null) {
+                for (int s : suggestionsRgba) {
+                    suggestions.add(colorFromRgba(s));
+                }
+            }
+            ColorChooser chooser =
+                new ColorChooser(w, id, colorFromRgba(initialRgba), suggestions);
+            ColorChooserHandler h = w.getColorChooserHandler();
+            if (h != null) {
+                h.handle(chooser);
+            } else {
+                // Native by default: the engine only surfaces this when the app
+                // installed a handler (override). Safety cancel otherwise.
+                chooser.cancel();
+            }
+        }
+
+        @Override public void openFileChooser(int id, int mode, String title,
+                                              String initialName, String acceptCsv) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            FileChooserRequest.Mode m = switch (mode) {
+                case 1       -> FileChooserRequest.Mode.OPEN_MULTIPLE;
+                case 2, 3    -> FileChooserRequest.Mode.DIRECTORY; // uploadFolder / openDirectory
+                case 4       -> FileChooserRequest.Mode.SAVE;
+                default      -> FileChooserRequest.Mode.OPEN;
+            };
+            List<String> filters = new ArrayList<>();
+            if (acceptCsv != null && !acceptCsv.isEmpty()) {
+                for (String s : acceptCsv.split("\n")) {
+                    String t = s.trim();
+                    if (!t.isEmpty()) {
+                        filters.add(t);
+                    }
+                }
+            }
+            FileChooserRequest req = new FileChooserRequest(w, id, m, title, initialName, filters);
+            FileChooserHandler h = w.getFileChooserHandler();
+            if (h != null) {
+                h.handle(req);   // app override
+            } else {
+                w.showDefaultFileChooser(req);   // built-in default — works out of the box
+            }
+        }
+
+        @Override public void savePdf(int requestId, String defaultName) {
+            WebEngine w = getEngine();
+            if (w != null) {
+                w.requestPdfSave(requestId, defaultName);
+            }
+        }
+
+        @Override public void openSelectPopup(int id, boolean multiple, int selectedIndex,
+                double anchorX, double anchorY, double anchorW, double anchorH,
+                List<BlinkPage.SelectItemData> items) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            List<SelectItem> options = new ArrayList<>();
+            if (items != null) {
+                for (BlinkPage.SelectItemData it : items) {
+                    options.add(new SelectItem(it.label(), it.value(), it.enabled(), it.group()));
+                }
+            }
+            Rectangle2D anchor = new Rectangle2D(anchorX, anchorY,
+                Math.max(0, anchorW), Math.max(0, anchorH));
+            SelectPopup popup = new SelectPopup(w, id, options, selectedIndex, multiple, anchor);
+            SelectPopupHandler h = w.getSelectPopupHandler();
+            if (h != null) {
+                h.handle(popup);
+            } else {
+                // Native by default: the engine only surfaces this when the app
+                // installed a handler (override). Safety cancel otherwise.
+                popup.cancel();
+            }
+        }
+
+        /** Unpacks an {@code 0xRRGGBBAA} value into a {@code Color}. */
+        private static Color colorFromRgba(int rgba) {
+            int r = (rgba >>> 24) & 0xFF;
+            int g = (rgba >>> 16) & 0xFF;
+            int b = (rgba >>> 8) & 0xFF;
+            int a = rgba & 0xFF;
+            return Color.rgb(r, g, b, a / 255.0);
+        }
+
+        @Override public void firePermissionRequest(int id, int permType, String origin) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            PermissionRequest req = new PermissionRequest(
+                w, id, PermissionType.fromWire(permType), origin);
+            PermissionHandler h = w.getPermissionHandler();
+            if (h != null) {
+                h.handle(req);
+            } else {
+                req.deny();  // safe default: never grant silently
+            }
+        }
+
+        @Override public void fireAuthRequest(int id, int scheme, boolean proxy,
+                String host, String realm) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            AuthRequest req = new AuthRequest(
+                w, id, AuthScheme.fromWire(scheme), proxy, host, realm);
+            AuthHandler h = w.getAuthHandler();
+            if (h != null) {
+                h.handle(req);
+            } else {
+                req.cancel();
+            }
+        }
+
+        @Override public void fireDownloadRequest(int id, String url, String suggestedName,
+                String mimeType, long totalBytes) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            DownloadRequest req = new DownloadRequest(
+                w, id, url, suggestedName, mimeType, totalBytes);
+            DownloadHandler h = w.getDownloadHandler();
+            if (h != null) {
+                h.handle(req);
+            } else {
+                req.deny();
+            }
+        }
+
+        @Override public void fireDownloadProgress(int id, int state, long received, long total) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            DownloadProgressHandler h = w.getDownloadProgressHandler();
+            if (h != null) {
+                h.onProgress(new Download(
+                    w, id, DownloadState.fromWire(state), received, total, null));
+            }
+        }
+
+        @Override public void fireDownloadFinished(int id, int state, String path) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            DownloadProgressHandler h = w.getDownloadProgressHandler();
+            if (h != null) {
+                File target = (path == null || path.isEmpty()) ? null : new File(path);
+                h.onFinished(new Download(
+                    w, id, DownloadState.fromWire(state), -1, -1, target));
+            }
+        }
+
+        // The engine's renderer-side contextmenu signal (rich DOM context). The
+        // menu itself is built + shown by WebEngine (foreground, JavaFX), shared
+        // with the WebView's right-click fallback so a menu always appears. menuId
+        // is unused — there is no request/response correlation on this path.
+        @Override public void fireContextMenu(int menuId, double x, double y, int flags,
+                String linkUrl, String srcUrl, String selection) {
+            WebEngine w = getEngine();
+            if (w != null) {
+                w.fireContextMenuFromEngine(x, y, flags, linkUrl, srcUrl, selection);
+            }
+        }
+
+        @Override public void fireFullscreenRequest(int id, boolean entering) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            FullscreenRequest req = new FullscreenRequest(w, id, entering);
+            FullscreenHandler h = w.getFullscreenHandler();
+            if (h != null) {
+                h.handle(req);
+            } else {
+                req.deny();
+            }
+        }
+
+        @Override public void fireFaviconChanged(String iconUrl) {
+            WebEngine w = getEngine();
+            if (w != null) {
+                w.setFaviconUrl(iconUrl);
+            }
+        }
+
+        @Override public void fireTooltipChanged(String text) {
+            WebEngine w = getEngine();
+            if (w != null) {
+                w.setToolTipText(text);
+            }
+        }
+
+        // interceptId → the request seen in the request phase, so the response
+        // exchange can expose the originating request. Cleared on completion.
+        /**
+         * In-flight intercepted exchanges, keyed by interceptId. Bounded: if a
+         * matched request never gets an {@code INTERCEPT_COMPLETE} (e.g. a dropped
+         * event under ring pressure, or a never-finishing load), the eldest entry
+         * is evicted past the cap so the map can't grow unbounded on a long-lived
+         * page with an active interceptor. Removed normally on networkComplete.
+         */
+        private static final int MAX_PENDING_NET = 2048;
+        private final Map<Integer, NetworkRequest> pendingNet =
+            new LinkedHashMap<>(16, 0.75f, false) {
+                @Override protected boolean removeEldestEntry(
+                        Map.Entry<Integer, NetworkRequest> eldest) {
+                    if (size() > MAX_PENDING_NET) {
+                        // Not silent: the eldest in-flight request is being dropped
+                        // (>2048 concurrent intercepts — a flood or leaked completes).
+                        // Its later phases will have no request context and so pass
+                        // through uninterceptable rather than being mis-routed.
+                        logger.warning("network intercept registry full ("
+                            + MAX_PENDING_NET + "); dropping context for id="
+                            + eldest.getKey() + " — later phases pass through");
+                        return true;
+                    }
+                    return false;
+                }
+            };
+        /**
+         * interceptId → the response seen in the response phase, so a body-chunk
+         * exchange can expose response metadata (Content-Type, status). Same bound
+         * as {@link #pendingNet}; removed on completion.
+         */
+        private final Map<Integer, NetworkResponse> pendingResp =
+            new LinkedHashMap<>(16, 0.75f, false) {
+                @Override protected boolean removeEldestEntry(
+                        Map.Entry<Integer, NetworkResponse> eldest) {
+                    return size() > MAX_PENDING_NET;
+                }
+            };
+
+        @Override public void fireNetworkRequest(int interceptId, int resourceType,
+                String method, String url, String[] headerNames, String[] headerValues) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            ResourceType type = ResourceType.fromWire(resourceType);
+            NetworkRequest req = new NetworkRequest(url, method,
+                NetworkHeaders.of(headerNames, headerValues), type, null);
+            pendingNet.put(interceptId, req);
+            NetworkExchange ex = new NetworkExchange(w, interceptId, 0 /*request phase*/, req, null);
+            NetworkInterceptor in = w.matchNetworkInterceptor(url, type, method,
+                NetworkFilter.Phase.REQUEST);
+            if (in != null) {
+                in.onRequest(ex);
+            } else {
+                ex.proceed();
+            }
+        }
+
+        @Override public void fireNetworkResponse(int interceptId, int status,
+                String mimeType, long contentLength,
+                String[] headerNames, String[] headerValues) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            NetworkRequest req = pendingNet.get(interceptId);
+            NetworkResponse resp = new NetworkResponse(status, "",
+                NetworkHeaders.of(headerNames, headerValues), mimeType, contentLength, false);
+            NetworkExchange ex = new NetworkExchange(w, interceptId, 1 /*response phase*/, req, resp);
+            if (req == null) {
+                // Lost request context (registry overflow / dropped request event):
+                // we can't route to the right interceptor, so proceed untouched
+                // rather than mis-route to a match-all with a bogus URL.
+                ex.proceed();
+                return;
+            }
+            pendingResp.put(interceptId, resp);
+            NetworkInterceptor in = w.matchNetworkInterceptor(req.url(), req.resourceType(),
+                req.method(), NetworkFilter.Phase.RESPONSE);
+            if (in != null) {
+                in.onResponse(ex);
+            } else {
+                ex.proceed();
+            }
+        }
+
+        @Override public void fireNetworkComplete(int interceptId, int netError) {
+            pendingNet.remove(interceptId);
+            pendingResp.remove(interceptId);
+        }
+
+        @Override public void fireNetworkBodyChunk(int interceptId, int chunkSeq,
+                long offset, boolean last, byte[] bytes) {
+            WebEngine w = getEngine();
+            if (w == null) {
+                return;
+            }
+            NetworkRequest req = pendingNet.get(interceptId);
+            BodyEdit edit = null;
+            // Only consult an interceptor when we still have the request context.
+            // A lost context (registry overflow / dropped request event) passes the
+            // chunk through untouched rather than mis-routing on a bogus URL.
+            if (req != null) {
+                NetworkInterceptor in = w.matchNetworkInterceptor(req.url(),
+                    req.resourceType(), req.method(), NetworkFilter.Phase.RESPONSE);
+                if (in != null) {
+                    // Thread the response metadata through (Content-Type/status), so
+                    // a body-rewriting interceptor isn't handed a null response.
+                    NetworkResponse resp = pendingResp.get(interceptId);
+                    NetworkExchange ex = new NetworkExchange(w, interceptId, 1, req, resp);
+                    try {
+                        edit = in.onBodyChunk(ex, new BodyChunk(bytes, offset, last));
+                    } catch (RuntimeException ex2) {
+                        // Don't let an interceptor bug corrupt the stream — pass the
+                        // chunk through — but make the failure visible (was silent).
+                        logger.warning("NetworkInterceptor.onBodyChunk threw; passing chunk through", ex2);
+                        edit = null;
+                    }
+                }
+            }
+            if (edit == null) {
+                edit = BodyEdit.passThrough();
+            }
+            int kind;
+            byte[] repl = null;
+            switch (edit.kind()) {
+                case REPLACE -> { kind = 1; repl = edit.replacement(); }
+                case DROP -> kind = 2;
+                default -> kind = 0;
+            }
+            w.resolveBodyEdit(interceptId, chunkSeq, kind, repl);
+        }
+    }
+
+    /**
+     * Drives the {@code Timer} when {@code Timer.Mode.PLATFORM_TICKS} is set.
+     */
+    private static final class PulseTimer {
+
+        // Used just to guarantee constant pulse activity. See JDK-8114603.
+        private static final AnimationTimer animation =
+            new AnimationTimer() {
+                @Override public void handle(long l) {}
+            };
+
+        private static final TKPulseListener listener =
+                () -> {
+                    // Note, the timer event is executed right in the notifyTick(),
+                    // that is during the pulse event. This makes the timer more
+                    // repsonsive, though prolongs the pulse. So far it causes no
+                    // problems but nevertheless it should be kept in mind.
+
+                    // Execute notifyTick in runLater to run outside of pulse so
+                    // that events will run in order and be able to display dialogs
+                    // or call other methods that require a nested event loop.
+                    Platform.runLater(() -> Timer.getTimer().notifyTick());
+                };
+
+        private static void start(){
+            Toolkit.getToolkit().addSceneTkPulseListener(listener);
+            animation.start();
+        }
+
+        private static void stop() {
+            Toolkit.getToolkit().removeSceneTkPulseListener(listener);
+            animation.stop();
+        }
+    }
+
+    static void checkThread() {
+        Toolkit.getToolkit().checkFxUserThread();
+    }
+
+
+    /**
+     * The page load event listener. This object references the owner
+     * WebEngine weakly so as to avoid referencing WebEngine from WebPage
+     * strongly.
+     */
+    private static final class PageLoadListener implements LoadListenerClient {
+
+        private final WeakReference<WebEngine> engine;
+
+
+        private PageLoadListener(WebEngine engine) {
+            this.engine = new WeakReference<>(engine);
+        }
+
+
+        @Override public void dispatchLoadEvent(long frame, int state,
+                String url, String contentType, double progress, int errorCode)
+        {
+            WebEngine w = engine.get();
+            if (w != null) {
+                w.loadWorker.dispatchLoadEvent(frame, state, url,
+                        contentType, progress, errorCode);
+            }
+        }
+
+        @Override public void dispatchResourceLoadEvent(long frame,
+                int state, String url, String contentType, double progress,
+                int errorCode)
+        {
+        }
+    }
+
+
+    private final class LoadWorker implements Worker<Void> {
+
+        private final ReadOnlyObjectWrapper<State> state = new ReadOnlyObjectWrapper<>(this, "state", State.READY);
+        @Override public final State getState() { checkThread(); return state.get(); }
+        @Override public final ReadOnlyObjectProperty<State> stateProperty() { checkThread(); return state.getReadOnlyProperty(); }
+        private void updateState(State value) {
+            checkThread();
+            this.state.set(value);
+            running.set(value == State.SCHEDULED || value == State.RUNNING);
+        }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyObjectWrapper<Void> value = new ReadOnlyObjectWrapper<>(this, "value", null);
+        @Override public final Void getValue() { checkThread(); return value.get(); }
+        @Override public final ReadOnlyObjectProperty<Void> valueProperty() { checkThread(); return value.getReadOnlyProperty(); }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyObjectWrapper<Throwable> exception = new ReadOnlyObjectWrapper<>(this, "exception");
+        @Override public final Throwable getException() { checkThread(); return exception.get(); }
+        @Override public final ReadOnlyObjectProperty<Throwable> exceptionProperty() { checkThread(); return exception.getReadOnlyProperty(); }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyDoubleWrapper workDone = new ReadOnlyDoubleWrapper(this, "workDone", -1);
+        @Override public final double getWorkDone() { checkThread(); return workDone.get(); }
+        @Override public final ReadOnlyDoubleProperty workDoneProperty() { checkThread(); return workDone.getReadOnlyProperty(); }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyDoubleWrapper totalWorkToBeDone = new ReadOnlyDoubleWrapper(this, "totalWork", -1);
+        @Override public final double getTotalWork() { checkThread(); return totalWorkToBeDone.get(); }
+        @Override public final ReadOnlyDoubleProperty totalWorkProperty() { checkThread(); return totalWorkToBeDone.getReadOnlyProperty(); }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyDoubleWrapper progress = new ReadOnlyDoubleWrapper(this, "progress", -1);
+        @Override public final double getProgress() { checkThread(); return progress.get(); }
+        @Override public final ReadOnlyDoubleProperty progressProperty() { checkThread(); return progress.getReadOnlyProperty(); }
+        private void updateProgress(double p) {
+            totalWorkToBeDone.set(100.0);
+            workDone.set(p * 100.0);
+            progress.set(p);
+        }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyBooleanWrapper running = new ReadOnlyBooleanWrapper(this, "running", false);
+        @Override public final boolean isRunning() { checkThread(); return running.get(); }
+        @Override public final ReadOnlyBooleanProperty runningProperty() { checkThread(); return running.getReadOnlyProperty(); }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyStringWrapper message = new ReadOnlyStringWrapper(this, "message", "");
+        @Override public final String getMessage() { return message.get(); }
+        @Override public final ReadOnlyStringProperty messageProperty() { return message.getReadOnlyProperty(); }
+
+        /**
+         * @InheritDoc
+         */
+        private final ReadOnlyStringWrapper title = new ReadOnlyStringWrapper(this, "title", "WebEngine Loader");
+        @Override public final String getTitle() { return title.get(); }
+        @Override public final ReadOnlyStringProperty titleProperty() { return title.getReadOnlyProperty(); }
+
+        /**
+         * Cancels the loading of the page. If called after the page has already
+         * been loaded, then this call takes no effect.
+         */
+        @Override public boolean cancel() {
+            if (isRunning()) {
+                stop(); // this call indirectly sets state
+                return true;
+            } else {
+                return false;
+            }
+        }
+
+        private void cancelAndReset() {
+            cancel();
+            exception.set(null);
+            message.set("");
+            totalWorkToBeDone.set(-1);
+            workDone.set(-1);
+            progress.set(-1);
+            updateState(State.READY);
+            running.set(false);
+        }
+
+        private void dispatchLoadEvent(long frame, int state,
+                String url, String contentType, double workDone, int errorCode)
+        {
+            if (frame != getMainFrame()) {
+                return;
+            }
+            switch (state) {
+                case PAGE_STARTED:
+                    message.set("Loading " + url);
+                    updateLocation(url);
+                    updateProgress(0.0);
+                    updateState(State.SCHEDULED);
+                    updateState(State.RUNNING);
+                    break;
+                case PAGE_REDIRECTED:
+                    message.set("Loading " + url);
+                    updateLocation(url);
+                    break;
+                case PAGE_REPLACED:
+                    message.set("Replaced " + url);
+                    // Update only the location, don't change title or document.
+                    WebEngine.this.location.set(url);
+                    break;
+                case PAGE_FINISHED:
+                    message.set("Loading complete");
+                    updateProgress(1.0);
+                    updateState(State.SUCCEEDED);
+                    break;
+                case LOAD_FAILED:
+                    message.set("Loading failed");
+                    exception.set(describeError(errorCode));
+                    updateState(State.FAILED);
+                    break;
+                case LOAD_STOPPED:
+                    message.set("Loading stopped");
+                    updateState(State.CANCELLED);
+                    break;
+                case PROGRESS_CHANGED:
+                    updateProgress(workDone);
+                    break;
+                case TITLE_RECEIVED:
+                    updateTitle();
+                    break;
+                case DOCUMENT_AVAILABLE:
+                    if (this.state.get() == State.READY) {
+                        // Empty load: the document became available without a
+                        // preceding PAGE_STARTED — synthesize one (JDK-8119247).
+                        // Guard on READY rather than "!= RUNNING": on the Blink
+                        // path the DOM tree (DOCUMENT_AVAILABLE) becomes available
+                        // AFTER the page has already reached SUCCEEDED, and
+                        // resurrecting a finished load back to RUNNING caused
+                        // repeated state notifications per load.
+                        dispatchLoadEvent(frame, PAGE_STARTED, url, contentType, workDone, errorCode);
+                    }
+                    document.invalidate(true);
+                    break;
+            }
+        }
+
+        private Throwable describeError(int errorCode) {
+            String reason = "Unknown error";
+
+            switch (errorCode) {
+                case UNKNOWN_HOST:
+                    reason = "Unknown host";
+                    break;
+                case MALFORMED_URL:
+                    reason = "Malformed URL";
+                    break;
+                case SSL_HANDSHAKE:
+                    reason = "SSL handshake failed";
+                    break;
+                case CONNECTION_REFUSED:
+                    reason = "Connection refused by server";
+                    break;
+                case CONNECTION_RESET:
+                    reason = "Connection reset by server";
+                    break;
+                case NO_ROUTE_TO_HOST:
+                    reason = "No route to host";
+                    break;
+                case CONNECTION_TIMED_OUT:
+                    reason = "Connection timed out";
+                    break;
+                case PERMISSION_DENIED:
+                    reason = "Permission denied";
+                    break;
+                case INVALID_RESPONSE:
+                    reason = "Invalid response from server";
+                    break;
+                case TOO_MANY_REDIRECTS:
+                    reason = "Too many redirects";
+                    break;
+                case FILE_NOT_FOUND:
+                    reason = "File not found";
+                    break;
+            }
+            return new Throwable(reason);
+        }
+    }
+
+
+    private final class DocumentProperty
+            extends ReadOnlyObjectPropertyBase<Document> {
+
+        private boolean available;
+        private Document document;
+
+        private void invalidate(boolean available) {
+            if (this.available || available) {
+                this.available = available;
+                this.document = null;
+                fireValueChangedEvent();
+            }
+        }
+
+        @Override
+        public Document get() {
+            if (!this.available) {
+                return null;
+            }
+            if (this.document == null) {
+                this.document = page.getDocument(page.getMainFrame());
+                if (this.document == null) {
+                    this.available = false;
+                }
+            }
+            return this.document;
+        }
+
+        @Override
+        public Object getBean() {
+            return WebEngine.this;
+        }
+
+        @Override
+        public String getName() {
+            return "document";
+        }
+    }
+
+
+    /*
+     * Returns the debugger associated with this web engine.
+     * The debugger is an object that can be used to debug
+     * the web page currently loaded into the web engine.
+     * <p>
+     * All methods of the debugger must be called on
+     * the JavaFX Application Thread.
+     * The message callback object registered with the debugger
+     * is always called on the JavaFX Application Thread.
+     * @return the debugger associated with this web engine.
+     *         The return value cannot be {@code null}.
+     */
+    Debugger getDebugger() {
+        return debugger;
+    }
+
+    /**
+     * The debugger implementation.
+     */
+    private final class DebuggerImpl implements Debugger {
+
+        private boolean enabled;
+        private Callback<String,Void> messageCallback;
+
+
+        @Override
+        public boolean isEnabled() {
+            checkThread();
+            return enabled;
+        }
+
+        @Override
+        public void setEnabled(boolean enabled) {
+            checkThread();
+            if (enabled != this.enabled) {
+                if (enabled) {
+                    page.setDeveloperExtrasEnabled(true);
+                    page.connectInspectorFrontend();
+                } else {
+                    page.disconnectInspectorFrontend();
+                    page.setDeveloperExtrasEnabled(false);
+                }
+                this.enabled = enabled;
+            }
+        }
+
+        @Override
+        public void sendMessage(String message) {
+            checkThread();
+            if (!enabled) {
+                throw new IllegalStateException("Debugger is not enabled");
+            }
+            if (message == null) {
+                throw new NullPointerException("message is null");
+            }
+            page.dispatchInspectorMessageFromFrontend(message);
+        }
+
+        @Override
+        public Callback<String,Void> getMessageCallback() {
+            checkThread();
+            return messageCallback;
+        }
+
+        @Override
+        public void setMessageCallback(Callback<String,Void> callback) {
+            checkThread();
+            messageCallback = callback;
+        }
+    }
+
+    /**
+     * The inspector client implementation. This object references the owner
+     * WebEngine weakly so as to avoid referencing WebEngine from WebPage
+     * strongly.
+     */
+    private static final class InspectorClientImpl implements InspectorClient {
+
+        private final WeakReference<WebEngine> engine;
+
+
+        private InspectorClientImpl(WebEngine engine) {
+            this.engine = new WeakReference<>(engine);
+        }
+
+        @Override
+        public boolean sendMessageToFrontend(final String message) {
+            boolean result = false;
+            WebEngine webEngine = engine.get();
+            if (webEngine != null) {
+                final Callback<String,Void> messageCallback =
+                        webEngine.debugger.messageCallback;
+                if (messageCallback != null) {
+                    messageCallback.call(message);
+                    result = true;
+                }
+            }
+            return result;
+        }
+    }
+
+    private static final boolean printStatusOK(PrinterJob job) {
+        switch (job.getJobStatus()) {
+            case NOT_STARTED:
+            case PRINTING:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /**
+     * Prints the current Web page using the given printer job.
+     * <p>This method does not modify the state of the job, nor does it call
+     * {@link PrinterJob#endJob}, so the job may be safely reused afterwards.
+     *
+     * @param job printer job used for printing
+     * @since JavaFX 8.0
+     */
+    public void print(PrinterJob job) {
+        if (!printStatusOK(job)) {
+            return;
+        }
+
+        PageLayout pl = job.getJobSettings().getPageLayout();
+        float width = (float) pl.getPrintableWidth();
+        float height = (float) pl.getPrintableHeight();
+        int pageCount = page.beginPrinting(width, height);
+
+        JobSettings jobSettings = job.getJobSettings();
+        if (jobSettings.getPageRanges() != null) {
+            PageRange[] pageRanges = jobSettings.getPageRanges();
+            for (PageRange p : pageRanges) {
+                for (int i = p.getStartPage(); i <= p.getEndPage() && i <= pageCount; ++i) {
+                    if (printStatusOK(job)) {
+                        Node printable = new Printable(page, i - 1, width);
+                        job.printPage(printable);
+                    }
+                }
+            }
+        } else {
+            for (int i = 0; i < pageCount; i++) {
+                if (printStatusOK(job)) {
+                    Node printable = new Printable(page, i, width);
+                    job.printPage(printable);
+                }
+            }
+        }
+        page.endPrinting();
+    }
+
+    /**
+     * Opens the interactive print preview for the current Web page. The preview
+     * is rendered by the underlying engine, where the user can adjust settings
+     * and choose to print or save.
+     * <p>This method must be called on the JavaFX Application Thread.
+     *
+     * @since skia-fx
+     */
+    public void showPrintPreview() {
+        checkThread();
+        page.showPrintPreview();
+    }
+
+    /**
+     * Renders the current Web page to a PDF document, prompting the user with a
+     * native "Save As" dialog to choose the destination.
+     * <p>This method must be called on the JavaFX Application Thread.
+     *
+     * @since skia-fx
+     */
+    public void print() {
+        checkThread();
+        page.printToPdf("");
+    }
+
+    /**
+     * Renders the current Web page to a PDF document written directly to
+     * {@code location}, without prompting the user.
+     * <p>This method must be called on the JavaFX Application Thread.
+     *
+     * @param location the file system path to write the PDF to
+     * @since skia-fx
+     */
+    public void print(String location) {
+        checkThread();
+        page.printToPdf(location == null ? "" : location);
+    }
+}

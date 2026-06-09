@@ -1,0 +1,230 @@
+diff --git a/chrome/browser/ui/webui/print_preview/print_preview_ui.h b/chrome/browser/ui/webui/print_preview/print_preview_ui.h
+index e08b519..60a3aed 100644
+--- a/chrome/browser/ui/webui/print_preview/print_preview_ui.h
++++ b/chrome/browser/ui/webui/print_preview/print_preview_ui.h
+@@ -65,7 +65,11 @@ class PrintPreviewUIConfig
+ };
+ 
+ // PrintPreviewUI lives on the UI thread.
+-class PrintPreviewUI : public ConstrainedWebDialogUI,
++// skia-fx: hosted off-screen by the jux engine (not in a chrome constrained
++// dialog), so the base is content::WebUIController instead of
++// ConstrainedWebDialogUI. PrintPreviewUI only uses web_ui() (a WebUIController
++// method), so this is a clean base reduction. See jux print_preview port.
++class PrintPreviewUI : public content::WebUIController,
+                        public mojom::PrintPreviewUI {
+  public:
+   explicit PrintPreviewUI(content::WebUI* web_ui);
+diff --git a/chrome/browser/ui/webui/print_preview/print_preview_ui.cc b/chrome/browser/ui/webui/print_preview/print_preview_ui.cc
+index bdbf965..06e3717 100644
+--- a/chrome/browser/ui/webui/print_preview/print_preview_ui.cc
++++ b/chrome/browser/ui/webui/print_preview/print_preview_ui.cc
+@@ -26,9 +26,11 @@
+ #include "base/values.h"
+ #include "build/build_config.h"
+ #include "chrome/browser/browser_process.h"
+-#include "chrome/browser/enterprise/browser_management/management_service_factory.h"
++// skia-fx: management_service_factory.h removed — isEnterpriseManaged is hard
++// false (see below), so the enterprise/browser_management cone isn't needed.
+ #include "chrome/browser/pdf/pdf_extension_util.h"
+-#include "chrome/browser/printing/background_printing_manager.h"
++// skia-fx: background_printing_manager.h removed — no hide-preview-to-background
++// in the off-screen OSR model (see OnPrintPreviewDialogClosed/OnInitiatorClosed).
+ #include "chrome/browser/printing/pdf_nup_converter_client.h"
+ #include "chrome/browser/printing/print_compositor_util.h"
+ #include "chrome/browser/printing/print_job_manager.h"
+@@ -37,11 +39,13 @@
+ #include "chrome/browser/printing/print_view_manager.h"
+ #include "chrome/browser/printing/printer_query.h"
+ #include "chrome/browser/profiles/profile.h"
+-#include "chrome/browser/ui/chrome_pages.h"
++// skia-fx: dead include "chrome/browser/ui/chrome_pages.h" removed (no
++// chrome::Show* use; the jux engine has no chrome Browser UI pages).
+ #include "chrome/browser/ui/webui/metrics_handler.h"
+ #include "chrome/browser/ui/webui/plural_string_handler.h"
+ #include "chrome/browser/ui/webui/print_preview/print_preview_handler.h"
+-#include "chrome/browser/ui/webui/theme_source.h"
++// skia-fx: theme_source.h removed — chrome://theme not registered for M2 (see
++// the ThemeSource note in CreatePrintPreviewUISource below).
+ #include "chrome/common/buildflags.h"
+ #include "chrome/common/pref_names.h"
+ #include "chrome/common/url_constants.h"
+@@ -53,6 +57,8 @@
+ #include "components/prefs/pref_service.h"
+ #include "components/printing/browser/print_composite_client.h"
+ #include "components/printing/browser/print_manager_utils.h"
++// skia-fx: engine bridge to tear down the off-screen preview on dialog close.
++#include "jux/print_preview/shim/jux_print_preview_hook.h"
+ #include "components/strings/grit/components_strings.h"
+ #include "components/user_manager/user_manager.h"
+ #include "content/public/browser/browser_thread.h"
+@@ -339,9 +345,10 @@ void AddPrintPreviewFlags(content::WebUIDataSource* source, Profile* profile) {
+                      base::FeatureList::IsEnabled(
+                          features::kAlignPdfDefaultPrintSettingsWithHTML));
+ 
+-  source->AddBoolean(
+-      "isEnterpriseManaged",
+-      policy::ManagementServiceFactory::GetForPlatform()->IsManaged());
++  // skia-fx: the jux engine is never enterprise-managed (no policy management
++  // service in a content embedder), so this is constant false — drops the
++  // chrome/browser/enterprise + components/policy management cone.
++  source->AddBoolean("isEnterpriseManaged", false);
+ 
+ 
+ #if BUILDFLAG(IS_CHROMEOS)
+@@ -363,10 +370,19 @@ void SetupPrintPreviewPlugin(content::WebUIDataSource* source) {
+ }
+ 
+ void CreateAndAddPrintPreviewUISource(Profile* profile) {
++  LOG(ERROR) << "[skia-fx] CreateAndAddPrintPreviewUISource: profile=" << profile
++             << " host=" << chrome::kChromeUIPrintHost
++             << " resources=" << std::size(kPrintPreviewResources)
++             << " default_idr=" << IDR_PRINT_PREVIEW_PRINT_PREVIEW_HTML;
+   content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
+       profile, chrome::kChromeUIPrintHost);
+   webui::SetupWebUIDataSource(source, kPrintPreviewResources,
+                               IDR_PRINT_PREVIEW_PRINT_PREVIEW_HTML);
++  // skia-fx DEBUG: allow the inline error-overlay script in print_preview.html
++  // to run (default WebUI CSP forbids inline scripts). Remove with diagnostics.
++  source->OverrideContentSecurityPolicy(
++      network::mojom::CSPDirectiveName::ScriptSrc,
++      "script-src chrome://resources chrome://print 'self' 'unsafe-inline';");
+   // Add TrustedTypes policy for creating the PDF plugin.
+   source->OverrideContentSecurityPolicy(
+       network::mojom::CSPDirectiveName::TrustedTypes,
+@@ -426,7 +442,7 @@ WEB_UI_CONTROLLER_TYPE_IMPL(PrintPreviewUI)
+ 
+ PrintPreviewUI::PrintPreviewUI(content::WebUI* web_ui,
+                                std::unique_ptr<PrintPreviewHandler> handler)
+-    : ConstrainedWebDialogUI(web_ui),
++    : content::WebUIController(web_ui),
+       initial_preview_start_time_(base::TimeTicks::Now()),
+       first_print_usage_since_startup_(IsFirstInstanceSinceStartup()),
+       handler_(handler.get()) {
+@@ -438,7 +454,7 @@ PrintPreviewUI::PrintPreviewUI(content::WebUI* web_ui,
+ }
+ 
+ PrintPreviewUI::PrintPreviewUI(content::WebUI* web_ui)
+-    : ConstrainedWebDialogUI(web_ui),
++    : content::WebUIController(web_ui),
+       initial_preview_start_time_(base::TimeTicks::Now()),
+       first_print_usage_since_startup_(IsFirstInstanceSinceStartup()),
+       handler_(CreatePrintPreviewHandlers(web_ui)) {
+@@ -449,8 +465,10 @@ PrintPreviewUI::PrintPreviewUI(content::WebUI* web_ui)
+   Profile* profile = Profile::FromWebUI(web_ui);
+   CreateAndAddPrintPreviewUISource(profile);
+ 
+-  // Set up the chrome://theme/ source.
+-  content::URLDataSource::Add(profile, std::make_unique<ThemeSource>(profile));
++  // skia-fx: the chrome://theme/ ThemeSource (real impl drags the theme service
++  // / NTP cone) is not registered for M2. The print-preview Polymer UI loads
++  // without it; a small ThemeSource (or color-pipeline equivalent) can be added
++  // in M4 if any chrome://theme icon proves load-bearing. See jux print_preview.
+ 
+ #if BUILDFLAG(ENABLE_OOP_PRINTING)
+   RegisterPrintBackendServiceManagerClient();
+@@ -804,30 +822,17 @@ std::optional<int32_t> PrintPreviewUI::GetIDForPrintPreviewUI() const {
+ }
+ 
+ void PrintPreviewUI::OnPrintPreviewDialogClosed() {
+-  WebContents* preview_dialog = web_ui()->GetWebContents();
+-  BackgroundPrintingManager* background_printing_manager =
+-      g_browser_process->background_printing_manager();
+-  if (background_printing_manager->HasPrintPreviewDialog(preview_dialog)) {
+-    return;
+-  }
++  // skia-fx: no BackgroundPrintingManager (chrome's hide-preview-to-background
++  // feature) in the off-screen OSR model — just close.
+   OnClosePrintPreviewDialog();
+ }
+ 
+ void PrintPreviewUI::OnInitiatorClosed() {
+   // Should only get here if the initiator was still tracked by the Print
+   // Preview Dialog Controller, so the print job has not yet been sent.
+-  WebContents* preview_dialog = web_ui()->GetWebContents();
+-  BackgroundPrintingManager* background_printing_manager =
+-      g_browser_process->background_printing_manager();
+-  if (background_printing_manager->HasPrintPreviewDialog(preview_dialog)) {
+-    // Dialog is hidden but is still generating the preview. Cancel the print
+-    // request as it can't be completed.
+-    background_printing_manager->OnPrintRequestCancelled(preview_dialog);
+-    handler_->OnPrintRequestCancelled();
+-  } else {
+-    // Initiator was closed while print preview dialog was still open.
+-    OnClosePrintPreviewDialog();
+-  }
++  // skia-fx: the OSR preview is never hidden into a BackgroundPrintingManager,
++  // so the print job hasn't been sent — close the preview.
++  OnClosePrintPreviewDialog();
+ }
+ 
+ void PrintPreviewUI::OnPrintPreviewRequest(int request_id) {
+@@ -941,22 +946,12 @@ void PrintPreviewUI::OnPrintPreviewFailed(int request_id) {
+ }
+ 
+ void PrintPreviewUI::OnHidePreviewDialog() {
+-  WebContents* preview_dialog = web_ui()->GetWebContents();
+-  BackgroundPrintingManager* background_printing_manager =
+-      g_browser_process->background_printing_manager();
+-  if (background_printing_manager->HasPrintPreviewDialog(preview_dialog)) {
+-    return;
+-  }
+-
+-  ConstrainedWebDialogDelegate* delegate = GetConstrainedDelegate();
+-  if (!delegate) {
+-    return;
+-  }
+-  std::unique_ptr<content::WebContents> preview_contents =
+-      delegate->ReleaseWebContents();
+-  DCHECK_EQ(preview_dialog, preview_contents.get());
+-  background_printing_manager->OwnPrintPreviewDialog(
+-      std::move(preview_contents));
++  // skia-fx: chrome hides the constrained dialog and hands the preview
++  // WebContents to BackgroundPrintingManager so an in-flight print survives the
++  // dialog closing. The jux engine hosts chrome://print off-screen and owns the
++  // preview WebContents itself (JuxPrintPreviewController), so there is no
++  // ConstrainedWebDialogDelegate / BackgroundPrintingManager here. The engine
++  // hides the OSR preview surface; lifecycle wiring lands in M4.
+   OnClosePrintPreviewDialog();
+ }
+ 
+@@ -965,12 +960,10 @@ void PrintPreviewUI::OnClosePrintPreviewDialog() {
+     return;
+   }
+   dialog_closed_ = true;
+-  ConstrainedWebDialogDelegate* delegate = GetConstrainedDelegate();
+-  if (!delegate) {
+-    return;
+-  }
+-  delegate->GetWebDialogDelegate()->OnDialogClosed(std::string());
+-  delegate->OnDialogCloseFromWebUI();
++  // skia-fx: no chrome constrained dialog — the preview is an off-screen OSR
++  // WebContents owned by the engine. Hand it back so the engine ends the surface
++  // takeover (the page resumes), notifies Java, and tears the WebContents down.
++  jux::ClosePrintPreview(web_ui()->GetWebContents());
+ }
+ 
+ void PrintPreviewUI::SetOptionsFromDocument(
+@@ -1069,10 +1062,18 @@ void PrintPreviewUI::DidPreviewPage(mojom::DidPreviewPageParamsPtr params,
+             mojom::PrintCompositor::Status::kCompositingFailure,
+             base::ReadOnlySharedMemoryRegion()));
+   } else {
+-    NotifyUIPreviewPageReady(
+-        page_index, request_id,
+-        base::RefCountedSharedMemoryMapping::CreateFromWholeRegion(
+-            content.metafile_data_region));
++    // skia-fx: the lean engine runs with OOPIF/compositor OFF, so preview pages
++    // arrive here directly instead of through OnCompositePdfPageDone. Upstream
++    // only applies pages-per-sheet (N-up) in that compositor callback, so doing
++    // nothing more than NotifyUIPreviewPageReady here meant pages-per-sheet was
++    // silently ignored. Route the page through OnCompositePdfPageDone so the
++    // N-up path (AddPdfPageForNupConversion → PdfNupConverterClient) runs. When
++    // not compositing the renderer emits a PDF page (not MSKP), which is exactly
++    // what the N-up converter consumes; for pages_per_sheet==1 it just forwards
++    // to NotifyUIPreviewPageReady as before.
++    OnCompositePdfPageDone(page_index, params->document_cookie, request_id,
++                           mojom::PrintCompositor::Status::kSuccess,
++                           content.metafile_data_region.Duplicate());
+   }
+ }
+ 

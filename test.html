@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JavaFX WebView Stress Test</title>
+    <style>
+        :root {
+            --bg1: #101827;
+            --bg2: #1e3a8a;
+            --card: rgba(255, 255, 255, 0.14);
+            --border: rgba(255, 255, 255, 0.22);
+            --text: #f8fafc;
+            --muted: rgba(248, 250, 252, 0.78);
+            --accent: #38bdf8;
+            --good: #34d399;
+            --warn: #fbbf24;
+        }
+
+        * { box-sizing: border-box; }
+
+        html, body {
+            margin: 0;
+            min-height: 100%;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+            color: var(--text);
+            background: radial-gradient(circle at top left, #7c3aed 0, transparent 30%),
+            radial-gradient(circle at bottom right, #06b6d4 0, transparent 28%),
+            linear-gradient(135deg, var(--bg1), var(--bg2));
+            overflow-x: hidden;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            background-image: linear-gradient(rgba(255,255,255,.055) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(255,255,255,.055) 1px, transparent 1px);
+            background-size: 44px 44px;
+            animation: gridMove 12s linear infinite;
+            opacity: .7;
+        }
+
+        @keyframes gridMove {
+            from { transform: translate3d(0,0,0); }
+            to { transform: translate3d(44px,44px,0); }
+        }
+
+        .wrap {
+            width: min(1100px, calc(100% - 32px));
+            margin: 0 auto;
+            padding: 48px 0 72px;
+            position: relative;
+            z-index: 1;
+        }
+
+        .hero {
+            display: grid;
+            grid-template-columns: 1.25fr .75fr;
+            gap: 22px;
+            align-items: stretch;
+        }
+
+        .card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 28px;
+            padding: 26px;
+            box-shadow: 0 20px 60px rgba(0,0,0,.25);
+            backdrop-filter: blur(14px);
+            -webkit-backdrop-filter: blur(14px);
+        }
+
+        h1 {
+            margin: 0 0 12px;
+            font-size: clamp(2.4rem, 6vw, 5.6rem);
+            line-height: .92;
+            letter-spacing: -0.07em;
+        }
+
+        .gradient-text {
+            background: linear-gradient(90deg, #fff, #93c5fd, #67e8f9, #f0abfc, #fff);
+            background-size: 300% 100%;
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+            animation: shine 5s ease-in-out infinite;
+        }
+
+        @keyframes shine {
+            0%,100% { background-position: 0% 50%; }
+            50% { background-position: 100% 50%; }
+        }
+
+        p { color: var(--muted); line-height: 1.65; }
+
+        .badge-row { display: flex; flex-wrap: wrap; gap: 10px; margin: 22px 0; }
+        .badge {
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            padding: 9px 13px;
+            background: rgba(255,255,255,.11);
+            font-size: .92rem;
+            white-space: nowrap;
+        }
+
+        .orb {
+            width: 210px;
+            height: 210px;
+            border-radius: 50%;
+            margin: 20px auto;
+            background: conic-gradient(from 90deg, #38bdf8, #a78bfa, #fb7185, #facc15, #34d399, #38bdf8);
+            box-shadow: 0 0 80px rgba(56,189,248,.5), inset 0 0 45px rgba(255,255,255,.35);
+            animation: spin 7s linear infinite, floaty 3.5s ease-in-out infinite;
+            position: relative;
+        }
+
+        .orb::after {
+            content: "☕🚀✨";
+            position: absolute;
+            inset: 18px;
+            display: grid;
+            place-items: center;
+            border-radius: 50%;
+            background: rgba(15,23,42,.78);
+            font-size: 2.4rem;
+            animation: spin 7s linear infinite reverse;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes floaty {
+            0%,100% { translate: 0 0; }
+            50% { translate: 0 -14px; }
+        }
+
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 18px;
+            margin-top: 22px;
+        }
+
+        .mini {
+            min-height: 180px;
+            transition: transform .25s ease, background .25s ease;
+            cursor: default;
+        }
+
+        .mini:hover {
+            transform: translateY(-7px) scale(1.015);
+            background: rgba(255,255,255,.2);
+        }
+
+        .icon { font-size: 2.3rem; display: inline-block; animation: bounce 1.8s ease-in-out infinite; }
+        @keyframes bounce {
+            0%,100% { transform: translateY(0); }
+            50% { transform: translateY(-8px); }
+        }
+
+        button, input, select {
+            font: inherit;
+            border-radius: 14px;
+            border: 1px solid var(--border);
+            padding: 12px 14px;
+            color: var(--text);
+            background: rgba(255,255,255,.12);
+            outline: none;
+        }
+
+        button {
+            background: linear-gradient(135deg, #2563eb, #06b6d4);
+            cursor: pointer;
+            font-weight: 800;
+            box-shadow: 0 12px 28px rgba(6,182,212,.25);
+        }
+
+        button:active { transform: scale(.98); }
+
+        .controls {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            margin-top: 18px;
+        }
+
+        .log {
+            height: 160px;
+            overflow: auto;
+            background: rgba(0,0,0,.28);
+            border-radius: 18px;
+            padding: 14px;
+            font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            font-size: .9rem;
+            white-space: pre-wrap;
+        }
+
+        .progress {
+            height: 18px;
+            border-radius: 999px;
+            overflow: hidden;
+            background: rgba(255,255,255,.14);
+            margin-top: 16px;
+        }
+
+        .bar {
+            height: 100%;
+            width: 35%;
+            border-radius: inherit;
+            background: linear-gradient(90deg, #34d399, #38bdf8, #a78bfa);
+            animation: load 2.4s ease-in-out infinite alternate;
+        }
+
+        @keyframes load { to { width: 96%; } }
+
+        .marquee {
+            margin-top: 22px;
+            overflow: hidden;
+            border-radius: 22px;
+            background: rgba(255,255,255,.11);
+            border: 1px solid var(--border);
+        }
+
+        .marquee span {
+            display: inline-block;
+            padding: 16px 0;
+            white-space: nowrap;
+            animation: scroll 14s linear infinite;
+            font-size: 1.25rem;
+        }
+
+        @keyframes scroll {
+            from { transform: translateX(100%); }
+            to { transform: translateX(-100%); }
+        }
+
+        .confetti {
+            position: fixed;
+            width: 10px;
+            height: 10px;
+            border-radius: 2px;
+            top: -20px;
+            animation: fall linear forwards;
+            z-index: 5;
+        }
+
+        @keyframes fall {
+            to { transform: translateY(110vh) rotate(720deg); opacity: 0; }
+        }
+
+        .theme-hot { --bg1: #3b0764; --bg2: #9f1239; --accent: #fb7185; }
+        .theme-cool { --bg1: #042f2e; --bg2: #0f172a; --accent: #2dd4bf; }
+
+        @media (max-width: 780px) {
+            .hero, .grid { grid-template-columns: 1fr; }
+            .wrap { padding-top: 24px; }
+        }
+    </style>
+</head>
+<body>
+<main class="wrap">
+    <section class="hero">
+        <div class="card">
+            <h1><span class="gradient-text">JavaFX WebView</span><br>visual test 🚦</h1>
+            <p>
+                This single HTML file checks common WebView features: embedded CSS, JavaScript events,
+                forms, animation timing, emoji rendering, gradients, scroll areas, hover states, and DOM updates.
+            </p>
+            <div class="badge-row">
+                <span class="badge">🎨 gradients</span>
+                <span class="badge">⚙️ JavaScript</span>
+                <span class="badge">✨ animations</span>
+                <span class="badge">📦 self-contained</span>
+                <span class="badge">🧪 WebView test</span>
+            </div>
+            <div class="controls">
+                <button id="confettiBtn">Launch confetti 🎉</button>
+                <button id="themeBtn">Switch theme 🌗</button>
+                <button id="stressBtn">DOM stress +100 🧱</button>
+                <input id="nameInput" placeholder="Type something..." maxlength="60" />
+            </div>
+            <div class="progress"><div class="bar"></div></div>
+        </div>
+
+        <div class="card">
+            <div class="orb" aria-label="animated orb"></div>
+            <p id="clock">Clock loading...</p>
+            <p id="echo">Input echo: —</p>
+        </div>
+    </section>
+
+    <section class="grid" id="cards">
+        <article class="card mini"><span class="icon">🖱️</span><h2>Events</h2><p>Click, type, hover, and scroll to test UI responsiveness.</p></article>
+        <article class="card mini"><span class="icon">🧊</span><h2>Glass UI</h2><p>Uses transparency, blur fallback, borders, and layered backgrounds.</p></article>
+        <article class="card mini"><span class="icon">🔥</span><h2>Animation</h2><p>CSS keyframes test transforms, gradients, and continuous painting.</p></article>
+    </section>
+
+    <section class="card" style="margin-top:22px">
+        <h2>Runtime log 🧾</h2>
+        <div class="log" id="log"></div>
+        <div class="marquee"><span>🚀 JavaFX WebView • Emojis 😎 • CSS animations ✨ • Gradients 🌈 • JS DOM updates ⚡ • Scroll test 📜 •</span></div>
+    </section>
+</main>
+
+<script>
+    (function () {
+        'use strict';
+
+        var logEl = document.getElementById('log');
+        var clockEl = document.getElementById('clock');
+        var echoEl = document.getElementById('echo');
+        var input = document.getElementById('nameInput');
+        var cards = document.getElementById('cards');
+        var themeIndex = 0;
+        var themes = ['', 'theme-hot', 'theme-cool'];
+
+        function log(message) {
+            var stamp = new Date().toLocaleTimeString();
+            logEl.textContent += '[' + stamp + '] ' + message + '\n';
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        function tick() {
+            clockEl.textContent = 'Live clock: ' + new Date().toLocaleString() + ' ⏱️';
+        }
+
+        function launchConfetti() {
+            var colors = ['#38bdf8', '#a78bfa', '#fb7185', '#facc15', '#34d399'];
+            for (var i = 0; i < 44; i++) {
+                var piece = document.createElement('div');
+                piece.className = 'confetti';
+                piece.style.left = Math.random() * 100 + 'vw';
+                piece.style.background = colors[i % colors.length];
+                piece.style.animationDuration = (1.2 + Math.random() * 2.3) + 's';
+                piece.style.animationDelay = Math.random() * 0.25 + 's';
+                document.body.appendChild(piece);
+                setTimeout((function (el) {
+                    return function () { if (el.parentNode) el.parentNode.removeChild(el); };
+                })(piece), 3800);
+            }
+            log('Confetti launched.');
+        }
+
+        function switchTheme() {
+            document.body.classList.remove('theme-hot', 'theme-cool');
+            themeIndex = (themeIndex + 1) % themes.length;
+            if (themes[themeIndex]) document.body.classList.add(themes[themeIndex]);
+            log('Theme changed to: ' + (themes[themeIndex] || 'default'));
+        }
+
+        function stressDom() {
+            var emojis = ['🧩', '🛠️', '🌊', '⚡', '🦊', '☕', '🎯', '🧠'];
+            var frag = document.createDocumentFragment();
+            for (var i = 0; i < 100; i++) {
+                var chip = document.createElement('span');
+                chip.className = 'badge';
+                chip.textContent = emojis[i % emojis.length] + ' node-' + (cards.children.length + i + 1);
+                frag.appendChild(chip);
+            }
+            var box = document.createElement('article');
+            box.className = 'card mini';
+            box.innerHTML = '<span class="icon">📈</span><h2>DOM Batch</h2><p>Added 100 inline nodes to test layout and rendering.</p>';
+            box.appendChild(frag);
+            cards.appendChild(box);
+            log('Added 100 DOM nodes. Total cards: ' + cards.children.length);
+        }
+
+        document.getElementById('confettiBtn').addEventListener('click', launchConfetti);
+        document.getElementById('themeBtn').addEventListener('click', switchTheme);
+        document.getElementById('stressBtn').addEventListener('click', stressDom);
+
+        input.addEventListener('input', function () {
+            echoEl.textContent = 'Input echo: ' + (input.value || '—') + ' ✍️';
+            log('Input changed: ' + (input.value || '(empty)'));
+        });
+
+        document.addEventListener('click', function (event) {
+            if (event.target.tagName !== 'BUTTON') {
+                log('Clicked: ' + event.target.tagName.toLowerCase());
+            }
+        });
+
+        setInterval(tick, 1000);
+        tick();
+        log('Page ready. User agent: ' + navigator.userAgent);
+    })();
+</script>
+</body>
+</html>

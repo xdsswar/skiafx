@@ -1,0 +1,176 @@
+# Copyright 2026 Xtreme Software Solutions. All rights reserved.
+#
+# jux_print_preview — content-layer port of Chrome's print preview (chrome://print),
+# rendered off-screen by the skia-fx engine. Copied to chromium/src/jux/print_preview/
+# by ConfigureBuildTask; pulled into //jux:jux_engine only under enable_print_preview.
+#
+# Strategy (see ../print_preview/README.md + the project plan):
+#   * Chrome print-preview .cc/.h are built IN PLACE from their real //chrome/...
+#     paths (NOT copied) so their cross-includes resolve naturally. There is no
+#     //chrome/browser target in our build, so listing these sources here does not
+#     conflict.
+#   * chrome/browser deps we don't want are satisfied by stub headers merged into
+#     the tree (native-blink/stubs/chrome/...); behavioral edits live in patches/.
+#   * New content-layer glue (WebUI factory, off-screen preview controller, shims)
+#     lives in THIS directory and is added to `sources` below.
+
+import("//printing/buildflags/buildflags.gni")
+
+assert(enable_print_preview,
+       "jux_print_preview is only built when enable_print_preview = true")
+
+source_set("jux_print_preview") {
+  # Tier 1 — low-coupling foundations (built in place). Grown tier-by-tier as the
+  # build resolves deps: PrintPreviewUI (base-class swap), PrintPreviewHandler,
+  # PrintViewManager, PrintPreviewDialogController follow.
+  sources = [
+    # --- tier 1: low-coupling foundations ---
+    "//chrome/browser/printing/print_preview_data_service.cc",
+    "//chrome/browser/printing/print_preview_data_service.h",
+    "//chrome/browser/printing/print_preview_sticky_settings.cc",
+    "//chrome/browser/printing/print_preview_sticky_settings.h",
+    "//chrome/browser/ui/webui/print_preview/parse_data_path.cc",
+    "//chrome/browser/ui/webui/print_preview/parse_data_path.h",
+    "//chrome/browser/ui/webui/print_preview/print_preview_metrics.cc",
+    "//chrome/browser/ui/webui/print_preview/print_preview_metrics.h",
+    "//chrome/browser/ui/webui/print_preview/print_preview_utils.cc",
+    "//chrome/browser/ui/webui/print_preview/print_preview_utils.h",
+
+    # --- tier 2: browser print-manager core (the layer under the WebUI handler).
+    # print_preview_dialog_controller + print_view_manager (Browser/tabs-coupled)
+    # come in a later round once their chrome/ui stubs are in. ---
+    # background_printing_manager dropped: it pulls print_preview_dialog_controller
+    # → chrome Browser/tab-strip UI cone. Our OSR preview controller (M2) replaces
+    # the chrome dialog hosting entirely.
+    # oop_features dropped: it static_asserts OOPPD; we run in-process
+    # (enable_oop_printing=false).
+    "//chrome/browser/printing/prefs_util.cc",
+    "//chrome/browser/printing/prefs_util.h",
+    # print_error_dialog.cc dropped (pulls chrome Browser UI / browser_finder);
+    # shim/print_error_dialog_stub.cc provides the 3 entry points as no-ops.
+    "//chrome/browser/printing/print_error_dialog.h",
+    "shim/print_error_dialog_stub.cc",
+    "//chrome/browser/printing/print_job_manager.cc",
+    "//chrome/browser/printing/print_job_manager.h",
+    "//chrome/browser/printing/print_view_manager_base.cc",
+    "//chrome/browser/printing/print_view_manager_base.h",
+    "//chrome/browser/printing/print_view_manager_common.cc",
+    "//chrome/browser/printing/print_view_manager_common.h",
+    "//chrome/browser/printing/printer_query.cc",
+    "//chrome/browser/printing/printer_query.h",
+
+    # --- tier 3: the print pipeline (PrintJob / PrintViewManager / compositor /
+    # XPS). PrintViewManager drives preview generation in M3. ---
+    "//chrome/browser/printing/print_compositor_util.cc",
+    "//chrome/browser/printing/print_compositor_util.h",
+    "//chrome/browser/printing/print_job.cc",
+    "//chrome/browser/printing/print_job.h",
+    "//chrome/browser/printing/print_view_manager.cc",
+    "//chrome/browser/printing/print_view_manager.h",
+    "//chrome/browser/printing/print_job_worker.cc",
+    "//chrome/browser/printing/print_job_worker.h",
+    "//chrome/browser/printing/pdf_to_emf_converter.cc",
+    "//chrome/browser/printing/pdf_to_emf_converter.h",
+    "//chrome/browser/printing/xps_features.cc",
+    "//chrome/browser/printing/xps_features.h",
+    # //pdf/pdf_features.cc removed — the real //pdf target (now a dep) provides
+    # these symbols; compiling it here too caused duplicate-symbol link errors.
+    "//components/pdf/browser/pdf_frame_util.cc",
+    # PdfNupConverterClient — N-up (pages-per-sheet) PDF conversion used by the
+    # print pipeline; light cone (printing_service + profile + prefs).
+    "//chrome/browser/printing/pdf_nup_converter_client.cc",
+    "//chrome/browser/printing/pdf_nup_converter_client.h",
+    # printer_capabilities.cc — GetSettingsOnBlockingTaskRunner + capability
+    # marshalling used by local_printer_handler_default; built from stubs/.
+    "//chrome/common/printing/printer_capabilities.cc",
+    # platform_util::GetTopLevel (file-dialog parent in pdf_printer_handler) —
+    # aura impl only; the cross-platform platform_util.cc (OpenItem/Reveal cone)
+    # is intentionally not built.
+    "//chrome/browser/platform_util_aura.cc",
+    # //components/pdf/common/pdf_util.cc removed — the real //components/pdf/common
+    # (pulled via //components/pdf/renderer dep) provides these; was a duplicate.
+    "//chrome/browser/printing/printing_service.cc",
+    "//chrome/browser/printing/printing_service.h",
+
+    # --- tier 4: the WebUI layer (M2 — chrome://print). PrintPreviewUI base is
+    # swapped ConstrainedWebDialogUI -> content::WebUIController by patch
+    # 0001-print-preview-ui-content-webuicontroller.patch so it hosts off-screen.
+    # The handler + its printer-handler family come along; the chrome Browser/
+    # tab-strip/ChromeOS cone they reach is stubbed (shim/) or gated off. ---
+    "//chrome/browser/ui/webui/print_preview/print_preview_ui.cc",
+    "//chrome/browser/ui/webui/print_preview/print_preview_ui.h",
+    # chrome-untrusted://print WebUI — serves the generated preview PDF bytes
+    # (PrintPreviewDataService) to the PDF viewer's <embed src=...print.pdf>.
+    "//chrome/browser/ui/webui/print_preview/print_preview_ui_untrusted.cc",
+    "//chrome/browser/ui/webui/print_preview/print_preview_ui_untrusted.h",
+    "//chrome/browser/ui/webui/print_preview/print_preview_handler.cc",
+    "//chrome/browser/ui/webui/print_preview/print_preview_handler.h",
+    "//chrome/browser/ui/webui/print_preview/printer_handler.cc",
+    "//chrome/browser/ui/webui/print_preview/printer_handler.h",
+    "//chrome/browser/ui/webui/print_preview/pdf_printer_handler.cc",
+    "//chrome/browser/ui/webui/print_preview/pdf_printer_handler.h",
+    "//chrome/browser/ui/webui/print_preview/local_printer_handler_default.cc",
+    "//chrome/browser/ui/webui/print_preview/local_printer_handler_default.h",
+    "//chrome/browser/ui/webui/print_preview/policy_settings.cc",
+    "//chrome/browser/ui/webui/print_preview/policy_settings.h",
+    # MetricsHandler — simple WebUI message handler the print-preview UI adds for
+    # recordAction; light cone, built in place from stubs/.
+    "//chrome/browser/ui/webui/metrics_handler.cc",
+    "//chrome/browser/ui/webui/metrics_handler.h",
+    # PluralStringHandler — WebUI handler for ICU plural strings; light cone.
+    "//chrome/browser/ui/webui/plural_string_handler.cc",
+    "//chrome/browser/ui/webui/plural_string_handler.h",
+
+    # --- content-layer glue/shims (ours) ---
+    # PrintPreviewDialogController: chrome's hosts chrome://print in a chrome
+    # Browser dialog; ours hosts it off-screen (M2). chrome_glue_stub defines the
+    # few chrome globals/switches whose defining .cc we don't compile.
+    "shim/print_preview_dialog_controller_stub.cc",
+    # Engine<->controller bridge: the engine registers an OSR-WebContents factory
+    # here; the controller calls it to open the off-screen chrome://print view.
+    "shim/jux_print_preview_hook.cc",
+    "shim/jux_print_preview_hook.h",
+    # Minimal BrowserProcess so PrintViewManager(Base) can resolve
+    # g_browser_process (print_job_manager / local_state / dialog controller).
+    # browser_process.cc supplies the trivial base ctor/dtor + the
+    # g_browser_process global definition.
+    "//chrome/browser/browser_process.cc",
+    "shim/jux_browser_process.cc",
+    "shim/jux_browser_process.h",
+    "shim/chrome_glue_stub.cc",
+    # pdf_extension_util::GetStrings/GetResources — real impl drags extensions +
+    # glic + mime-handler; M2 stub returns empty so chrome://print loads.
+    "shim/pdf_extension_util_stub.cc",
+    # ChromeSelectFilePolicy — real .cc pulls the chrome infobar cone; ours
+    # always allows file pickers (no policy/infobar in the engine).
+    "shim/chrome_select_file_policy_stub.cc",
+    # print_preview_ui_stub.cc removed — the real print_preview_ui.cc (above) now
+    # provides PrintPreviewUI::ShouldCancelRequest and the rest of the WebUI.
+  ]
+
+  # Starting dep set — the compile loop refines this. Content-layer only; NO
+  # //chrome/browser. Heavier printing deps (//components/printing/browser, which
+  # needs the real //components/printing/common — a 1-line stub in this trimmed
+  # checkout) are added with the preview pipeline (M3), not tier-1.
+  deps = [
+    "//base",
+    "//chrome/services/printing/public/mojom",
+    "//components/prefs",
+    "//components/printing/browser",
+    "//components/printing/browser/print_to_pdf",
+    "//content/public/browser",
+    "//printing",
+    "//printing/backend",
+    "//skia",
+    "//ui/base",
+    # Generates the real chrome/grit/print_preview_resources{,_map}.h (Polymer UI
+    # build_webui grit) consumed by print_preview_ui.cc, replacing the M2 stub
+    # headers. Its .pak is added to the engine repack (see engine/BUILD.gn).
+    "//chrome/browser/resources/print_preview:resources",
+    # Generates chrome/grit/pdf_resources_map.h (kPdfResources) consumed by
+    # pdf_extension_util_stub.cc::GetResources so chrome://print/pdf/* loads.
+    "//chrome/browser/resources/pdf:resources",
+  ]
+
+  defines = [ "SFXWEB_ENABLE_PRINTING" ]
+}

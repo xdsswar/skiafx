@@ -1,0 +1,41 @@
+/*
+ * javafx.scene3d — additive Door-2 module: 3D asset loading (glTF 2.0).
+ *
+ * This module is ENTIRELY ours (nothing copied from upstream OpenJFX —
+ * stock JavaFX has no model loader). It produces a STANDARD JavaFX
+ * scene-graph subtree (Group → MeshView → TriangleMesh + PhongMaterial)
+ * from a glTF file, which then renders through the existing Door-1
+ * bgfx/Skia 3D pipeline in javafx.graphics. No new rendering code, and
+ * the public API never exposes a native handle/id.
+ *
+ * Layout:
+ *   - src/main/java/javafx/scene/model3d/...     — public API (handle-free)
+ *   - src/main/java/com/sun/javafx/model3d/...    — private FFM bridge + builder
+ *   - src/main/native/...                         — openjfx_model3d (cgltf parser)
+ *
+ * Conventions applied (no skia/bgfx/upstream — this module has no Skia or
+ * bgfx dependency and no upstream provenance):
+ *   - java       : JDK 25 toolchain, javadoc, manifest version overlay
+ *   - native     : CMake-driven openjfx_model3d.{dll,so,dylib} + checksums
+ *   - module     : JPMS module-info wiring
+ *   - test       : JUnit platform config (we verify via the ensemble demo's
+ *                  -Pmodel.selftest mode today; the runner stays available)
+ *   - sdk        : collectIntoSdk → sdk/lib/<jar> + sdk/lib/<triple>/<lib>
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'skiafx.native-conventions'
+    id 'skiafx.module-conventions'
+    id 'skiafx.test-conventions'
+    id 'skiafx.sdk-conventions'
+}
+
+dependencies {
+    // Public JavaFX 3D scene-graph types the loader builds against:
+    // Group, MeshView, TriangleMesh, PhongMaterial, Image, transforms.
+    // `api` because javafx.scene.model3d signatures return javafx.scene.Node.
+    api project(':javafx.graphics')
+}
+
+description = 'JavaFX 3D asset loading (glTF 2.0) — additive Door-2 module.'

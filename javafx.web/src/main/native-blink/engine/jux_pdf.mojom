@@ -1,0 +1,13 @@
+// Copyright 2026 Xtreme Software Solutions. All rights reserved.
+module jux.mojom;
+
+// Renderer → browser: the print-preview PDF plugin fetches the generated preview
+// PDF bytes. The plugin lives in the chrome://print/pdf frame, which cannot fetch
+// the cross-scheme chrome-untrusted://print byte-server (ERR_DISALLOWED_URL_SCHEME
+// — a WebUI subframe is never granted the untrusted scheme). So instead the plugin
+// asks the browser, which already holds the bytes in PrintPreviewDataService.
+interface PdfDataProvider {
+  // `data_path` is the byte-server path "ui_id/page/print.pdf" (e.g. "1/0/print.pdf").
+  // Returns the PDF bytes, or an empty array if not generated yet.
+  GetPreviewPdf(string data_path) => (array<uint8> data);
+};

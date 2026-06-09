@@ -1,0 +1,65 @@
+/*
+ * skiafx.sdk-conventions
+ *
+ * Replaces the old openjfx.dist-conventions. Two responsibilities:
+ *
+ *   1. The native-conventions plugin already embeds each module's
+ *      host-platform native libs into the modular jar under
+ *      /native/<platform>-<arch>/<lib>. This convention doesn't
+ *      duplicate that.
+ *
+ *   2. Register the per-module `collectIntoSdk` task that copies the
+ *      built jar + the module's host-platform native libs into the
+ *      root-level `sdk/` directory in the standard OpenJFX SDK layout:
+ *         <rootDir>/sdk/lib/<artifact>.jar
+ *         <rootDir>/sdk/lib/<host-triple>/<lib>.dll  (or .so / .dylib)
+ *
+ * The root build's `buildAll` task depends on every subproject's
+ * `:assemble`, which in turn finalizes with `:collectIntoSdk`, so
+ * `./gradlew buildAll` populates `sdk/` from scratch end-to-end.
+ */
+
+import org.gradle.internal.os.OperatingSystem
+
+def os = OperatingSystem.current()
+def hostPlatform = os.windows ? 'win'
+                 : os.macOsX  ? 'mac'
+                 : 'linux'
+def hostArch = (System.getProperty('os.arch') in ['x86_64', 'amd64']) ? 'x64' : 'arm64'
+def hostTriple = "${hostPlatform}-${hostArch}"
+
+def perModuleNativeLibs = layout.buildDirectory.dir("native/${hostTriple}/lib")
+
+tasks.register('collectIntoSdk', Copy) {
+    group = 'distribution'
+    description = "Copy module jar + host-platform native libs into sdk/."
+
+    // Pin destination to sdk/ and ONLY sdk/. Earlier iterations used
+    // rootProject.projectDir which made Gradle treat the entire repo
+    // (.gradle/, build/ caches, locked files) as output, blowing up
+    // checksumming. The `into 'lib'` etc. paths are now relative to
+    // this directory.
+    destinationDir = rootProject.layout.projectDirectory.dir('sdk').asFile
+    includeEmptyDirs = false
+
+    // The jar artifact.
+    dependsOn tasks.named('jar')
+    from(tasks.named('jar').flatMap { it.archiveFile }) {
+        into 'lib'
+    }
+
+    // Native libs for the host platform (if this module has any).
+    // The collection is empty for Java-only modules so nothing is
+    // copied — clean no-op.
+    from(perModuleNativeLibs) {
+        include '*.dll', '*.so', '*.dylib'
+        into "lib/${hostTriple}"
+    }
+}
+
+// Make `assemble` quietly populate sdk/ too, so a developer who runs
+// `./gradlew :javafx.media:assemble` for a single module sees sdk/
+// stay current. Full `./gradlew buildAll` at the root collects the lot.
+tasks.named('assemble') {
+    finalizedBy 'collectIntoSdk'
+}

@@ -1,0 +1,66 @@
+# Stubbed — jux-engine build. No Google DWA service, no data upload,
+# no federated compute, no oak. Entry builders kept for link resolution.
+
+component("private_metrics_features") {
+  sources = [ "private_metrics_features.cc" ]
+  public = [ "private_metrics_features.h" ]
+  defines = [ "IS_PRIVATE_METRICS_FEATURES_IMPL" ]
+  deps = [ "//base" ]
+}
+
+component("dwa_recorder") {
+  sources = [
+    "//components/metrics/dwa/dwa_recorder.cc",
+    "//components/metrics/dwa/dwa_recorder.h",
+  ]
+  defines = [ "IS_DWA_RECORDER_IMPL" ]
+  public_deps = [
+    "//components/metrics/dwa/mojom",
+    "//third_party/metrics_proto",
+  ]
+  deps = [
+    ":private_metrics_features",
+    "//base",
+  ]
+}
+
+component("private_metrics_recorders") {
+  sources = [
+    "dkm_recorder.cc",
+    "dkm_recorder.h",
+  ]
+  defines = [ "IS_PRIVATE_METRICS_RECORDERS_IMPL" ]
+  public_deps = [
+    "//components/metrics/private_metrics/mojom",
+    "//third_party/metrics_proto",
+  ]
+  deps = [
+    ":private_metrics_features",
+    "//base",
+  ]
+}
+
+# Minimal private_metrics — only entry builders for link resolution.
+# No DWA service, no data upload, no federated compute, no oak.
+static_library("private_metrics") {
+  sources = [
+    "//components/metrics/dwa/dwa_entry_builder.cc",
+    "//components/metrics/dwa/dwa_entry_builder.h",
+    "//components/metrics/dwa/dwa_entry_builder_base.cc",
+    "//components/metrics/dwa/dwa_entry_builder_base.h",
+    "dkm_entry_builder.cc",
+    "dkm_entry_builder.h",
+    "dkm_entry_builder_base.cc",
+    "dkm_entry_builder_base.h",
+  ]
+  public_deps = [
+    ":dwa_recorder",
+    ":private_metrics_recorders",
+    "//third_party/metrics_proto",
+  ]
+  defines = [ "IS_DWA_IMPL" ]
+  deps = [
+    ":private_metrics_features",
+    "//base",
+  ]
+}

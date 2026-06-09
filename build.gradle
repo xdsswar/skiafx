@@ -1,0 +1,187 @@
+/*
+ * Root build for skia-fx.
+ *
+ * The root project intentionally has no Java code of its own. Its
+ * job is to define cross-cutting tasks (buildAll, versions report,
+ * SDK aggregation, upstream-drift checks) and coordinate
+ * subprojects.
+ */
+
+plugins {
+    id 'base'
+    id 'com.github.ben-manes.versions' version '0.51.0'
+}
+
+// The PUBLISHED version stays exactly upstream so artifact filenames
+// match stock OpenJFX 25 SDK. The skia-fx overlay lives in
+// MANIFEST.MF Implementation-Version, applied by
+// skiafx.java-conventions to every modular jar.
+def libs = project.extensions.getByType(VersionCatalogsExtension).named('libs')
+
+allprojects {
+    group = 'dev.skiafx'
+    version = libs.findVersion('javafx').get().requiredVersion
+}
+
+// =============================================================================
+// buildAll — the single command in the project. Compiles Java,
+// builds natives, packages modular jars, and writes everything into
+// sdk/ in the SDK layout.
+//
+// Each module's skiafx.sdk-conventions plugin already finalizes its
+// `:assemble` with `:collectIntoSdk`, so the only thing buildAll
+// needs to do here is fan out to every subproject's assemble.
+// =============================================================================
+tasks.register('buildAll') {
+    group = 'distribution'
+    description = 'Compile Java + build natives + bundle libs into jars + populate sdk/.'
+    // `:samples` is a container project with no own build.gradle — it
+    // only nests `:samples:ensemble`, `:samples:perf` and
+    // `:samples:swinginterop`. Filter to leaf subprojects (those that
+    // actually have a build.gradle) to avoid
+    // `Task with name 'assemble' not found in project ':samples'`.
+    //
+    // (`:javafx.swing` used to be excluded here because it required the
+    // deprecated `jdk.unsupported.desktop` JDK module; that dependency
+    // has since been removed — the interop glue now lives in-module under
+    // com.sun.javafx.embed.swing.interop — so the module builds and ships
+    // normally again. See docs/MODULE_SWING_DROP_UNSUPPORTED_DESKTOP.md.)
+    def excluded = [':samples']
+    dependsOn subprojects
+        .findAll { it.buildFile.exists() && !(it.path in excluded) }
+        .collect { ":${it.path}:assemble" }
+    finalizedBy 'sdkSummary'
+}
+
+tasks.register('sdkSummary') {
+    group = 'distribution'
+    description = 'Print a summary of what landed in sdk/ after buildAll.'
+    // Capture the sdk path at CONFIGURATION time, not execution time —
+    // Gradle 9's configuration cache forbids referencing Project /
+    // rootProject from a doLast closure (Project isn't serialisable).
+    // `layout.projectDirectory` is a config-cache-safe DirectoryProperty.
+    def sdkDir = layout.projectDirectory.dir('sdk').asFile
+    doLast {
+        def libDir = new File(sdkDir, 'lib')
+        if (libDir.exists()) {
+            def jars = libDir.listFiles({ File _, String n -> n.endsWith('.jar') } as FilenameFilter) ?: []
+            println "[sdk] lib/ — ${jars.length} jar(s):"
+            jars.sort { it.name }.each { println "  ${it.name}" }
+            libDir.listFiles({ File f -> f.isDirectory() } as FileFilter)?.each { hostDir ->
+                def libsHere = hostDir.listFiles() ?: []
+                println "[sdk] lib/${hostDir.name}/ — ${libsHere.length} native lib(s):"
+                libsHere.sort { it.name }.each { println "  ${it.name}" }
+            }
+        } else {
+            println "[sdk] no output yet — run ./gradlew buildAll"
+        }
+    }
+}
+
+// =============================================================================
+// versions task — print every pinned version and active overrides.
+// Required reading before filing any build issue (see CLAUDE.md).
+// =============================================================================
+tasks.register('versions') {
+    group = 'help'
+    description = 'Print every pinned version and active build overrides.'
+    doLast {
+        println "=== skia-fx versions ==="
+        printf("%-18s %-25s %s%n", "key", "value", "source")
+        libs.versionAliases.each { alias ->
+            def value = libs.findVersion(alias).get().requiredVersion
+            printf("%-18s %-25s %s%n", alias, value, 'catalog')
+        }
+        println ""
+        println "Overrides (Gradle properties):"
+        def any = false
+        ['skiafxVersion', 'javaVersion', 'gradleVersion',
+         'cmakeMin', 'ninjaMin', 'gccMin', 'clangMin', 'msvcMin'].each { name ->
+            def v = providers.gradleProperty(name).orNull
+            if (v != null) {
+                printf("  -P%s=%s%n", name, v)
+                any = true
+            }
+        }
+        if (!any) println "  (none active)"
+    }
+}
+
+// =============================================================================
+// /jfx-master integration tasks — see skiafx.upstream-sync conventions
+// for per-module metadata. These root tasks aggregate across modules.
+// =============================================================================
+tasks.register('syncJfxMaster') {
+    group = 'upstream'
+    description = 'Verify /jfx-master exists and is at the expected upstream tag.'
+    doLast {
+        def candidates = [
+            file(rootDir.parentFile.toPath().resolve('jfx-master').toFile().absolutePath),
+            file('jfx-master'),
+        ]
+        def found = candidates.find { it.directory }
+        if (found == null) {
+            throw new GradleException(
+                "/jfx-master not found at any of: ${candidates*.absolutePath}. " +
+                "See CLAUDE.md for layout expectations.")
+        }
+        println "[syncJfxMaster] Reference SDK: ${found.absolutePath}"
+    }
+}
+
+tasks.register('listCopiedFiles') {
+    group = 'upstream'
+    description = 'List files in our tree carrying the upstream-provenance comment.'
+    doLast {
+        def marker = 'Copied from openjfx/jfx'
+        def matches = []
+        fileTree(rootDir) {
+            include 'javafx.*/**/*.java'
+            include 'javafx.*/**/*.cpp'
+            include 'javafx.*/**/*.h'
+            include 'jdk.*/**/*.java'
+        }.each { f ->
+            if (f.text.contains(marker)) matches << f
+        }
+        if (matches.isEmpty()) {
+            println "[listCopiedFiles] No copied files yet."
+        } else {
+            matches.each { println it.absolutePath - "${rootDir}${File.separator}" }
+        }
+    }
+}
+
+tasks.register('checkUpstreamDrift') {
+    group = 'upstream'
+    description = 'Compare each copied file against /jfx-master and print diverged paths.'
+    dependsOn 'syncJfxMaster'
+    doLast { println "[checkUpstreamDrift] Not yet implemented (phase-0 task)." }
+}
+
+// =============================================================================
+// Aggregate convenience tasks. Per-module nativeCompile is registered
+// by skiafx.native-conventions; we fan out only to modules that have it.
+// =============================================================================
+tasks.register('nativeCompile') {
+    group = 'build'
+    description = 'Compile native code for the host platform across all modules.'
+    subprojects.each { sub ->
+        // Resolved lazily via taskGraph; if a subproject doesn't have
+        // nativeCompile (Java-only modules) this is a no-op.
+        dependsOn "${sub.path}:nativeCompile"
+    }
+}
+
+tasks.register('nativeClean') {
+    group = 'build'
+    description = 'Wipe native build outputs across all modules.'
+    doLast {
+        subprojects.each { sub ->
+            def nativeDir = sub.layout.buildDirectory.dir('native').get().asFile
+            if (nativeDir.exists()) {
+                println "[nativeClean] ${sub.path}: ${nativeDir}"
+                nativeDir.deleteDir()
+            }
+        }
+    }
+}

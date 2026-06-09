@@ -1,0 +1,116 @@
+/*
+ * Copyright (c) 2014, 2024, Oracle and/or its affiliates. All rights reserved.
+ * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
+ *
+ * This code is free software; you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License version 2 only, as
+ * published by the Free Software Foundation.  Oracle designates this
+ * particular file as subject to the "Classpath" exception as provided
+ * by Oracle in the LICENSE file that accompanied this code.
+ *
+ * This code is distributed in the hope that it will be useful, but WITHOUT
+ * ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+ * FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License
+ * version 2 for more details (a copy is included in the LICENSE file that
+ * accompanied this code).
+ *
+ * You should have received a copy of the GNU General Public License version
+ * 2 along with this work; if not, write to the Free Software Foundation,
+ * Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301 USA.
+ *
+ * Please contact Oracle, 500 Oracle Parkway, Redwood Shores, CA 94065 USA
+ * or visit www.oracle.com if you need additional information or have any
+ * questions.
+ */
+
+package javafx.css.converter;
+
+import javafx.css.Size;
+import javafx.css.ParsedValue;
+import javafx.css.StyleConverter;
+import javafx.scene.text.Font;
+import javafx.util.Duration;
+
+/**
+ * Converter to Convert a {@code Size} to {@code Duration}.
+ *
+ * @since 9
+ */
+public final class DurationConverter extends StyleConverter<ParsedValue<?, Size>, Duration> {
+
+    // lazy, thread-safe instatiation
+    private static class Holder {
+        static final DurationConverter INSTANCE = new DurationConverter();
+        static final SequenceConverter SEQUENCE_INSTANCE = new SequenceConverter();
+    }
+
+    /**
+     * Gets the {@code DurationConverter} instance.
+     * @return the {@code DurationConverter} instance
+     */
+    public static StyleConverter<ParsedValue<?, Size>, Duration> getInstance() {
+        return Holder.INSTANCE;
+    }
+
+    private DurationConverter() {
+        super();
+    }
+
+    @Override
+    public Duration convert(ParsedValue<ParsedValue<?, Size>, Duration> value, Font font) {
+        ParsedValue<?, Size> parsedValue = value.getValue();
+        Size size = parsedValue.convert(font);
+        double time = size.getValue();
+        Duration duration = null;
+        if (time < Double.POSITIVE_INFINITY) {
+            switch (size.getUnits()) {
+                case S:  duration = Duration.seconds(time); break;
+                case MS: duration = Duration.millis(time);  break;
+                default: duration = Duration.UNKNOWN;
+            }
+        } else {
+            duration = Duration.INDEFINITE;
+        }
+        return duration;
+    }
+
+    @Override
+    public String toString() {
+        return "DurationConverter";
+    }
+
+    /**
+     * Converts a sequence of parsed values to an array of {@link Duration} instances.
+     *
+     * @since 23
+     */
+    public static final class SequenceConverter extends StyleConverter<ParsedValue<ParsedValue<?, Size>, Duration>[], Duration[]> {
+        /**
+         * Gets the {@code SequenceConverter} instance.
+         * @return the {@code SequenceConverter} instance
+         */
+        public static SequenceConverter getInstance() {
+            return Holder.SEQUENCE_INSTANCE;
+        }
+
+        private SequenceConverter() {}
+
+        @Override
+        public Duration[] convert(
+                ParsedValue<ParsedValue<ParsedValue<?, Size>, Duration>[], Duration[]> value, Font font) {
+            ParsedValue<?, Duration>[] values = value.getValue();
+            Duration[] durations = new Duration[values.length];
+            for (int p = 0; p < values.length; p++) {
+                durations[p] = values[p].convert(font);
+            }
+
+            return durations;
+        }
+
+        @Override
+        public String toString() {
+            return "Duration.SequenceConverter";
+        }
+    }
+
+}

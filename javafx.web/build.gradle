@@ -1,0 +1,36 @@
+/*
+ * javafx.web — WebView, now backed by the Blink engine (skia-fx-webview).
+ *
+ * Public API under javafx.scene.web.* is OpenJFX-identical and stays
+ * stable. The native engine is the Chromium content layer (Blink + V8 +
+ * cc/viz + net), run out-of-process and composited off-screen into the
+ * JavaFX scene's Skia surface. Replaces the former WebKit C++ port.
+ *
+ * Native side is the heaviest in the project; opt-in via
+ * `-PbuildWebNative=true`. See docs/WEB_MODULE_BUILD.md for the
+ * toolchain prerequisites and the architecture. The legacy WebKit C++
+ * native tree has been removed; the com.sun.webkit.dom.* org.w3c.dom
+ * wrappers it once held now live in src/main/java/com/sun/webkit/dom/.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'skiafx.module-conventions'
+    id 'skiafx.upstream-sync'
+    id 'skiafx.sdk-conventions'
+    id 'skiafx.blink-native-conventions'
+}
+
+upstream {
+    trackedFromJfxMaster 'modules/javafx.web'
+}
+
+dependencies {
+    api project(':javafx.base')
+    api project(':javafx.graphics')
+    api project(':javafx.controls')
+    api project(':javafx.media')
+    api project(':jdk.jsobject')
+}
+
+description = 'JavaFX WebView module (Blink-backed, skia-fx-webview engine).'

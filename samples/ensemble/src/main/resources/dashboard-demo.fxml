@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="UTF-8"?>
+
+<!--
+  dashboard-demo.fxml — shell for the Numa Dashboard demo.
+
+  Layout: a full-height sidebar (brand + SVG nav rail + user cell) beside a
+  content column (custom-titlebar top strip + content stack + status bar).
+  Caption buttons and nav items carry fx:ids so DashboardController can wire
+  the Stage hit regions, the collapse animation and section switching.
+-->
+
+<?import javafx.geometry.Insets?>
+<?import javafx.scene.control.Label?>
+<?import javafx.scene.control.TextField?>
+<?import javafx.scene.control.ToggleButton?>
+<?import javafx.scene.layout.HBox?>
+<?import javafx.scene.layout.Priority?>
+<?import javafx.scene.layout.Region?>
+<?import javafx.scene.layout.StackPane?>
+<?import javafx.scene.layout.VBox?>
+<?import javafx.scene.shape.SVGPath?>
+
+<HBox fx:id="rootPane" styleClass="root-pane"
+      xmlns:fx="http://javafx.com/fxml/1"
+      fx:controller="org.openjfx.samples.ensemble.DashboardController">
+
+    <!-- ====================================================== sidebar -->
+    <VBox fx:id="sidebar" styleClass="sidebar" minWidth="252" prefWidth="252" maxWidth="252">
+
+        <!-- brand / logo -->
+        <HBox fx:id="sidebarHeader" styleClass="sidebar-header" alignment="CENTER_LEFT" spacing="12">
+            <Region styleClass="app-mark"/>
+            <Label fx:id="brandLabel" styleClass="brand-name" text="Numa"/>
+        </HBox>
+
+        <Label fx:id="navSectionPages" styleClass="nav-section" text="PAGES"/>
+
+        <VBox spacing="4">
+            <ToggleButton fx:id="navDashboard" styleClass="nav-item" text="Dashboard" contentDisplay="LEFT">
+                <graphic><SVGPath styleClass="nav-icon"
+                    content="M3 3h7v9H3z M14 3h7v5h-7z M14 12h7v9h-7z M3 16h7v5H3z"/></graphic>
+            </ToggleButton>
+            <ToggleButton fx:id="navSwap" styleClass="nav-item" text="Swap" contentDisplay="LEFT">
+                <graphic><SVGPath styleClass="nav-icon"
+                    content="M17 1l4 4-4 4 M3 11V9a4 4 0 0 1 4-4h14 M7 23l-4-4 4-4 M21 13v2a4 4 0 0 1-4 4H3"/></graphic>
+            </ToggleButton>
+            <ToggleButton fx:id="navRegistration" styleClass="nav-item" text="Registration" contentDisplay="LEFT">
+                <graphic><SVGPath styleClass="nav-icon"
+                    content="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2 M9 2h6a1 1 0 0 1 1 1v1a1 1 0 0 1-1 1H9a1 1 0 0 1-1-1V3a1 1 0 0 1 1-1z M9 12h6 M9 16h6"/></graphic>
+            </ToggleButton>
+            <ToggleButton fx:id="navAnalytics" styleClass="nav-item" text="Analytics" contentDisplay="LEFT">
+                <graphic><SVGPath styleClass="nav-icon"
+                    content="M3 3v18h18 M7 14l3-3 3 3 5-6"/></graphic>
+            </ToggleButton>
+            <ToggleButton fx:id="navControls" styleClass="nav-item" text="Controls" contentDisplay="LEFT">
+                <graphic><SVGPath styleClass="nav-icon"
+                    content="M4 21v-7 M4 10V3 M12 21v-9 M12 8V3 M20 21v-5 M20 12V3 M1 14h6 M9 8h6 M17 16h6"/></graphic>
+            </ToggleButton>
+        </VBox>
+
+        <Label fx:id="navSectionGeneral" styleClass="nav-section" text="GENERAL"/>
+
+        <VBox spacing="4">
+            <ToggleButton fx:id="navSettings" styleClass="nav-item" text="Settings" contentDisplay="LEFT">
+                <graphic><SVGPath styleClass="nav-icon"
+                    content="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6z M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></graphic>
+            </ToggleButton>
+        </VBox>
+
+        <Region VBox.vgrow="ALWAYS"/>
+
+        <!-- logged-in user cell -->
+        <HBox fx:id="userCell" styleClass="user-cell" alignment="CENTER_LEFT" spacing="11">
+            <StackPane styleClass="avatar, avatar-user">
+                <Label styleClass="avatar-text" text="AR"/>
+            </StackPane>
+            <VBox fx:id="userText" spacing="0">
+                <Label styleClass="user-name" text="Austin Robertson"/>
+                <Label styleClass="user-sub" text="Administrator"/>
+            </VBox>
+        </HBox>
+    </VBox>
+
+    <!-- ====================================================== content column -->
+    <VBox fx:id="contentColumn" styleClass="content-column" HBox.hgrow="ALWAYS">
+
+        <!-- top strip: collapse + title · drag region · search + profile + window buttons -->
+        <HBox fx:id="topStrip" styleClass="top-strip" alignment="CENTER_LEFT" minHeight="58" prefHeight="58">
+
+            <HBox alignment="CENTER_LEFT" spacing="12">
+                <padding><Insets left="10"/></padding>
+                <StackPane fx:id="hamburger" styleClass="icon-btn">
+                    <SVGPath styleClass="thin-icon" content="M3 6h18 M3 12h18 M3 18h18"/>
+                </StackPane>
+                <Label fx:id="pageTitle" styleClass="page-title" text="Dashboard"/>
+            </HBox>
+
+            <Region fx:id="captionRegion" HBox.hgrow="ALWAYS"/>
+
+            <HBox alignment="CENTER_RIGHT" spacing="12">
+                <padding><Insets right="6"/></padding>
+                <HBox fx:id="searchBox" styleClass="search-box" alignment="CENTER_LEFT" spacing="8">
+                    <SVGPath styleClass="thin-icon, search-icon"
+                             content="M10 3a7 7 0 1 0 0 14 7 7 0 0 0 0-14z M21 21l-5.2-5.2"/>
+                    <TextField fx:id="search" styleClass="search-field" promptText="Search…"/>
+                </HBox>
+                <StackPane fx:id="bellBtn" styleClass="icon-btn">
+                    <SVGPath styleClass="thin-icon"
+                             content="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9 M13.73 21a2 2 0 0 1-3.46 0"/>
+                    <Region styleClass="bell-dot" StackPane.alignment="TOP_RIGHT"/>
+                </StackPane>
+                <HBox fx:id="profileChip" styleClass="profile-chip" alignment="CENTER_LEFT" spacing="9">
+                    <StackPane styleClass="avatar, avatar-profile">
+                        <Label styleClass="avatar-text" text="AR"/>
+                    </StackPane>
+                    <Label styleClass="profile-name" text="Austin"/>
+                    <SVGPath styleClass="thin-icon, caret" content="M6 9l6 6 6-6"/>
+                </HBox>
+            </HBox>
+
+            <HBox fx:id="winButtons" styleClass="win-buttons" alignment="TOP_RIGHT">
+                <StackPane fx:id="minBtn" styleClass="win-btn, win-btn-min"
+                           minWidth="44" prefWidth="44" maxWidth="44" minHeight="58" prefHeight="58">
+                    <SVGPath styleClass="ctb-icon" content="M0,5 H10"/>
+                </StackPane>
+                <StackPane fx:id="maxBtn" styleClass="win-btn, win-btn-max"
+                           minWidth="44" prefWidth="44" maxWidth="44" minHeight="58" prefHeight="58">
+                    <SVGPath fx:id="maxIcon" styleClass="ctb-icon" content="M0.5,0.5 H9.5 V9.5 H0.5 Z"/>
+                </StackPane>
+                <StackPane fx:id="closeBtn" styleClass="win-btn, win-btn-close"
+                           minWidth="44" prefWidth="44" maxWidth="44" minHeight="58" prefHeight="58">
+                    <SVGPath styleClass="ctb-icon" content="M0,0 L10,10 M10,0 L0,10"/>
+                </StackPane>
+            </HBox>
+        </HBox>
+
+        <!-- the section bodies live here -->
+        <StackPane fx:id="contentStack" styleClass="content-area" VBox.vgrow="ALWAYS"/>
+
+        <!-- status bar -->
+        <HBox fx:id="statusBar" styleClass="status-bar" alignment="CENTER_LEFT" spacing="8"
+              minHeight="30" prefHeight="30">
+            <padding><Insets left="16" right="16"/></padding>
+            <Region styleClass="state-dot"/>
+            <Label fx:id="statusText" styleClass="status-text" text="Ready"/>
+            <Region HBox.hgrow="ALWAYS"/>
+            <Label fx:id="sizeLabel" styleClass="status-text" text=""/>
+            <Label fx:id="fpsBadge" styleClass="fps-badge" text="— fps"/>
+        </HBox>
+    </VBox>
+</HBox>

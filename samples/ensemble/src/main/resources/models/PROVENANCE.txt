@@ -1,0 +1,15 @@
+Sample 3D models for the javafx.scene3d (glTF) loader demo.
+
+Source: KhronosGroup/glTF-Sample-Assets
+        https://github.com/KhronosGroup/glTF-Sample-Assets/tree/main/Models
+Fetched: 2026-06-08
+
+  Box.glb         — minimal lit box (positions + normals + material color)
+  BoxTextured.glb — box with a base-color (diffuse) texture
+  Duck.glb        — the classic textured "duck" (denser mesh; good visual test)
+
+License: Khronos glTF Sample Assets — these specific models are published
+royalty-free for use in tests/demos (Box & BoxTextured: public-domain CC0;
+Duck: © Sony, provided royalty-free by Khronos for sample use). Used here only
+as loader test fixtures. See the upstream repo's LICENSE / model README for the
+authoritative per-model terms.

@@ -1,0 +1,4 @@
+# Stub — jux-engine build. No Google account manager.
+source_set("account_manager_core") {
+  public = [ "account.h" ]
+}

@@ -1,0 +1,275 @@
+/* MediaSmokeApp — dark video-player styling.
+ *
+ * Palette is inlined (no -palette-* CSS variables) so every selector
+ * is self-contained and survives the Skia pipeline's CSS resolver
+ * with no surprises. Reference values:
+ *   #0b0e13  stage backdrop (sits behind the video too)
+ *   #161b22  control bar surface
+ *   #1f2630  controls (resting)
+ *   #2c3543  controls (hover)
+ *   #11151c  controls (pressed)
+ *   #2d3543  subtle borders
+ *   #e6edf3  primary text
+ *   #9ba1a8  dim / caption text
+ *   #f85149  errors
+ *   #2f81f7  accent (primary button, slider thumb, focus ring)
+ */
+
+.root {
+    -fx-background-color: #0b0e13;
+    -fx-font-family: "Segoe UI Semibold", "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+}
+
+/* ---- Control bar surface ----------------------------------------- */
+
+.control-bar {
+    -fx-background-color: #161b22;
+    -fx-border-color: #2d3543 transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+}
+
+/* ---- Labels ------------------------------------------------------- */
+
+.label {
+    -fx-text-fill: #e6edf3;
+    -fx-font-size: 13px;
+}
+
+.label-status {
+    -fx-text-fill: #9ba1a8;
+    -fx-font-size: 12px;
+    -fx-font-weight: normal;
+}
+
+.label-error {
+    -fx-text-fill: #f85149;
+    -fx-font-size: 12px;
+}
+
+/* VideoPlayerApp welcome overlay — large dim text shown when no clip
+   is loaded, sitting above an empty MediaView. */
+.welcome {
+    -fx-text-fill: #5a626d;
+    -fx-font-size: 18px;
+    -fx-font-weight: 600;
+}
+
+.label-time {
+    -fx-font-family: "Cascadia Mono", "JetBrains Mono", "Consolas", "Courier New", monospace;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+    -fx-text-fill: #e6edf3;
+    -fx-min-width: 130px;
+    -fx-alignment: CENTER_RIGHT;
+}
+
+.label-caption {
+    -fx-text-fill: #9ba1a8;
+    -fx-font-size: 11px;
+    -fx-font-weight: normal;
+    -fx-padding: 0 2 0 6;
+}
+
+/* ---- Buttons ------------------------------------------------------ */
+
+.button {
+    -fx-background-color: #1f2630;
+    -fx-background-radius: 6;
+    -fx-border-color: #2d3543;
+    -fx-border-width: 1;
+    -fx-border-radius: 6;
+    -fx-text-fill: #e6edf3;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-padding: 8 18 8 18;
+    -fx-cursor: hand;
+    -fx-effect: null;
+}
+
+.button:hover {
+    -fx-background-color: #2c3543;
+    -fx-border-color: #3a4555;
+}
+
+.button:pressed {
+    -fx-background-color: #11151c;
+    -fx-border-color: #2d3543;
+}
+
+.button:focused {
+    -fx-border-color: #2f81f7;
+    -fx-effect: dropshadow(gaussian, rgba(47,129,247,0.35), 6, 0, 0, 0);
+}
+
+/* Primary action — the Play button. Accent fill so it's the obvious
+ * first click when the demo opens. */
+.button-primary {
+    -fx-background-color: #2f81f7;
+    -fx-border-color: #2f81f7;
+    -fx-text-fill: white;
+}
+.button-primary:hover {
+    -fx-background-color: #4a91f8;
+    -fx-border-color: #4a91f8;
+}
+.button-primary:pressed {
+    -fx-background-color: #1f6feb;
+    -fx-border-color: #1f6feb;
+}
+.button-primary:focused {
+    -fx-background-color: #4a91f8;
+    -fx-border-color: #ffffff;
+    -fx-effect: dropshadow(gaussian, rgba(47,129,247,0.55), 8, 0, 0, 0);
+}
+
+/* ---- Sliders ------------------------------------------------------ */
+
+.slider {
+    -fx-padding: 6 0 6 0;
+}
+
+.slider .track {
+    -fx-background-color: #2d3543;
+    -fx-background-insets: 0;
+    -fx-background-radius: 4;
+    -fx-pref-height: 6;
+}
+
+.slider .thumb {
+    /* Two-layer background: outer accent ring + white inner dot. */
+    -fx-background-color: #2f81f7, white;
+    -fx-background-insets: 0, 4;
+    -fx-background-radius: 100;
+    -fx-pref-height: 18;
+    -fx-pref-width: 18;
+    -fx-padding: 0;
+    -fx-cursor: hand;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.55), 4, 0, 0, 1);
+}
+
+.slider:hover .thumb,
+.slider:focused .thumb {
+    -fx-background-color: #4a91f8, white;
+}
+
+.slider:disabled .thumb {
+    -fx-background-color: #3a4555, #6a7280;
+    -fx-cursor: default;
+}
+.slider:disabled .track {
+    -fx-background-color: #1f2630;
+}
+
+/* Seek slider — slim track, slightly smaller thumb, looks like a real
+ * scrubber. */
+.slider-seek .track {
+    -fx-pref-height: 5;
+}
+.slider-seek .thumb {
+    -fx-pref-height: 16;
+    -fx-pref-width: 16;
+}
+
+.slider-volume {
+    -fx-pref-width: 140;
+}
+
+/* ---- ChoiceBox (rate picker) ------------------------------------- */
+
+.choice-box {
+    -fx-background-color: #1f2630;
+    -fx-background-radius: 6;
+    -fx-border-color: #2d3543;
+    -fx-border-radius: 6;
+    -fx-border-width: 1;
+    -fx-padding: 4 8 4 12;
+    -fx-cursor: hand;
+}
+.choice-box:hover {
+    -fx-background-color: #2c3543;
+    -fx-border-color: #3a4555;
+}
+.choice-box:focused {
+    -fx-border-color: #2f81f7;
+    -fx-effect: dropshadow(gaussian, rgba(47,129,247,0.35), 6, 0, 0, 0);
+}
+.choice-box .label {
+    -fx-text-fill: #e6edf3;
+    -fx-font-size: 12px;
+    -fx-font-weight: bold;
+    -fx-padding: 0 8 0 0;
+}
+.choice-box .open-button {
+    -fx-padding: 0 2 0 6;
+    -fx-background-color: transparent;
+}
+.choice-box .open-button .arrow {
+    -fx-background-color: #e6edf3;
+    -fx-padding: 3 4 3 4;
+}
+
+/* Dropdown menu rendered by ChoiceBox / ContextMenu. The default
+ * Modena background is bright cream which would be jarring against
+ * the dark control bar. */
+.context-menu {
+    -fx-background-color: #161b22;
+    -fx-background-radius: 6;
+    -fx-border-color: #2d3543;
+    -fx-border-radius: 6;
+    -fx-padding: 4;
+    -fx-effect: dropshadow(gaussian, rgba(0,0,0,0.6), 10, 0, 0, 3);
+}
+.menu-item {
+    -fx-padding: 6 14 6 14;
+    -fx-background-radius: 4;
+}
+.menu-item .label {
+    -fx-text-fill: #e6edf3;
+    -fx-font-size: 12px;
+}
+.menu-item:focused,
+.menu-item:hover {
+    -fx-background-color: #2f81f7;
+}
+.menu-item:focused .label,
+.menu-item:hover   .label {
+    -fx-text-fill: white;
+}
+
+/* ---- Text fields (DualStreamPlayer source URL inputs) ----------- */
+
+.text-field {
+    -fx-background-color: #11151c;
+    -fx-background-radius: 6;
+    -fx-border-color: #2d3543;
+    -fx-border-radius: 6;
+    -fx-border-width: 1;
+    -fx-text-fill: #e6edf3;
+    -fx-prompt-text-fill: #5a626d;
+    -fx-font-size: 12px;
+    -fx-padding: 6 10 6 10;
+    -fx-highlight-fill: #2f81f7;
+    -fx-highlight-text-fill: white;
+    -fx-cursor: text;
+}
+
+.text-field:hover {
+    -fx-border-color: #3a4555;
+}
+
+.text-field:focused {
+    -fx-border-color: #2f81f7;
+    -fx-effect: dropshadow(gaussian, rgba(47,129,247,0.35), 6, 0, 0, 0);
+}
+
+/* ---- Tooltips ----------------------------------------------------- */
+
+.tooltip {
+    -fx-background-color: #161b22;
+    -fx-text-fill: #e6edf3;
+    -fx-font-size: 11px;
+    -fx-padding: 5 9 5 9;
+    -fx-background-radius: 4;
+    -fx-border-color: #2d3543;
+    -fx-border-radius: 4;
+}

@@ -1,0 +1,102 @@
+/*
+ * samples/swinginterop — JavaFX <-> Swing interop demo.
+ *
+ * Exercises the javafx.swing module after the jdk.unsupported.desktop removal
+ * (JFXPanel + SwingNode round-trip). Standalone on purpose so it builds without
+ * the rest of the samples.
+ *
+ * Tasks:
+ *   :samples:swinginterop:run             — launch the interop window
+ *   :samples:swinginterop:runSelfCheck    — print the module self-check, then exit
+ *
+ * The four --add-exports below are the RUNTIME counterpart of the compile-time
+ * flags in javafx.swing/build.gradle: any app that uses JFXPanel or SwingNode
+ * must pass them (see docs/MODULE_SWING_DROP_UNSUPPORTED_DESKTOP.md).
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'application'
+}
+
+dependencies {
+    implementation project(':javafx.base')
+    implementation project(':javafx.graphics')
+    implementation project(':javafx.controls')
+    implementation project(':javafx.swing')
+}
+
+// Runtime --add-exports that javafx.swing needs to reach the JDK internals it
+// used to get from jdk.unsupported.desktop. Targeted at module javafx.swing,
+// so the launching app/module doesn't matter.
+//
+// NOTE: --enable-preview is NOT listed here. The skiafx.java-conventions plugin
+// already calls `jvmArgs '--enable-preview'` on every JavaExec. That call also
+// detaches the `applicationDefaultJvmArgs` convention from the `run` task, which
+// is why we set these explicitly on `run` below instead of relying on
+// applicationDefaultJvmArgs (doing so silently dropped them).
+def swingAddExports = [
+    '--add-exports', 'java.desktop/sun.swing=javafx.swing',
+    '--add-exports', 'java.desktop/sun.awt=javafx.swing',
+    '--add-exports', 'java.desktop/sun.awt.dnd=javafx.swing',
+    '--add-exports', 'java.desktop/java.awt.dnd.peer=javafx.swing',
+]
+def swingRuntimeArgs = ['--enable-native-access=ALL-UNNAMED'] + swingAddExports
+
+application {
+    mainClass  = 'org.openjfx.samples.swinginterop.SwingInteropDemo'
+    mainModule = 'openjfx.samples.swinginterop'
+    // Used by the generated start scripts (installDist). The `run` task gets
+    // these explicitly below — see the note above.
+    applicationDefaultJvmArgs = ['--enable-preview'] + swingRuntimeArgs
+}
+
+// ----------------------------------------------------------------------
+// Dev-tree run config: we launch against in-tree build outputs, so point
+// java.library.path at the javafx.graphics native dir and tell NativeBridge
+// where the Skia bridge DLL lives. A packaged SDK consumer doesn't need this.
+// ----------------------------------------------------------------------
+def repoRoot = rootDir
+def hostOs   = System.getProperty('os.name').toLowerCase()
+def hostPlat = hostOs.contains('win') ? 'win' : hostOs.contains('mac') ? 'mac' : 'linux'
+def hostArch = (System.getProperty('os.arch') in ['x86_64', 'amd64']) ? 'x64' : 'arm64'
+def graphicsLib = new File(repoRoot, "javafx.graphics/build/native/${hostPlat}-${hostArch}/lib")
+def skiaBridgeName = hostPlat == 'win' ? 'openjfx_skia_shared.dll'
+                   : hostPlat == 'mac' ? 'libopenjfx_skia_shared.dylib'
+                                       : 'libopenjfx_skia_shared.so'
+def skiaBridge = new File(graphicsLib, skiaBridgeName)
+
+def applyDevTreeRunConfig = { JavaExec t ->
+    t.doFirst {
+        systemProperty 'java.library.path', graphicsLib.absolutePath
+        if (skiaBridge.exists()) {
+            systemProperty 'openjfx.skia.nativeLib', skiaBridge.absolutePath
+        }
+    }
+}
+
+tasks.named('run') {
+    description = 'Launch SwingInteropDemo (JFXPanel + SwingNode round-trip).'
+    // Set explicitly (not via applicationDefaultJvmArgs) — see the note above.
+    jvmArgs swingRuntimeArgs
+    // Forward demo control flags from the gradlew CLI to the forked app JVM
+    // (JavaExec does NOT inherit the daemon's -D system properties).
+    ['swinginterop.autoExitMs', 'swinginterop.shotPath',
+     'swinginterop.selfCheckOnly'].each { k ->
+        def v = project.findProperty(k) ?: System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runSelfCheck', JavaExec) {
+    group = 'verification'
+    description = 'Print the javafx.swing module self-check (no window) and exit.'
+    dependsOn 'classes'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.swinginterop.SwingInteropDemo')
+    mainModule.set('openjfx.samples.swinginterop')
+    jvmArgs swingRuntimeArgs
+    systemProperty 'swinginterop.selfCheckOnly', 'true'
+    applyDevTreeRunConfig(it)
+}

@@ -1,0 +1,25 @@
+# Stub targets for components/metrics/private_metrics.
+# The real federated_compute protos depend on Project Oak attestation
+# protos that aren't synced. Instead, we provide stub headers so the
+# metrics code compiles but does nothing.
+
+config("federated_compute_include") {
+  include_dirs = [ "src" ]
+}
+
+source_set("confidential_compute_proto") {
+  sources = [ "stub/stub.cc" ]
+  public = [
+    "src/fcp/protos/confidentialcompute/data_upload_config.pb.h",
+    "src/fcp/protos/confidentialcompute/key.pb.h",
+    "src/fcp/protos/confidentialcompute/signed_endorsements.pb.h",
+    "src/fcp/protos/federatedcompute/confidential_encryption_config.pb.h",
+  ]
+  public_configs = [ ":federated_compute_include" ]
+}
+
+source_set("confidential_compute") {
+  sources = [ "stub/stub.cc" ]
+  public_deps = [ ":confidential_compute_proto" ]
+  public_configs = [ ":federated_compute_include" ]
+}

@@ -1,0 +1,466 @@
+/* ======================================================================
+ * showcase.css — skia-fx Showcase Dashboard, light theme.
+ *
+ * A clean light-glassmorphism skin: soft frosted surfaces, a cyan→violet
+ * accent gradient, gentle elevation shadows. One stylesheet drives the
+ * whole app (custom title bar, collapsible sidebar, every section, the
+ * loader and the FPS badge).
+ *
+ * Design tokens live in :root as -fx looked-up colours so the palette
+ * can be retuned in one place.
+ * ====================================================================== */
+
+* {
+    /* --- palette ------------------------------------------------------ */
+    -app-bg-top:      #eef3fb;
+    -app-bg-bot:      #e2e9f4;
+    -surface:         #ffffff;
+    -surface-2:       #f6f8fc;
+    -surface-sunken:  #eef2f8;
+    -hairline:        #dbe3ee;
+    -hairline-soft:   #e7edf6;
+
+    -ink:             #1c2533;   /* primary text   */
+    -ink-2:           #55617a;   /* secondary text */
+    -ink-3:           #8a93a6;   /* muted text     */
+
+    -accent:          #5b8cff;
+    -accent-2:        #9b5bff;
+    -accent-ink:      #ffffff;
+    -accent-grad:     linear-gradient(to right, -accent, -accent-2);
+    -accent-grad-br:  linear-gradient(to bottom right, -accent, -accent-2);
+
+    -good:            #18b663;
+    -warn:            #f0a020;
+    -bad:             #ef4d61;
+
+    -fx-font-family:  "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+    -fx-font-smoothing-type: gray;
+}
+
+/* ======================================================================
+ * Root + shell
+ * ====================================================================== */
+
+.root-pane {
+    -fx-background-color: linear-gradient(from 0% 0% to 60% 100%,
+                            -app-bg-top 0%, -app-bg-bot 100%);
+}
+
+.content-area {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+}
+
+.content-area > .viewport { -fx-background-color: transparent; }
+.content-area:focused { -fx-background-insets: 0; }
+
+/* ======================================================================
+ * Custom title bar + caption buttons
+ * ====================================================================== */
+
+.title-bar {
+    -fx-background-color: rgba(255, 255, 255, 0.72);
+    -fx-border-color: transparent transparent -hairline transparent;
+    -fx-border-width: 0 0 1 0;
+}
+
+.app-mark {
+    -fx-min-width: 16; -fx-min-height: 16;
+    -fx-max-width: 16; -fx-max-height: 16;
+    -fx-background-color: -accent-grad-br;
+    -fx-background-radius: 5;
+    -fx-effect: dropshadow(gaussian, rgba(91, 140, 255, 0.45), 8, 0.2, 0, 2);
+}
+
+.app-title {
+    -fx-text-fill: -ink;
+    -fx-font-size: 12.5px;
+    -fx-font-weight: bold;
+}
+
+.app-title-dim {
+    -fx-text-fill: -ink-3;
+    -fx-font-size: 12px;
+}
+
+/* Large "Fx" glyph used by the effect-gallery tiles and the live-blur demo.
+ * The size MUST live in CSS, not Text.setFont(): a programmatic font (USER
+ * origin) is overridden by the inherited -fx-font-family on .root whenever the
+ * subtree is re-styled (focus/click), which silently shrinks the glyph to the
+ * default size. A direct style-class rule is part of the cascade and re-applies
+ * deterministically, so it stays put. -fx-font-family is inherited from .root. */
+.fx-glyph {
+    -fx-font-size: 38px;
+    -fx-font-weight: bold;
+}
+
+.win-btn {
+    -fx-background-color: transparent;
+    -fx-cursor: hand;
+    -fx-alignment: center;
+}
+
+.ctb-icon {
+    -fx-fill: transparent;
+    -fx-stroke: -ink-2;
+    -fx-stroke-width: 1;
+    -fx-stroke-line-cap: round;
+    -fx-stroke-line-join: round;
+}
+
+/* Native WM_NCHITTEST hover pseudo-classes (set by CustomDecorations). */
+.win-btn-min:ht-min,
+.win-btn-max:ht-max {
+    -fx-background-color: rgba(28, 37, 51, 0.08);
+}
+.win-btn-close:ht-close {
+    -fx-background-color: -bad;
+}
+.win-btn-close:ht-close .ctb-icon {
+    -fx-stroke: #ffffff;
+}
+
+/* ======================================================================
+ * Sidebar
+ * ====================================================================== */
+
+.sidebar {
+    -fx-background-color: rgba(255, 255, 255, 0.66);
+    -fx-border-color: transparent -hairline transparent transparent;
+    -fx-border-width: 0 1 0 0;
+    -fx-padding: 14 12 14 12;
+}
+
+.sidebar-header {
+    -fx-padding: 2 4 14 6;
+    -fx-alignment: center-left;
+}
+
+.hamburger {
+    -fx-background-color: transparent;
+    -fx-background-radius: 9;
+    -fx-padding: 8;
+    -fx-cursor: hand;
+}
+.hamburger:hover { -fx-background-color: rgba(28, 37, 51, 0.06); }
+.hamburger .ctb-icon { -fx-stroke: -ink-2; -fx-stroke-width: 1.4; }
+
+.nav-item {
+    -fx-background-color: transparent;
+    -fx-background-radius: 11;
+    -fx-text-fill: -ink-2;
+    -fx-font-size: 13.5px;
+    -fx-font-weight: bold;
+    -fx-alignment: center-left;
+    -fx-graphic-text-gap: 14;
+    -fx-padding: 11 14 11 14;
+    -fx-cursor: hand;
+    -fx-content-display: left;
+}
+.nav-item:hover {
+    -fx-background-color: rgba(91, 140, 255, 0.10);
+    -fx-text-fill: -ink;
+}
+.nav-item:selected,
+.nav-item.active {
+    -fx-background-color: -accent-grad;
+    -fx-text-fill: -accent-ink;
+    -fx-effect: dropshadow(gaussian, rgba(91, 140, 255, 0.40), 14, 0.1, 0, 4);
+}
+.nav-item .nav-icon {
+    -fx-fill: transparent;
+    -fx-stroke: -ink-2;
+    -fx-stroke-width: 1.6;
+    -fx-stroke-line-cap: round;
+    -fx-stroke-line-join: round;
+}
+.nav-item:hover .nav-icon { -fx-stroke: -accent; }
+.nav-item:selected .nav-icon,
+.nav-item.active .nav-icon { -fx-stroke: -accent-ink; }
+
+/* Collapsed rail: text hidden by the controller, here we just centre. */
+.sidebar.collapsed .nav-item { -fx-alignment: center; -fx-padding: 11 0 11 0; }
+.sidebar.collapsed .sidebar-header { -fx-alignment: center; -fx-padding: 2 0 14 0; }
+
+/* ======================================================================
+ * Sections — headings + generic glass card
+ * ====================================================================== */
+
+.section { -fx-padding: 26 30 30 30; }
+
+.section-title {
+    -fx-text-fill: -ink;
+    -fx-font-size: 24px;
+    -fx-font-weight: bold;
+}
+.section-sub {
+    -fx-text-fill: -ink-3;
+    -fx-font-size: 13px;
+}
+
+.card, .glass {
+    -fx-background-color: rgba(255, 255, 255, 0.86);
+    -fx-background-radius: 16;
+    -fx-border-color: -hairline-soft;
+    -fx-border-radius: 16;
+    -fx-border-width: 1;
+    -fx-effect: dropshadow(gaussian, rgba(40, 60, 100, 0.10), 22, 0.06, 0, 8);
+}
+
+.card-title {
+    -fx-text-fill: -ink;
+    -fx-font-size: 14px;
+    -fx-font-weight: bold;
+}
+.card-sub {
+    -fx-text-fill: -ink-3;
+    -fx-font-size: 12px;
+}
+
+/* KPI cards (Overview) */
+.kpi-card { -fx-padding: 18 20 18 20; -fx-min-width: 190; }
+.kpi-label { -fx-text-fill: -ink-3; -fx-font-size: 12px; -fx-font-weight: bold; }
+.kpi-value { -fx-text-fill: -ink; -fx-font-size: 30px; -fx-font-weight: bold; }
+.kpi-delta { -fx-font-size: 12px; -fx-font-weight: bold; }
+.kpi-delta.up   { -fx-text-fill: -good; }
+.kpi-delta.down { -fx-text-fill: -bad; }
+.kpi-spark { -fx-stroke: -accent; -fx-stroke-width: 2; -fx-fill: transparent; }
+.kpi-dot {
+    -fx-fill: -accent;
+    -fx-effect: dropshadow(gaussian, rgba(91,140,255,0.6), 12, 0.3, 0, 0);
+}
+
+/* ======================================================================
+ * Buttons (shared)
+ * ====================================================================== */
+
+.btn-accent {
+    -fx-background-color: -accent-grad-br;
+    -fx-text-fill: -accent-ink;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+    -fx-background-radius: 10;
+    -fx-padding: 9 20 9 20;
+    -fx-cursor: hand;
+    -fx-effect: dropshadow(gaussian, rgba(91,140,255,0.35), 12, 0.1, 0, 4);
+}
+.btn-accent:hover { -fx-background-color: linear-gradient(to bottom right, derive(-accent, 12%), derive(-accent-2, 12%)); }
+
+.btn-ghost {
+    -fx-background-color: -surface;
+    -fx-text-fill: -ink;
+    -fx-font-size: 13px;
+    -fx-font-weight: bold;
+    -fx-background-radius: 10;
+    -fx-border-color: -hairline;
+    -fx-border-radius: 10;
+    -fx-border-width: 1;
+    -fx-padding: 9 18 9 18;
+    -fx-cursor: hand;
+}
+.btn-ghost:hover { -fx-background-color: -surface-2; -fx-border-color: -accent; }
+
+/* ======================================================================
+ * Generic control polish (light)
+ * ====================================================================== */
+
+.label { -fx-text-fill: -ink; }
+
+.button, .toggle-button {
+    -fx-background-radius: 9;
+    -fx-background-color: -surface;
+    -fx-text-fill: -ink;
+    -fx-border-color: -hairline;
+    -fx-border-radius: 9;
+    -fx-border-width: 1;
+    -fx-padding: 7 14 7 14;
+    -fx-cursor: hand;
+}
+.button:hover, .toggle-button:hover { -fx-border-color: -accent; }
+.toggle-button:selected {
+    -fx-background-color: -accent-grad;
+    -fx-text-fill: -accent-ink;
+    -fx-border-color: transparent;
+}
+
+.text-field, .password-field, .text-area, .spinner .text-field,
+.combo-box, .choice-box, .color-picker, .date-picker {
+    -fx-background-color: -surface;
+    -fx-background-radius: 9;
+    -fx-border-color: -hairline;
+    -fx-border-radius: 9;
+    -fx-border-width: 1;
+    -fx-text-fill: -ink;
+    -fx-prompt-text-fill: -ink-3;
+}
+.text-field:focused, .password-field:focused, .text-area:focused,
+.combo-box:focused, .choice-box:focused, .date-picker:focused {
+    -fx-border-color: -accent;
+}
+.text-area .content { -fx-background-color: -surface; -fx-background-radius: 9; }
+
+.check-box .box, .radio-button .radio {
+    -fx-background-color: -surface;
+    -fx-border-color: -hairline;
+    -fx-border-width: 1;
+}
+.check-box .box { -fx-background-radius: 5; -fx-border-radius: 5; }
+.check-box:selected .mark { -fx-background-color: -accent-ink; }
+.check-box:selected .box, .radio-button:selected .radio {
+    -fx-background-color: -accent-grad-br; -fx-border-color: transparent;
+}
+.radio-button:selected .dot { -fx-background-color: -accent-ink; }
+
+.slider .thumb {
+    -fx-background-color: -accent;
+    -fx-effect: dropshadow(gaussian, rgba(91,140,255,0.5), 8, 0.2, 0, 1);
+}
+.slider .track { -fx-background-color: -surface-sunken; -fx-background-radius: 4; }
+
+.progress-bar > .track { -fx-background-color: -surface-sunken; -fx-background-radius: 6; }
+.progress-bar > .bar   { -fx-background-color: -accent-grad; -fx-background-radius: 6; }
+.progress-indicator { -fx-progress-color: -accent; }
+
+.scroll-pane, .scroll-pane > .viewport { -fx-background-color: transparent; }
+.scroll-bar { -fx-background-color: transparent; }
+.scroll-bar .thumb {
+    -fx-background-color: rgba(120, 135, 160, 0.45);
+    -fx-background-radius: 6;
+}
+.scroll-bar .thumb:hover { -fx-background-color: rgba(120, 135, 160, 0.7); }
+.scroll-bar .increment-button, .scroll-bar .decrement-button,
+.scroll-bar .increment-arrow, .scroll-bar .decrement-arrow {
+    -fx-background-color: transparent; -fx-shape: " ";
+}
+
+.list-view, .table-view, .tree-view, .tree-table-view {
+    -fx-background-color: -surface;
+    -fx-background-radius: 12;
+    -fx-border-color: -hairline-soft;
+    -fx-border-radius: 12;
+    -fx-border-width: 1;
+}
+.list-cell, .table-row-cell, .tree-cell, .tree-table-row-cell {
+    -fx-background-color: transparent;
+    -fx-text-fill: -ink;
+}
+.list-cell:filled:hover, .table-row-cell:filled:hover { -fx-background-color: -surface-2; }
+.list-cell:filled:selected, .table-row-cell:filled:selected,
+.tree-cell:filled:selected, .tree-table-row-cell:filled:selected {
+    -fx-background-color: rgba(91, 140, 255, 0.16);
+    -fx-text-fill: -ink;
+}
+.table-view .column-header, .tree-table-view .column-header {
+    -fx-background-color: -surface-2;
+}
+.table-view .column-header .label, .tree-table-view .column-header .label {
+    -fx-text-fill: -ink-2; -fx-font-weight: bold;
+}
+
+.tab-pane .tab-header-area .tab-header-background { -fx-background-color: transparent; }
+.tab-pane .tab {
+    -fx-background-color: -surface;
+    -fx-background-radius: 9 9 0 0;
+    -fx-border-color: -hairline;
+    -fx-padding: 6 14 6 14;
+}
+.tab-pane .tab:selected { -fx-background-color: -accent-grad; }
+.tab-pane .tab:selected .tab-label { -fx-text-fill: -accent-ink; }
+.tab-pane .tab .tab-label { -fx-text-fill: -ink-2; -fx-font-weight: bold; }
+
+.titled-pane > .title {
+    -fx-background-color: -surface-2;
+    -fx-background-radius: 10 10 0 0;
+    -fx-text-fill: -ink;
+    -fx-font-weight: bold;
+}
+.titled-pane > *.content {
+    -fx-background-color: -surface;
+    -fx-border-color: -hairline-soft;
+    -fx-border-width: 0 1 1 1;
+}
+
+.tool-bar {
+    -fx-background-color: -surface-2;
+    -fx-background-radius: 10;
+    -fx-padding: 8;
+}
+.menu-bar { -fx-background-color: transparent; }
+.separator .line { -fx-border-color: -hairline; }
+
+.tooltip {
+    -fx-background-color: -ink;
+    -fx-text-fill: #ffffff;
+    -fx-background-radius: 8;
+    -fx-font-size: 12px;
+}
+
+/* Chips for the shapes/effect legends */
+.chip {
+    -fx-background-color: -surface-sunken;
+    -fx-background-radius: 999;
+    -fx-text-fill: -ink-2;
+    -fx-font-size: 11.5px;
+    -fx-font-weight: bold;
+    -fx-padding: 4 12 4 12;
+}
+
+/* ======================================================================
+ * Charts
+ * ====================================================================== */
+
+.chart { -fx-padding: 6; }
+.chart-content { -fx-padding: 4; }
+.chart-title { -fx-text-fill: -ink; -fx-font-weight: bold; }
+.chart-legend { -fx-background-color: transparent; }
+.chart-legend-item { -fx-text-fill: -ink-2; }
+.axis { -fx-tick-label-fill: -ink-3; }
+.axis-label { -fx-text-fill: -ink-2; }
+.chart-vertical-grid-lines, .chart-horizontal-grid-lines {
+    -fx-stroke: -hairline-soft;
+}
+.chart-plot-background { -fx-background-color: transparent; }
+.chart-series-line { -fx-stroke-width: 2.5; }
+
+/* ======================================================================
+ * Status bar + FPS badge
+ * ====================================================================== */
+
+.status-bar {
+    -fx-background-color: rgba(255, 255, 255, 0.72);
+    -fx-border-color: -hairline transparent transparent transparent;
+    -fx-border-width: 1 0 0 0;
+    -fx-padding: 0 16 0 16;
+}
+.status-text { -fx-text-fill: -ink-3; -fx-font-size: 11.5px; }
+
+.state-dot {
+    -fx-min-width: 8; -fx-min-height: 8; -fx-max-width: 8; -fx-max-height: 8;
+    -fx-background-color: -good;
+    -fx-background-radius: 4;
+}
+
+.fps-badge {
+    -fx-background-radius: 999;
+    -fx-padding: 3 12 3 12;
+    -fx-font-size: 11.5px;
+    -fx-font-weight: bold;
+    -fx-background-color: -surface-sunken;
+    -fx-text-fill: -ink-2;
+}
+.fps-badge.fps-good { -fx-background-color: rgba(24,182,99,0.16);  -fx-text-fill: -good; }
+.fps-badge.fps-okay { -fx-background-color: rgba(240,160,32,0.18); -fx-text-fill: #b9791a; }
+.fps-badge.fps-slow { -fx-background-color: rgba(239,77,97,0.16);  -fx-text-fill: -bad; }
+
+/* ======================================================================
+ * Loader (DualLoader)
+ * ====================================================================== */
+
+.loader-overlay { -fx-background-color: rgba(247, 249, 253, 0.55); }
+.dual-loader { -fx-alignment: center; }
+.dual-loader > * > .outer-arc { -fx-stroke: -accent;   }
+.dual-loader > * > .inner-arc { -fx-stroke: -accent-2; }
+.dual-loader .loader-label {
+    -fx-text-fill: -ink-2; -fx-font-size: 13px; -fx-font-weight: bold;
+}

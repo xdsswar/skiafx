@@ -1,0 +1,43 @@
+/*
+ * samples/perf — performance benchmarks.
+ *
+ * Houses:
+ *   - 300fps animation harness (existing target from CLAUDE.md)
+ *   - copy-counter assertion scenes
+ *   - frame-pacing measurement under uncapped mode
+ *   - memory soak scenarios
+ *
+ * Outputs JSON metrics consumed by `./gradlew runPerfBench` (TBD)
+ * for trending in CI.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'application'
+}
+
+dependencies {
+    implementation project(':javafx.base')
+    implementation project(':javafx.graphics')
+    implementation project(':javafx.controls')
+}
+
+application {
+    mainClass = 'org.openjfx.samples.perf.PerfMain'
+    mainModule = 'openjfx.samples.perf'
+    applicationDefaultJvmArgs = [
+        '-Dprism.order=skia',
+        '-Djavafx.animation.fullspeed=true',
+        '--enable-preview',
+    ]
+}
+
+tasks.register('runPerfBench', JavaExec) {
+    group = 'verification'
+    description = 'Run perf benchmarks and emit JSON metrics for trending.'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'org.openjfx.samples.perf.PerfMain'
+    systemProperty 'perf.outputFormat', 'json'
+}
+
+description = 'Performance benchmarks and copy-counter target scenes.'

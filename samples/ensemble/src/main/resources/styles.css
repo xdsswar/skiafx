@@ -1,0 +1,224 @@
+/* openjfx-skia dashboard — minimal CSS optimized for software Skia.
+ * One gradient on the dashboard bg + one on the active nav-item;
+ * everything else is flat color or simple borders.
+ */
+
+.dashboard {
+    -fx-background-color: #0f172a;
+    -fx-font-family: "Segoe UI", system, sans-serif;
+}
+
+/* ---- Header --------------------------------------------------------- */
+
+.header {
+    -fx-padding: 18 28 18 28;
+    -fx-background-color: #0a1325;
+    -fx-border-color: transparent transparent #1f2a44 transparent;
+    -fx-border-width: 0 0 1 0;
+}
+
+.brand       { -fx-text-fill: #f8fafc; -fx-font-size: 18px; -fx-font-weight: 700; }
+.tagline     { -fx-text-fill: #94a3b8; -fx-font-size: 12px; -fx-padding: 3 0 0 0; }
+.status      { -fx-text-fill: #a3e635; -fx-font-size: 12px; }
+.status-dot  { -fx-fill: #84cc16; }
+
+/* ---- Sidebar -------------------------------------------------------- */
+
+.sidebar {
+    -fx-padding: 24 12 24 12;
+    -fx-min-width: 220;
+    -fx-pref-width: 220;
+    -fx-background-color: #0c172e;
+    -fx-border-color: transparent #1f2a44 transparent transparent;
+    -fx-border-width: 0 1 0 0;
+}
+
+.sidebar-section {
+    -fx-text-fill: #475569;
+    -fx-font-size: 10px;
+    -fx-font-weight: 700;
+    -fx-padding: 16 12 6 12;
+}
+
+.nav-item {
+    -fx-text-fill: #cbd5e1;
+    -fx-font-size: 13px;
+    -fx-padding: 10 14 10 14;
+    -fx-background-radius: 8;
+    -fx-min-width: 196;
+    -fx-cursor: hand;
+}
+.nav-item:hover         { -fx-background-color: #1e2a4d; -fx-text-fill: #e2e8f0; }
+.nav-item-active        { -fx-background-color: #6366f1; -fx-text-fill: #ffffff; -fx-font-weight: 600; }
+.nav-item-active:hover  { -fx-background-color: #6366f1; }
+
+/* ---- Main content --------------------------------------------------- */
+
+.main          { -fx-padding: 28 32 28 32; }
+.h1            { -fx-text-fill: #f8fafc; -fx-font-size: 28px; -fx-font-weight: 700; }
+.subhead       { -fx-text-fill: #94a3b8; -fx-font-size: 13px; }
+
+.card {
+    -fx-padding: 18 20 18 20;
+    -fx-background-color: #1e293b;
+    -fx-background-radius: 14;
+    -fx-border-color: #2a3554;
+    -fx-border-radius: 14;
+    -fx-border-width: 1;
+}
+
+.kpi-title    { -fx-text-fill: #94a3b8; -fx-font-size: 10px; -fx-font-weight: 700; }
+.kpi-value    { -fx-text-fill: #f8fafc; -fx-font-size: 30px; -fx-font-weight: 700; }
+.kpi-trailing { -fx-text-fill: #64748b; -fx-font-size: 11px; }
+
+.h2             { -fx-text-fill: #e2e8f0; -fx-font-size: 16px; -fx-font-weight: 700; }
+
+/* ---- Recent-pulses table ------------------------------------------- */
+
+.table-card {
+    -fx-padding: 22 22 22 22;
+}
+
+.pulse-table {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+    -fx-table-cell-border-color: transparent;
+    -fx-control-inner-background: transparent;
+    -fx-control-inner-background-alt: transparent;
+}
+
+.pulse-table .column-header-background,
+.pulse-table .column-header,
+.pulse-table .filler {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-padding: 8 0 8 0;
+}
+
+.pulse-table .column-header .label {
+    -fx-text-fill: #64748b;
+    -fx-font-size: 10px;
+    -fx-font-weight: 700;
+    -fx-alignment: CENTER_LEFT;
+    -fx-padding: 0 12 0 12;
+}
+
+.pulse-table .table-row-cell {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent transparent #1f2a44 transparent;
+    -fx-border-width: 0 0 1 0;
+    -fx-padding: 0;
+}
+.pulse-table .table-row-cell:hover     { -fx-background-color: #1a2540; }
+.pulse-table .table-row-cell:selected  { -fx-background-color: #243056; }
+.pulse-table .table-row-cell:empty     { -fx-background-color: transparent; -fx-border-color: transparent; }
+
+.pulse-table .table-cell {
+    -fx-text-fill: #e2e8f0;
+    -fx-font-size: 12px;
+    -fx-padding: 0 12 0 12;
+    -fx-alignment: CENTER_LEFT;
+    -fx-border-color: transparent;
+}
+
+.stage-name { -fx-text-fill: #e2e8f0; }
+
+/* Renderer chip ------------------------------------------------------ */
+.chip {
+    -fx-padding: 3 10 3 10;
+    -fx-background-radius: 20;
+    -fx-font-size: 10px;
+    -fx-font-weight: 700;
+}
+.chip-skia    { -fx-background-color: #312e81; -fx-text-fill: #c7d2fe; }
+.chip-neutral { -fx-background-color: #1e293b; -fx-text-fill: #94a3b8; }
+
+/* Status pill -------------------------------------------------------- */
+.pill {
+    -fx-padding: 3 10 3 10;
+    -fx-background-radius: 20;
+    -fx-font-size: 10px;
+    -fx-font-weight: 800;
+    -fx-letter-spacing: 0.05em;
+}
+.pill-ok       { -fx-background-color: #064e3b; -fx-text-fill: #a7f3d0; }
+.pill-warn     { -fx-background-color: #78350f; -fx-text-fill: #fed7aa; }
+.pill-slow     { -fx-background-color: #7f1d1d; -fx-text-fill: #fecaca; }
+.pill-neutral  { -fx-background-color: #1e293b; -fx-text-fill: #94a3b8; }
+
+/* Frame-time bar ---------------------------------------------------- */
+.bar-track    { -fx-background-color: #1f2a44; -fx-background-radius: 3; }
+.bar-fill     { -fx-background-radius: 3; }
+.bar-fill-ok  { -fx-background-color: #22c55e; }
+.bar-fill-warn{ -fx-background-color: #f59e0b; }
+.bar-fill-slow{ -fx-background-color: #ef4444; }
+.bar-value    { -fx-text-fill: #cbd5e1; -fx-font-size: 11px; }
+
+.showcase {
+    -fx-background-color: #1a1f3d;
+    -fx-background-radius: 18;
+    -fx-border-color: #3a4570;
+    -fx-border-radius: 18;
+    -fx-border-width: 1;
+}
+
+.effects-card {
+    -fx-min-height: 180;
+}
+
+/* ---- Right-content scroll pane ------------------------------------ */
+
+.content-scroll {
+    -fx-background-color: transparent;
+    -fx-background-insets: 0;
+    -fx-padding: 0;
+}
+.content-scroll > .viewport {
+    -fx-background-color: transparent;
+}
+.content-scroll > .scroll-bar {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+}
+.content-scroll > .scroll-bar > .thumb {
+    -fx-background-color: #2a3554;
+    -fx-background-radius: 5;
+    -fx-background-insets: 2;
+}
+.content-scroll > .scroll-bar > .thumb:hover {
+    -fx-background-color: #3a4570;
+}
+.content-scroll > .scroll-bar > .track {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+}
+.content-scroll > .scroll-bar > .increment-button,
+.content-scroll > .scroll-bar > .decrement-button {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+}
+.content-scroll > .scroll-bar > .increment-arrow,
+.content-scroll > .scroll-bar > .decrement-arrow {
+    -fx-shape: " ";
+    -fx-padding: 0;
+}
+.content-scroll > .corner {
+    -fx-background-color: transparent;
+}
+
+.effect-label {
+    -fx-text-fill: #94a3b8;
+    -fx-font-size: 10px;
+    -fx-font-weight: 700;
+    -fx-padding: 4 0 0 0;
+}
+
+.text-wall-body {
+    -fx-text-fill: #cbd5e1;
+    -fx-font-size: 12px;
+    -fx-line-spacing: 2;
+}
+
+.showcase-title { -fx-text-fill: #c7d2fe; -fx-font-size: 12px; -fx-font-weight: 600; }
+.anim-box       { -fx-fill: #f97316; }
+.anim-dot       { -fx-fill: #38bdf8; }

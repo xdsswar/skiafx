@@ -1,0 +1,140 @@
+/*
+ * skiafx.matroska-conventions
+ *
+ * Brings the matroska demuxer into the gstreamer-lite build so that
+ * .webm and .mkv files are recognised by the JFX media engine. Without
+ * this, our gstreamer-lite ships only isomp4 / wavparse / mpegaudio /
+ * aiff demuxers, and any webm/mkv container fails on construction with
+ * MEDIA_UNSUPPORTED.
+ *
+ * Strategy mirrors skiafx.ffmpeg-conventions: download the upstream
+ * source tarball, verify sha-256, extract just `gst/matroska/` into
+ * build/generated/gst-matroska/<version>/, and expose the dir to the
+ * native build via `ext.gstMatroskaDir`. The directory is consumed by
+ * the gstreamer-lite CMakeLists which compiles the sources directly
+ * into the gstreamer-lite-plugins object library and adds the plugin
+ * init call to gstplugins-lite.c.
+ *
+ * The fetched matroska.c (upstream plugin entry) declares its own
+ * `plugin_init` symbol which would conflict with gstreamer-lite's
+ * static registry. We DON'T compile matroska.c — instead, our own
+ * matroska-lite-plugin.c (committed in tree) calls the demuxer's
+ * GST_ELEMENT_REGISTER macro under the `plugin_init_matroska` name
+ * gstplugins-lite expects.
+ */
+
+import java.security.MessageDigest
+
+def libs = project.extensions.getByType(VersionCatalogsExtension).named('libs')
+def gpgVersion = providers.gradleProperty('gstPluginsGoodVersion')
+        .orElse(libs.findVersion('gst-plugins-good').get().requiredVersion)
+        .get()
+def gpgSha256 = libs.findVersion('gst-plugins-good-sha256').get().requiredVersion
+
+def userMatroskaDir = providers.gradleProperty('gstMatroskaDir')
+        .orElse(providers.environmentVariable('OPENJFX_GST_MATROSKA_DIR'))
+        .getOrNull()
+
+def autoMatroskaDir = layout.buildDirectory
+        .dir("generated/gst-matroska/${gpgVersion}")
+def downloadDir = layout.buildDirectory.dir("generated/gst-matroska/download")
+
+def tarballName = "gst-plugins-good-${gpgVersion}.tar.xz"
+def tarballUrl  = "https://gstreamer.freedesktop.org/src/gst-plugins-good/${tarballName}"
+
+def sha256Of = { File f ->
+    if (!f.exists()) return null
+    def md = MessageDigest.getInstance('SHA-256')
+    f.withInputStream { ins ->
+        byte[] buf = new byte[64 * 1024]
+        int n
+        while ((n = ins.read(buf)) != -1) md.update(buf, 0, n)
+    }
+    md.digest().collect { String.format('%02x', it) }.join('')
+}
+
+def fetchTask = tasks.register('fetchGstMatroska') {
+    group = 'build'
+    description = "Download + extract gst-plugins-good ${gpgVersion} matroska sources"
+
+    inputs.property('gpgVersion', gpgVersion)
+    inputs.property('gpgSha256', gpgSha256)
+    outputs.dir(autoMatroskaDir)
+    outputs.upToDateWhen {
+        new File(autoMatroskaDir.get().asFile, 'matroska-demux.c').exists()
+    }
+
+    doLast {
+        def outDir = autoMatroskaDir.get().asFile
+        def dlDir  = downloadDir.get().asFile
+        dlDir.mkdirs()
+        outDir.mkdirs()
+
+        def tarball = new File(dlDir, tarballName)
+        def existingHash = sha256Of(tarball)
+        if (existingHash == null || !existingHash.equalsIgnoreCase(gpgSha256)) {
+            logger.lifecycle "[matroska] downloading ${tarballUrl}"
+            tarball.withOutputStream { os ->
+                new URI(tarballUrl).toURL().openStream().withStream { is ->
+                    os << is
+                }
+            }
+            def gotHash = sha256Of(tarball)
+            if (gotHash == null || !gotHash.equalsIgnoreCase(gpgSha256)) {
+                tarball.delete()
+                throw new GradleException(
+                    "[matroska] sha256 mismatch on ${tarballName}. " +
+                    "Expected ${gpgSha256}, got ${gotHash}.")
+            }
+        }
+
+        def tmpExtract = new File(dlDir, "extract-${gpgVersion}")
+        if (tmpExtract.exists()) tmpExtract.deleteDir()
+        tmpExtract.mkdirs()
+        logger.lifecycle "[matroska] extracting ${tarball.name}"
+        def proc = new ProcessBuilder('tar', '-xf', tarball.absolutePath,
+                                       '-C', tmpExtract.absolutePath)
+                .redirectErrorStream(true).start()
+        proc.inputStream.eachLine { logger.info "[matroska.tar] ${it}" }
+        if (proc.waitFor() != 0) {
+            throw new GradleException(
+                "[matroska] tar extraction failed (exit ${proc.exitValue()}).")
+        }
+
+        def srcMatroska = new File(tmpExtract,
+            "gst-plugins-good-${gpgVersion}/gst/matroska")
+        if (!srcMatroska.exists()) {
+            throw new GradleException(
+                "[matroska] expected ${srcMatroska} after extraction")
+        }
+
+        // Copy the matroska directory wholesale. The gstreamer-lite
+        // CMakeLists explicitly enumerates the demuxer-side sources
+        // (skipping mux + webm-mux files), so files we don't compile
+        // sit unused — that's fine, keeps the extract simple.
+        outDir.deleteDir(); outDir.mkdirs()
+        srcMatroska.eachFile { f ->
+            if (f.isFile()) {
+                new File(outDir, f.name).bytes = f.bytes
+            }
+        }
+        tmpExtract.deleteDir()
+        logger.lifecycle "[matroska] sources ready: ${outDir}"
+    }
+}
+
+def resolvedMatroskaDir
+if (userMatroskaDir != null && !userMatroskaDir.isBlank()) {
+    resolvedMatroskaDir = userMatroskaDir
+    logger.lifecycle "[matroska] using user-supplied source dir: ${resolvedMatroskaDir}"
+} else {
+    resolvedMatroskaDir = autoMatroskaDir.get().asFile.absolutePath
+}
+ext.gstMatroskaDir = resolvedMatroskaDir
+ext.gstMatroskaFetchTask = fetchTask
+
+if (userMatroskaDir == null || userMatroskaDir.isBlank()) {
+    tasks.matching { it.name == 'nativeConfigure' }.configureEach {
+        dependsOn fetchTask
+    }
+}

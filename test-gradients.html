@@ -1,0 +1,67 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>skia-fx gradient pairing test</title>
+<style>
+  body { font-family: 'Segoe UI', system-ui, sans-serif; margin: 24px;
+         background: #1b1b22; color: #eee; }
+  h1 { font-size: 22px; }
+  h2 { font-size: 16px; margin-top: 26px; color: #9aa; }
+  .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; }
+
+  /* Linear gradient inside a rounded-rect clip + box-shadow (=> clip
+     layer + effect/transparency layer nesting). */
+  .card { padding: 18px; border-radius: 14px; color: #fff; min-height: 90px;
+          box-shadow: 0 6px 18px rgba(0,0,0,.45);
+          background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); }
+
+  /* Same, but the whole card is also semi-transparent (opacity =>
+     beginTransparencyLayer / saveLayerAlpha around the gradient). */
+  .card.faded { opacity: .72; }
+
+  /* Nested: a gradient card containing another gradient pill with its
+     own border-radius clip — stacks two clip layers over the gradient. */
+  .pill { display:inline-block; margin-top:10px; padding:6px 14px;
+          border-radius: 999px; font-size: 13px;
+          background: linear-gradient(90deg, #11998e, #38ef7d); }
+
+  /* Radial gradient inside a circular clip. */
+  .orb { width: 90px; height: 90px; border-radius: 50%;
+         background: radial-gradient(circle at 35% 30%, #fceabb, #f8b500); }
+
+  /* Repeating + reflect spread to exercise non-PAD tile modes. */
+  .stripes { height: 60px; border-radius: 10px;
+             background: repeating-linear-gradient(45deg,
+               #ff6b6b 0 14px, #feca57 14px 28px); }
+</style></head>
+<body>
+  <h1>Gradient layer-pairing stress test</h1>
+  <p>Every box below paints a gradient inside one or more clip / opacity /
+     shadow layers. Before the fix these were clipped away or the surface
+     save-stack underflowed.</p>
+
+  <h2>1 · Gradient cards (clip + box-shadow)</h2>
+  <div class="grid">
+    <div class="card"><b>Linear #1</b><br>667eea → 764ba2
+      <div class="pill">nested clip pill</div></div>
+    <div class="card" style="background: linear-gradient(135deg,#ff9966,#ff5e62);">
+      <b>Linear #2</b><br>ff9966 → ff5e62</div>
+    <div class="card faded"><b>Faded (opacity .72)</b><br>gradient inside
+      a transparency layer</div>
+  </div>
+
+  <h2>2 · Radial gradients (circular clip)</h2>
+  <div class="grid">
+    <div class="orb"></div>
+    <div class="orb" style="opacity:.6"></div>
+    <div class="orb" style="background: radial-gradient(circle, #a18cd1, #fbc2eb);"></div>
+  </div>
+
+  <h2>3 · Repeating / reflect spread</h2>
+  <div class="stripes"></div>
+
+  <h2>4 · Deeply nested opacity + clip</h2>
+  <div class="card faded" style="opacity:.85;">
+    <div class="card" style="opacity:.85; background: linear-gradient(135deg,#36d1dc,#5b86e5);">
+      <div class="pill">three layers deep</div>
+    </div>
+  </div>
+</body></html>

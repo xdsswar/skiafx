@@ -1,0 +1,166 @@
+/*
+ * Demo3D theme. Dark glass HUD floating over a live 3D SubScene,
+ * sharing the custom-title-bar chrome conventions.
+ */
+
+.root,
+.root-pane {
+    -fx-background-color: #070b14;
+    -fx-font-family: "Segoe UI", "Inter", "Helvetica Neue", sans-serif;
+    -fx-font-smoothing-type: gray;
+}
+
+/* ---------------------------------------------------- title bar */
+
+.ctb-title-bar {
+    -fx-background-color: #0b101a;
+    -fx-border-color: transparent transparent rgba(255, 255, 255, 0.06) transparent;
+    -fx-border-width: 0 0 1 0;
+}
+
+.ctb-title-bar .title {
+    -fx-text-fill: #cfd6e2;
+    -fx-font-size: 12px;
+    -fx-font-weight: 600;
+}
+
+.app-mark {
+    -fx-background-color: linear-gradient(to bottom right, #22d3ee, #6366f1);
+    -fx-background-radius: 4;
+}
+
+/* ---------------------------------------------------- window buttons */
+
+.win-btn {
+    -fx-background-color: #0b101a;
+    -fx-cursor: hand;
+    -fx-alignment: center;
+}
+
+.ctb-icon {
+    -fx-fill: transparent;
+    -fx-stroke: #cfd6e2;
+    -fx-stroke-width: 1;
+    -fx-stroke-line-cap: round;
+    -fx-stroke-line-join: round;
+}
+
+.win-btn-min:ht-min,
+.win-btn-max:ht-max {
+    -fx-background-color: #1c2330;
+}
+
+.win-btn-close:ht-close {
+    -fx-background-color: #e81123;
+}
+
+.win-btn-close:ht-close .ctb-icon {
+    -fx-stroke: #ffffff;
+}
+
+/* ---------------------------------------------------- viewport / HUD */
+
+.viewport {
+    -fx-background-color: #070b14;
+}
+
+/* Top-left info panel — frosted dark card. */
+.hud-panel {
+    -fx-background-color: rgba(11, 16, 26, 0.72);
+    -fx-background-radius: 12;
+    -fx-border-color: rgba(255, 255, 255, 0.08);
+    -fx-border-radius: 12;
+    -fx-border-width: 1;
+    -fx-padding: 16 20 16 20;
+}
+
+.hud-heading {
+    -fx-text-fill: #f5f7fb;
+    -fx-font-size: 18px;
+    -fx-font-weight: 700;
+}
+
+.hud-sub {
+    -fx-text-fill: #9aa6b7;
+    -fx-font-size: 12.5px;
+    -fx-line-spacing: 2;
+}
+
+.hud-fps {
+    -fx-text-fill: #22d3ee;
+    -fx-font-family: "Consolas", "Menlo", monospace;
+    -fx-font-size: 22px;
+    -fx-font-weight: 700;
+    -fx-padding: 6 0 0 0;
+}
+
+/* Bottom control bar. */
+.hud-controls {
+    -fx-background-color: rgba(11, 16, 26, 0.72);
+    -fx-background-radius: 12;
+    -fx-border-color: rgba(255, 255, 255, 0.08);
+    -fx-border-radius: 12;
+    -fx-border-width: 1;
+    -fx-padding: 10 16 10 16;
+}
+
+.hud-hint {
+    -fx-text-fill: #6b7689;
+    -fx-font-size: 11.5px;
+    -fx-font-family: "Consolas", "Menlo", monospace;
+    -fx-padding: 0 4 0 0;
+}
+
+/* Pill-shaped toggle buttons. */
+.pill {
+    -fx-background-color: rgba(255, 255, 255, 0.05);
+    -fx-text-fill: #cfd6e2;
+    -fx-font-size: 12px;
+    -fx-font-weight: 600;
+    -fx-background-radius: 18;
+    -fx-border-color: rgba(255, 255, 255, 0.12);
+    -fx-border-radius: 18;
+    -fx-border-width: 1;
+    -fx-padding: 6 16 6 16;
+    -fx-cursor: hand;
+}
+
+.pill:hover {
+    -fx-background-color: rgba(255, 255, 255, 0.10);
+}
+
+.pill:selected {
+    -fx-background-color: linear-gradient(to bottom right, #22d3ee, #6366f1);
+    -fx-text-fill: #06131c;
+    -fx-border-color: transparent;
+}
+
+.pill:selected:hover {
+    -fx-background-color: linear-gradient(to bottom right, #4ee2ee, #7c80ff);
+}
+
+/* ---------------------------------------------------- capability probe */
+
+.cap-list {
+    -fx-padding: 8 0 0 0;
+}
+
+.cap-name {
+    -fx-text-fill: #cfd6e2;
+    -fx-font-family: "Consolas", "Menlo", monospace;
+    -fx-font-size: 13px;
+}
+
+.cap-ok {
+    -fx-text-fill: #34d399;
+    -fx-font-family: "Consolas", "Menlo", monospace;
+    -fx-font-size: 13px;
+    -fx-font-weight: 700;
+}
+
+.cap-no {
+    -fx-text-fill: #fb7185;
+    -fx-font-family: "Consolas", "Menlo", monospace;
+    -fx-font-size: 13px;
+    -fx-font-weight: 700;
+}

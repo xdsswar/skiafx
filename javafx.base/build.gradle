@@ -1,0 +1,46 @@
+/*
+ * javafx.base — copied from upstream, ours to modify.
+ *
+ * VersionInfo.java lives in src/main/version-info as a template; we
+ * substitute build-time placeholders and emit it to build/gensrc/java
+ * so it joins the main source set. Mirrors upstream's processVersionInfo
+ * task.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'skiafx.module-conventions'
+    id 'skiafx.upstream-sync'
+    id 'skiafx.sdk-conventions'
+}
+
+upstream {
+    trackedFromJfxMaster 'modules/javafx.base'
+}
+
+description = 'JavaFX base module.'
+
+def versionShort = providers.gradleProperty('openjfxVersionShort').orElse('25').get()
+def versionLong  = providers.gradleProperty('openjfxVersionLong').orElse(project.version.toString()).get()
+
+def gensrcDir = layout.buildDirectory.dir('gensrc/java')
+
+def processVersionInfo = tasks.register('processVersionInfo', Copy) {
+    description = 'Substitute @PLACEHOLDER@ tokens in VersionInfo.java.'
+    from 'src/main/version-info'
+    into gensrcDir.map { it.dir('com/sun/javafx/runtime') }
+    filter(org.apache.tools.ant.filters.ReplaceTokens, tokens: [
+        BUILD_TIMESTAMP        : new Date().format("yyyy-MM-dd-HHmmss"),
+        HUDSON_JOB_NAME        : (System.getenv('JOB_NAME') ?: 'not_hudson'),
+        HUDSON_BUILD_NUMBER    : (System.getenv('BUILD_NUMBER') ?: '0000'),
+        RELEASE_SUFFIX         : (providers.gradleProperty('releaseSuffix').orElse('-internal').get()),
+        RELEASE_VERSION_SHORT  : versionShort,
+        RELEASE_VERSION_LONG   : versionLong,
+    ])
+}
+
+sourceSets.main.java.srcDir gensrcDir
+tasks.named('compileJava') { dependsOn processVersionInfo }
+// If sourcesJar is ever re-enabled per-module via withSourcesJar(),
+// wire processVersionInfo as a dependency:
+//   tasks.named('sourcesJar') { dependsOn processVersionInfo }

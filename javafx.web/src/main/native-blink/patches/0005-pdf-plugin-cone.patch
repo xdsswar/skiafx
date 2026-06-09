@@ -1,0 +1,69 @@
+diff --git a/chrome/browser/resources/pdf/index_print.html b/chrome/browser/resources/pdf/index_print.html
+index c66f29d..3f608cf 100644
+--- a/chrome/browser/resources/pdf/index_print.html
++++ b/chrome/browser/resources/pdf/index_print.html
+@@ -4,6 +4,30 @@
+   <meta charset="utf-8">
+   <meta name="color-scheme" content="light dark">
+ 
++  <!-- skia-fx: our embedder injects no PDF-viewer extension context, so `chrome`
++       is undefined and createBrowserApiForPrintPreview() throws before boot. It
++       only needs `chrome` to EXIST (it skips chrome.tabs when absent). Classic
++       script → runs before the deferred module scripts. -->
++  <script>
++    window.chrome = window.chrome || {};
++    // skia-fx: the print-preview PDF viewer (pdf_viewer_base.ts) requests its
++    // translated strings via chrome.resourcesPrivate.getStrings — an extension
++    // API absent in our WebUI. Without it the viewer element throws at init and
++    // never constructs. Provide a shim returning the strings the print-path
++    // viewer reads at init (presetZoomFactors is JSON.parsed; the rest are
++    // labels). Expand as more of the viewer UI is wired.
++    window.chrome.resourcesPrivate = window.chrome.resourcesPrivate || {
++      Component: {PDF: 'pdf'},
++      getStrings: function(component, callback) {
++        callback({
++          presetZoomFactors:
++              '[0.25, 0.333333, 0.5, 0.666667, 0.75, 0.9, 1, 1.1, 1.25, 1.5, 2, 3, 4, 5]',
++          zoomTextInputAriaLabel: 'Zoom',
++        });
++      },
++    };
++  </script>
++
+   <link rel="stylesheet" href="chrome://resources/css/text_defaults_md.css">
+   <link rel="stylesheet" href="index.css">
+ 
+diff --git a/chrome/browser/resources/pdf/pdf_viewer.ts b/chrome/browser/resources/pdf/pdf_viewer.ts
+index e9dad50..d013ded 100644
+--- a/chrome/browser/resources/pdf/pdf_viewer.ts
++++ b/chrome/browser/resources/pdf/pdf_viewer.ts
+@@ -36,7 +36,10 @@ import {BeforeUnloadProxyImpl} from './before_unload_proxy.js';
+ // </if>
+ import type {Bookmark} from './bookmark_type.js';
+ import type {BrowserApi} from './browser_api.js';
+-import type {Attachment, DocumentMetadata, ExtendedKeyEvent, Point} from './constants.js';
++import type {Attachment, DocumentMetadata, Point} from './constants.js';
++// <if expr="enable_pdf_ink2">
++import type {ExtendedKeyEvent} from './constants.js';
++// </if>
+ // <if expr="enable_pdf_ink2">
+ import {AnnotationMode} from './constants.js';
+ // </if>
+diff --git a/chrome/browser/resources/pdf/elements/viewer_zoom_toolbar.css b/chrome/browser/resources/pdf/elements/viewer_zoom_toolbar.css
+index 5a9c4bd..ff947c7 100644
+--- a/chrome/browser/resources/pdf/elements/viewer_zoom_toolbar.css
++++ b/chrome/browser/resources/pdf/elements/viewer_zoom_toolbar.css
+@@ -36,8 +36,12 @@
+   right: var(--button-position-offset);
+ }
+ 
++/* skia-fx: the off-screen (OSR) print preview does not reliably deliver the
++   bottom-left mouse-move "reveal" that ToolbarManager relies on, so the zoom
++   toolbar never faded in. Keep the zoom buttons always visible (persistent),
++   like a normal toolbar, instead of reveal-on-hover. */
+ :host(:not([visible_])) #zoom-buttons {
+-  opacity: 0;
++  opacity: 1;
+   transition-timing-function: cubic-bezier(0.4, 0, 1, 1);
+ }
+ 

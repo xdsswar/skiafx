@@ -1,0 +1,45 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>border/shadow isolation</title>
+<style>
+  body { font-family:'Segoe UI',system-ui,sans-serif; margin:24px; background:#202028; color:#eee; }
+  h2 { font-size:14px; color:#9aa; margin:22px 0 8px; }
+  .row { display:flex; gap:40px; flex-wrap:wrap; }
+  .box { width:200px; height:80px; padding:10px;
+         box-sizing:border-box; color:#fff; font-size:13px; }
+  /* A: solid, square, nothing else */
+  .a { background:#3a6ea5; }
+  /* B: solid + box-shadow only (no radius, no border) */
+  .b { background:#3a6ea5; box-shadow:0 6px 18px rgba(0,0,0,.6); }
+  /* C: solid + CSS border only */
+  .c { background:#3a6ea5; border:2px solid #ffd166; }
+  /* D: solid + border-radius only */
+  .d { background:#3a6ea5; border-radius:14px; }
+  /* E: solid + radius + shadow */
+  .e { background:#3a6ea5; border-radius:14px; box-shadow:0 6px 18px rgba(0,0,0,.6); }
+  /* F: solid + radius + border */
+  .f { background:#3a6ea5; border-radius:14px; border:2px solid #ffd166; }
+  /* G: gradient + radius + shadow (the card case) */
+  .g { background:linear-gradient(135deg,#667eea,#764ba2); border-radius:14px;
+       box-shadow:0 6px 18px rgba(0,0,0,.6); }
+  /* H: gradient + radius + border + shadow (everything) */
+  .h { background:linear-gradient(135deg,#667eea,#764ba2); border-radius:14px;
+       border:2px solid #ffd166; box-shadow:0 6px 18px rgba(0,0,0,.6); }
+</style></head>
+<body>
+  <h2>A · solid square (baseline)</h2>
+  <div class="row"><div class="box a">A</div></div>
+  <h2>B · solid + box-shadow only</h2>
+  <div class="row"><div class="box b">B</div></div>
+  <h2>C · solid + 2px border only</h2>
+  <div class="row"><div class="box c">C</div></div>
+  <h2>D · solid + border-radius only</h2>
+  <div class="row"><div class="box d">D</div></div>
+  <h2>E · solid + radius + shadow</h2>
+  <div class="row"><div class="box e">E</div></div>
+  <h2>F · solid + radius + border</h2>
+  <div class="row"><div class="box f">F</div></div>
+  <h2>G · gradient + radius + shadow (the card)</h2>
+  <div class="row"><div class="box g">G</div></div>
+  <h2>H · gradient + radius + border + shadow (all)</h2>
+  <div class="row"><div class="box h">H</div></div>
+</body></html>

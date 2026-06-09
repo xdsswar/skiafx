@@ -1,0 +1,83 @@
+/*
+ * skiafx.test-conventions
+ *
+ * Test runner configuration shared across modules. The build is
+ * hermetic (no Maven runtime deps), so this convention DOES NOT add
+ * any test-library deps — modules that want JUnit/AssertJ/Mockito
+ * should add a local `repositories { mavenCentral() }` block and
+ * declare those deps directly in their build.gradle.
+ *
+ * Provided:
+ *   - JUnit Platform configured on the default `test` task.
+ *   - Standard JFR-friendly JVM flags.
+ *   - System-property forwarding (openjfx.*, prism.*, skia.*) from
+ *     the Gradle JVM into the test JVM, evaluated at execution time
+ *     so configuration cache doesn't lock the set on first run.
+ *   - Lifecycle hooks (`pixelDiffTest`, `copyCounterTest`,
+ *     `memorySoakTest`, `frameRateTest`) that exist as task aliases
+ *     and only run when their respective gating properties are set.
+ */
+
+tasks.withType(Test).configureEach {
+    useJUnitPlatform()
+    testLogging {
+        events 'failed', 'skipped', 'standardError'
+        showStackTraces = true
+        showCauses = true
+        exceptionFormat = 'full'
+    }
+    maxHeapSize = '2g'
+    jvmArgs(
+        '--enable-preview',
+        '--enable-native-access=ALL-UNNAMED',
+    )
+
+    // Forward openjfx.*, prism.*, and skia.* system properties from
+    // the Gradle JVM into the test JVM. Read at execution time so each
+    // invocation sees the current set (configuration cache would
+    // otherwise lock in whatever was set on first run).
+    doFirst {
+        def fwd = System.properties.findAll { k, v ->
+            k instanceof String && (k.startsWith('openjfx.')
+                                    || k.startsWith('prism.')
+                                    || k.startsWith('skia.'))
+        }.collectEntries { k, v -> [(k): v] }
+        systemProperties.putAll(fwd)
+    }
+}
+
+// --------- pixelDiffTest ---------------------------------------------------
+// Rendering correctness baseline: render reference scenes and diff
+// against committed PNGs. Skipped by default; opt-in via -PpixelDiff.
+tasks.register('pixelDiffTest', Test) {
+    group = 'verification'
+    description = 'Render reference scenes and diff against baseline images.'
+    onlyIf { providers.gradleProperty('pixelDiff').isPresent() }
+    shouldRunAfter tasks.named('test')
+}
+
+// --------- copyCounterTest -------------------------------------------------
+// Asserts specific scenes hit specific copy counts — guards against
+// regressions in the zero-copy work. Opt-in via -PcopyCounter.
+tasks.register('copyCounterTest', Test) {
+    group = 'verification'
+    description = 'Assert specific scenes hit specific copy counts.'
+    onlyIf { providers.gradleProperty('copyCounter').isPresent() }
+    shouldRunAfter tasks.named('test')
+}
+
+// --------- memorySoakTest --------------------------------------------------
+tasks.register('memorySoakTest', Test) {
+    group = 'verification'
+    description = 'Long-running memory test (off by default; nightly CI only).'
+    onlyIf { providers.gradleProperty('memorySoak').isPresent() }
+    systemProperty 'javafx.gpu.memDump', 'true'
+}
+
+// --------- frameRateTest ---------------------------------------------------
+tasks.register('frameRateTest', Test) {
+    group = 'verification'
+    description = 'Measure achievable fps on capable hardware (needs a real display).'
+    onlyIf { providers.gradleProperty('frameRate').isPresent() }
+    systemProperty 'javafx.animation.fullspeed', 'true'
+}

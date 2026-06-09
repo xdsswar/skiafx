@@ -1,0 +1,51 @@
+/*
+ * Root settings for skia-fx.
+ *
+ * Flat multi-module layout — every Gradle subproject sits at the repo
+ * root by its JPMS module name. Directory == Gradle project ==
+ * JPMS module == published artifact name. No `modules/` wrapper,
+ * no projectDir indirection, no surprises.
+ *
+ * Scope (desktop only): javafx.base, javafx.controls, javafx.fxml,
+ * javafx.graphics, javafx.media, javafx.swing, javafx.web, jdk.jsobject.
+ * Excluded: javafx.swt, iOS/Android, jfx.incubator.*.
+ */
+
+pluginManagement {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+}
+
+plugins {
+    // Foojay resolver lets the Java toolchain auto-provision JDK 25
+    // so a fresh clone + IntelliJ open builds without a manual SDK
+    // configuration step.
+    id 'org.gradle.toolchains.foojay-resolver-convention' version '0.8.0'
+}
+
+rootProject.name = 'skia-fx'
+
+includeBuild 'build-logic'
+
+include(
+    'javafx.base',
+    'javafx.graphics',
+    'javafx.scene3d',
+    'javafx.controls',
+    'javafx.fxml',
+    'javafx.swing',
+    'javafx.media',
+    'javafx.web',
+    'jdk.jsobject',
+    'samples:ensemble',
+    'samples:perf',
+    'samples:swinginterop',
+)
+
+// No project-side dependencyResolutionManagement. We don't pull any
+// runtime deps from Maven — Skia is linked locally via SKIA_HOME, all
+// other native libs are built in-tree. If a module needs an external
+// runtime dep later, add a per-module `repositories { ... }` block in
+// that module's build.gradle so the rest of the build stays hermetic.

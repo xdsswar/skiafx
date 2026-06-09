@@ -1,0 +1,28 @@
+{
+    "//": "ICU data filter for jux-framework-blink. Reduces icudtl.dat from",
+    "//": "the full ~11 MB to roughly 3-5 MB by keeping only the locales the",
+    "//": "framework targets. To narrow further, drop entries from the",
+    "//": "language includelist; to broaden, add ISO-639 codes.",
+    "//": "Copied into chromium/src/jux/ by the configureBuild Gradle task,",
+    "//": "referenced from args.gn as //jux/icu_filter.json.",
+
+    "strategy": "additive",
+
+    "localeFilter": {
+        "filterType": "language",
+        "includelist": [
+            "en",
+            "es", "fr", "de", "it", "pt", "nl", "pl", "sv", "da", "no", "fi",
+            "ru", "uk", "cs", "ro", "hu", "el", "bg",
+            "tr", "ar", "fa", "he",
+            "ja", "zh", "ko",
+            "hi", "vi", "th", "id", "ms"
+        ]
+    },
+
+    "featureFilters": {
+        "brkitr_lstm": "exclude",
+        "conversion_mappings": "exclude",
+        "confusables": "exclude"
+    }
+}

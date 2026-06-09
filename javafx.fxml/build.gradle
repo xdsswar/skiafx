@@ -1,0 +1,21 @@
+/*
+ * javafx.fxml — copied from upstream, ours to modify.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'skiafx.module-conventions'
+    id 'skiafx.upstream-sync'
+    id 'skiafx.sdk-conventions'
+}
+
+upstream {
+    trackedFromJfxMaster 'modules/javafx.fxml'
+}
+
+dependencies {
+    api project(':javafx.base')
+    api project(':javafx.graphics')
+}
+
+description = 'JavaFX FXML module.'

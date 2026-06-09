@@ -1,0 +1,21 @@
+/*
+ * build-logic — included build housing convention plugins for skia-fx.
+ * Replaces ad-hoc buildSrc; gives us proper plugin IDs, faster
+ * configuration, and isolation from the main build classpath.
+ */
+
+rootProject.name = 'build-logic'
+
+dependencyResolutionManagement {
+    repositories {
+        gradlePluginPortal()
+        mavenCentral()
+    }
+
+    // Reuse the main build's version catalog inside convention plugins.
+    versionCatalogs {
+        libs {
+            from(files('../gradle/libs.versions.toml'))
+        }
+    }
+}

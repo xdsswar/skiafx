@@ -1,0 +1,85 @@
+#
+# LibFFI Makefile
+#
+CC = cl.exe
+AR = lib.exe
+
+OBJBASE_DIR = $(BUILD_DIR)/obj/$(THIRD_PARTY_DIR)/libffi
+SRCBASE_DIR = ../../../$(THIRD_PARTY_DIR)/libffi
+
+DIRLIST = src src/x86
+
+DEP_DIRS = $(BUILD_DIR) $(addprefix $(OBJBASE_DIR)/,$(DIRLIST))
+
+C_SOURCES = src/closures.c \
+	    src/java_raw_api.c \
+	    src/prep_cif.c \
+	    src/raw_api.c \
+	    src/types.c
+
+COMPILER_FLAGS = -nologo -W3 -WX- -EHsc -GS -fp:precise -Gm- \
+                 -Zc:wchar_t -Zc:forScope -Gd -wd"4430" -analyze- -errorReport:queue
+
+INCLUDES = -I$(SRCBASE_DIR)/include \
+           -I$(SRCBASE_DIR)/src/x86
+
+CFLAGS = -DFFI_STATIC_BUILD \
+         -D_DISABLE_CONSTEXPR_MUTEX_CONSTRUCTOR \
+         -DGSTREAMER_LITE \
+	 $(INCLUDES) \
+	 $(COMPILER_FLAGS)
+
+LIBFLAGS = -out:$(shell cygpath -ma $(TARGET)) -nologo
+
+# Do not use -RTC1(-RTCs) in debug build. See JDK-8248365.
+ifeq ($(BUILD_TYPE), Release)
+    CFLAGS += -O1 -Oy -MD -Gy -GF
+else # debug
+    CFLAGS += -Od -Oy- -RTCu -MDd -Zi -Fd$(PDB)
+endif
+
+ifeq ($(ARCH), x32)
+    INCLUDES += -I$(SRCBASE_DIR)/include/win/x86
+    CFLAGS += -DX86_WIN32
+    LIBFLAGS += -MACHINE:x86
+
+    C_SOURCES += src/x86/ffi.c
+    ASM_SOURCES = src/x86/sysv_intel.S
+    ASM_FLAGS = -DX86_WIN32
+
+    ML = ml.exe
+    MLFLAGS = -safeseh
+else
+    INCLUDES += -I$(SRCBASE_DIR)/include/win/x64
+    CFLAGS += -DX86_WIN64
+    LIBFLAGS += -MACHINE:x64
+
+    C_SOURCES += src/x86/ffiw64.c
+    ASM_SOURCES = src/x86/win64_intel.S
+    ASM_FLAGS = -DX86_WIN64
+
+    ML = ml64.exe
+    MLFLAGS =
+endif
+
+OBJECTS = $(patsubst %.c,$(OBJBASE_DIR)/%.obj,$(C_SOURCES)) \
+	  $(patsubst %.S,$(OBJBASE_DIR)/%.obj,$(ASM_SOURCES))
+
+.PHONY: default list
+
+default: $(TARGET)
+
+$(TARGET): $(OBJECTS)
+	$(AR) $(LIBFLAGS) $(foreach object,$(OBJECTS),$(shell cygpath -ma $(object)))
+
+$(OBJECTS): | $(DEP_DIRS)
+
+$(DEP_DIRS):
+	@mkdir -p $(DEP_DIRS)
+
+$(OBJBASE_DIR)/%.obj: $(SRCBASE_DIR)/%.c
+	$(CC) $(CFLAGS) -TC -c -Fo$(shell cygpath -ma $@) $<
+
+$(OBJBASE_DIR)/%.obj: $(SRCBASE_DIR)/%.S
+	$(CC) -EP $(INCLUDES) $(CFLAGS) $(shell cygpath -ma $(SRCBASE_DIR)/$(ASM_SOURCES)) > $(shell cygpath -ma $@.asm)
+	$(ML) $(MLFLAGS) -c -Fo$(shell cygpath -ma $@) $(shell cygpath -ma $@.asm)

@@ -1,0 +1,19 @@
+# skia-fx override of the jux features.gni stub.
+#
+# The jux engine ships a stripped chrome/common/features.gni with
+# `chrome_grit_defines = []`. That empty list breaks the build_webui()
+# preprocessing of the restored chrome/browser/resources/{print_preview,pdf}
+# Polymer UIs, which reference grit vars in <if expr> — concretely
+# enable_pdf_ink2 and enable_pdf_save_to_drive (is_win / is_macosx are provided
+# by the build config automatically). We populate chrome_grit_defines with just
+# those. Both PDF-viewer features are disabled via gn args (see
+# generateArgs/printPreview), so the embedded preview viewer skips the ink
+# (annotation) + save-to-drive resource cones.
+import("//build/config/chrome_build.gni")
+import("//ui/webui/webui_features.gni")
+import("//pdf/features.gni")
+
+chrome_grit_defines = [
+  "enable_pdf_ink2=$enable_pdf_ink2",
+  "enable_pdf_save_to_drive=$enable_pdf_save_to_drive",
+]

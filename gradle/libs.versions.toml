@@ -1,0 +1,87 @@
+# skia-fx version catalog — single source of truth for every pinned
+# version + the project's own version identifiers. No Maven runtime
+# deps today (Skia is linked locally via SKIA_HOME); the catalog is
+# kept lean so adding one later is a one-line entry.
+#
+# Override at the CLI:
+#   ./gradlew build -PskiafxVersion=0.2.0-dev -PjavaVersion=26
+# See CLAUDE.md "Version pinning and overrides" for the full policy.
+
+[versions]
+# --- Project versions ---
+# Upstream OpenJFX release we fork. This is the version that ends up
+# in artifact filenames (javafx.base-25.0.0.jar) and
+# Specification-Version, so it MUST match a real OpenJFX release for
+# drop-in compatibility.
+javafx = "25.0.0"
+# Our overlay on top of upstream. Recorded in Implementation-Version
+# of every modular jar's MANIFEST.MF; never appears in the artifact
+# filename so consumers can replace a stock OpenJFX SDK with ours
+# without rewriting --module-path or pom.xml entries.
+skiafx = "0.1.0-SNAPSHOT"
+
+# --- Build infrastructure ---
+gradle = "9.2.0"               # tracked; wrapper enforces this
+java = "25"                    # JDK toolchain
+foojay-resolver = "0.8.0"
+
+# --- Native toolchain minimums ---
+cmake-min = "3.28"
+ninja-min = "1.11"
+gcc-min = "13"                 # Linux
+clang-min = "17"               # macOS
+msvc-min = "1939"              # Windows (VS 2022 17.9)
+
+# --- ffmpeg (runtime-dynamic, headers-only at build time) ---
+# We don't link against any ffmpeg .lib. The native plugin opens
+# avcodec-*.dll etc. at runtime via LoadLibrary/GetProcAddress when
+# the user points us at an ffmpeg install via OPENJFX_MEDIA_FFMPEG_DIR
+# or -Dopenjfx.media.ffmpeg.dir. We only need the public headers at
+# build time for struct layouts + function signatures.
+#
+# 7.1 is the latest stable line (March 2025). Windows DLL ABI:
+#   avcodec-61.dll  avformat-61.dll  avutil-59.dll
+#   swresample-5.dll  swscale-8.dll
+# Different major versions are NOT compatible — bump this only with
+# coordinated changes to the loader's expected DLL names + function
+# pointer table.
+ffmpeg = "7.1"
+# SHA-256 of https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
+# (verified against the upstream signature file at fetch time).
+ffmpeg-sha256 = "40973d44970dbc83ef302b0609f2e74982be2d85916dd2ee7472d30678a7abe6"
+
+# --- gst-plugins-good (matroska demuxer sources) ---
+# Our vendored gstreamer-lite is GStreamer 1.26.5; the matroska demuxer
+# is fetched at build time from the matching gst-plugins-good release
+# and compiled into the gstreamer-lite-plugins object library. Pin to
+# match the rest of the vendored gst tree exactly — mismatched versions
+# break ABI between the demuxer and the core gstreamer API.
+gst-plugins-good = "1.26.5"
+gst-plugins-good-sha256 = "eb0862e93404b073e98ec50350ece7e6685ea2936cab8118c2b8e938e2cbea8b"
+
+# --- bgfx (3D rendering — BSD-2, built from source via CMake) ---
+# Cross-platform GPU abstraction backing the Skia 3D pipeline
+# (docs/3D.md). Consumed via bkaradzic/bgfx.cmake — the canonical,
+# actively-maintained public-domain CMake wrapper that bundles bgfx +
+# bx + bimg as git submodules pinned to a RECENT bgfx (the widberg fork
+# is stale at 2021 and pins a 2020 bgfx whose PlatformData lacks the
+# `queue` field we need for D3D12 command-queue sharing). Fetched with
+# `git clone` + submodule update (tarballs omit submodules) by
+# skiafx.bgfx-conventions into build/generated/bgfx/.
+#
+# Pin an EXACT wrapper commit and bump deliberately + re-test; the
+# wrapper commit captures the bgfx/bx/bimg submodule SHAs, so a checkout
+# is reproducible. Override with -PbgfxRef=<commit|branch> or a
+# pre-vendored tree via -PbgfxDir / OPENJFX_BGFX_DIR.
+#
+# Commit: bkaradzic/bgfx.cmake master tip as of 2026-06-07 (no tags;
+# default branch is `master`).
+bgfx-cmake-ref = "4ba3843dd96f39252cb4e995f28070fdfd12a3d3"
+
+# --- Plugin versions ---
+plugin-foojay = "0.8.0"
+plugin-versions = "0.51.0"
+
+[plugins]
+foojay-toolchains  = { id = "org.gradle.toolchains.foojay-resolver-convention", version.ref = "plugin-foojay" }
+ben-manes-versions = { id = "com.github.ben-manes.versions",                    version.ref = "plugin-versions" }

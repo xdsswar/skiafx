@@ -1,0 +1,115 @@
+/* Dashboard styling: scrollbars + uniform press/hover/selected on
+ * table & list cells. Keeps the Skia pipeline rendering paths
+ * exercised under realistic CSS load without falling back to
+ * Modena's saturated defaults that would fight our soft palette. */
+
+/* Palette mirrors the inline constants in DashboardApp.java. */
+* {
+    -palette-bg-card:       #ffffff;
+    -palette-row-hover:     #f1f5f9;
+    -palette-row-select:    #e0f2fe;
+    -palette-accent:        #06b6d4;
+    -palette-border:        #e2e8f0;
+    -palette-border-strong: #cbd5e1;
+    -palette-text-fg:       #0f172a;
+    -palette-text-dim:      #64748b;
+}
+
+/* ---- TableView ---------------------------------------------------- */
+
+.table-view .table-row-cell:filled:pressed {
+    /* Pressed-without-yet-selected = same soft tint as selected,
+     * so a mouse-down during multi-select doesn't show the harsh
+     * Modena default in the gap before mouse-up. */
+    -fx-background-color: -palette-row-select;
+}
+.table-view .table-row-cell:filled:hover {
+    -fx-background-color: -palette-row-hover;
+}
+.table-view .table-row-cell:filled:selected {
+    /* Left 3-px accent rail behind a row-bg-color inset. */
+    -fx-background-color: -palette-accent, -palette-row-select;
+    -fx-background-insets: 0, 0 0 0 3;
+}
+
+/* Column-header styling — flat, monochrome, subtle bottom border. */
+.table-view .column-header,
+.table-view .column-header-background,
+.table-view .filler {
+    -fx-background-color: -palette-bg-card;
+    -fx-border-color: -palette-border;
+    -fx-border-width: 0 0 1 0;
+}
+.table-view .column-header .label {
+    -fx-text-fill: -palette-text-dim;
+    -fx-font-size: 11px;
+    -fx-font-weight: 700;
+    -fx-padding: 8 12 8 12;
+    -fx-alignment: CENTER_LEFT;
+}
+.table-view .table-cell {
+    -fx-border-color: transparent;
+    -fx-padding: 0 12 0 12;
+    -fx-alignment: CENTER_LEFT;
+}
+
+/* ---- ListView ----------------------------------------------------- */
+
+.list-view .list-cell:filled:pressed {
+    -fx-background-color: -palette-row-select;
+}
+.list-view .list-cell:filled:hover {
+    -fx-background-color: -palette-row-hover;
+}
+.list-view .list-cell:filled:selected,
+.list-view .list-cell:filled:selected:focused {
+    -fx-background-color: -palette-accent, -palette-row-select;
+    -fx-background-insets: 0, 0 0 0 3;
+}
+
+/* ---- ScrollBar (covers TableView, ListView, ScrollPane) ---------- */
+
+.scroll-bar:horizontal,
+.scroll-bar:vertical {
+    -fx-background-color: -palette-bg-card;
+    -fx-padding: 2;
+}
+
+.scroll-bar:horizontal { -fx-pref-height: 12; }
+.scroll-bar:vertical   { -fx-pref-width:  12; }
+
+.scroll-bar > .track,
+.scroll-bar > .track-background {
+    -fx-background-color: transparent;
+    -fx-border-color: transparent;
+    -fx-background-radius: 6;
+}
+
+.scroll-bar > .thumb {
+    -fx-background-color: -palette-border-strong;
+    -fx-background-radius: 6;
+    -fx-background-insets: 2;
+}
+.scroll-bar > .thumb:hover,
+.scroll-bar > .thumb:pressed {
+    -fx-background-color: -palette-text-dim;
+}
+
+/* Hide the increment/decrement arrows (modern look). */
+.scroll-bar > .increment-button,
+.scroll-bar > .decrement-button {
+    -fx-background-color: transparent;
+    -fx-padding: 0;
+}
+.scroll-bar > .increment-arrow,
+.scroll-bar > .decrement-arrow {
+    -fx-shape: " ";
+    -fx-padding: 0;
+}
+
+/* Corner where horizontal + vertical bars meet. */
+.scroll-pane .corner,
+.table-view .corner,
+.list-view .corner {
+    -fx-background-color: -palette-bg-card;
+}

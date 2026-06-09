@@ -1,0 +1,31 @@
+# Stubbed — jux-engine build. TFLite ML language detection removed.
+# The content layer falls back to ICU/CLD3 for basic language detection.
+
+import("//build/config/features.gni")
+
+component("core") {
+  sources = [
+    "background_file.cc",
+    "background_file.h",
+    "constants.h",
+    "features.cc",
+    "features.h",
+    "language_detection_model.cc",
+    "language_detection_model.h",
+  ]
+  if (use_blink) {
+    sources += [
+      "language_detection_provider.cc",
+      "language_detection_provider.h",
+    ]
+  }
+  deps = [
+    "//base",
+    "//components/optimization_guide/core:features",
+  ]
+  defines = [ "IS_LANGUAGE_DETECTION_IMPL" ]
+}
+
+# Internals (embedding_lookup, ngram_hash) removed — they depend on TFLite.
+# The LanguageDetectionModel will fail to load any model, which is fine.
+group("internals") {}

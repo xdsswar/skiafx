@@ -1,0 +1,36 @@
+/*
+ * openjfx.module-conventions
+ *
+ * JPMS wiring. Each subproject that applies this convention is treated
+ * as a Java Platform Module:
+ *   - module-info.java compiled together with the rest of the module.
+ *   - The compile + runtime classpaths are converted to module path
+ *     where reasonable.
+ *   - Modular jar produced (with Automatic-Module-Name fallback for
+ *     non-modular legacy deps; we shouldn't have any in our modules).
+ *
+ * Applied alongside openjfx.java-conventions.
+ */
+
+def moduleInfo = file('src/main/java/module-info.java')
+
+if (moduleInfo.exists()) {
+    plugins.withId('java-library') {
+        java {
+            modularity.inferModulePath.set(true)
+        }
+        // Module path is inferred automatically. Do NOT eagerly resolve
+        // compileClasspath here — Gradle 9 + Isolated Projects rejects
+        // configuration-time observation of compileClasspath from
+        // sibling subprojects.
+    }
+}
+
+// Make the module name available as a project property so other tasks
+// (e.g. dist-conventions) can use it for jlink / jpackage.
+ext.moduleName = providers.provider {
+    if (!moduleInfo.exists()) return null
+    def text = moduleInfo.text
+    def m = text =~ /(?ms)\bmodule\s+([\w.]+)\s*\{/
+    m.find() ? m.group(1) : null
+}

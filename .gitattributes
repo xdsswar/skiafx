@@ -1,0 +1,23 @@
+# Normalise line endings — LF everywhere on disk in the repo, native EOL
+# checkout on Windows. Avoids the "files changed because EOL" diff that
+# fights every Windows contributor.
+* text=auto eol=lf
+
+# Windows shell wrappers stay CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Gradle wrapper jar + native libs are binary
+gradle/wrapper/gradle-wrapper.jar binary
+*.jar       binary
+*.dll       binary
+*.exp       binary
+*.lib       binary
+*.so        binary
+*.dylib     binary
+*.png       binary
+*.jpg       binary
+*.gif       binary
+*.ico       binary
+*.zip       binary
+*.gz        binary

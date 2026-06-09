@@ -1,0 +1,320 @@
+/*
+ * skiafx.ffmpeg-conventions
+ *
+ * Provides ffmpeg PUBLIC HEADERS to the native build (and only those —
+ * we don't link against any ffmpeg .lib). The headers are needed for
+ * struct layouts, enum values, and function signatures used by the
+ * runtime-dynamic loader in fxplugins (`ffmpeg_loader.cpp`), which
+ * opens avcodec-*.dll etc. via LoadLibrary at startup and resolves
+ * symbols via GetProcAddress.
+ *
+ * Resolution order for the include directory (first hit wins):
+ *   1. `-PffmpegIncludeDir=...`            — Gradle property (CLI / properties file)
+ *   2. `OPENJFX_FFMPEG_INCLUDE_DIR` env    — typical CI / offline setups
+ *   3. fetchFfmpegHeaders task downloads the upstream source tarball,
+ *      verifies SHA-256, and extracts libav* public headers into
+ *      build/generated/ffmpeg/include/<ffmpegVersion>/
+ *
+ * The native convention plugin reads `ext.ffmpegIncludeDir` (set here)
+ * and passes it to CMake as -DOPENJFX_FFMPEG_INCLUDE_DIR. The plugin
+ * is OPTIONAL — when no headers are available, ffmpegwrapper.cpp
+ * skips its source file at the CMake level (the loader/plugin become
+ * non-functional but the rest of fxplugins still builds, and codec
+ * routing falls back to mfwrapper/dshowwrapper at runtime).
+ */
+
+import java.security.MessageDigest
+
+def libs = project.extensions.getByType(VersionCatalogsExtension).named('libs')
+def ffmpegVersion = providers.gradleProperty('ffmpegVersion')
+        .orElse(libs.findVersion('ffmpeg').get().requiredVersion)
+        .get()
+def ffmpegSha256 = libs.findVersion('ffmpeg-sha256').get().requiredVersion
+
+// User-supplied include dir (highest priority).
+def userIncludeDir = providers.gradleProperty('ffmpegIncludeDir')
+        .orElse(providers.environmentVariable('OPENJFX_FFMPEG_INCLUDE_DIR'))
+        .getOrNull()
+
+// Auto-fetched location: build/generated/ffmpeg/include/<version>/.
+// Versioned so re-fetching a different ffmpeg never collides with an
+// older extraction.
+def autoIncludeDir = layout.buildDirectory
+        .dir("generated/ffmpeg/include/${ffmpegVersion}")
+
+def downloadDir = layout.buildDirectory.dir("generated/ffmpeg/download")
+def tarballName = "ffmpeg-${ffmpegVersion}.tar.xz"
+def tarballUrl  = "https://ffmpeg.org/releases/${tarballName}"
+
+// SHA-256 of a file, streaming, hex lowercase. Closure so we can call
+// it from inside the task's doLast (script-level `static` defs aren't
+// visible there).
+def sha256Of = { File f ->
+    if (!f.exists()) return null
+    def md = MessageDigest.getInstance('SHA-256')
+    f.withInputStream { ins ->
+        byte[] buf = new byte[64 * 1024]
+        int n
+        while ((n = ins.read(buf)) != -1) md.update(buf, 0, n)
+    }
+    md.digest().collect { String.format('%02x', it) }.join('')
+}
+
+def fetchTask = tasks.register('fetchFfmpegHeaders') {
+    group = 'build'
+    description = "Download + extract ffmpeg ${ffmpegVersion} public headers " +
+            "into ${autoIncludeDir.get().asFile.relativePath(rootDir)}"
+
+    // Inputs / outputs so Gradle knows when this is up-to-date.
+    inputs.property('ffmpegVersion', ffmpegVersion)
+    inputs.property('ffmpegSha256', ffmpegSha256)
+    outputs.dir(autoIncludeDir)
+    outputs.upToDateWhen {
+        new File(autoIncludeDir.get().asFile, 'libavcodec/avcodec.h').exists() &&
+        new File(autoIncludeDir.get().asFile, 'libavutil/avutil.h').exists()
+    }
+
+    doLast {
+        def outDir = autoIncludeDir.get().asFile
+        def dlDir  = downloadDir.get().asFile
+        dlDir.mkdirs()
+        outDir.mkdirs()
+
+        def tarball = new File(dlDir, tarballName)
+        def existingHash = sha256Of(tarball)
+        if (existingHash == null || !existingHash.equalsIgnoreCase(ffmpegSha256)) {
+            logger.lifecycle "[ffmpeg] downloading ${tarballUrl}"
+            tarball.withOutputStream { os ->
+                new URI(tarballUrl).toURL().openStream().withStream { is ->
+                    os << is
+                }
+            }
+            def gotHash = sha256Of(tarball)
+            if (gotHash == null || !gotHash.equalsIgnoreCase(ffmpegSha256)) {
+                tarball.delete()
+                throw new GradleException(
+                    "[ffmpeg] sha256 mismatch on ${tarballName}. " +
+                    "Expected ${ffmpegSha256}, got ${gotHash}. Check the " +
+                    "version pin in gradle/libs.versions.toml or your " +
+                    "network proxy.")
+            }
+        }
+
+        // Extract only the public header dirs we need. The full source
+        // tarball is ~10 MB tar.xz; pulling just the libav*/*.h files
+        // keeps build/ small (< 4 MB extracted).
+        //
+        // tar.xz on Windows: Java's runtime doesn't ship an xz codec
+        // out of the box, but we can shell out to `tar -xf` (Win10+
+        // has bsdtar built in). On macOS / Linux the system tar
+        // handles it too. We extract to a temp dir then copy only
+        // the header subtrees over so a partial extract never
+        // pollutes the output dir.
+        def tmpExtract = new File(dlDir, "extract-${ffmpegVersion}")
+        if (tmpExtract.exists()) { tmpExtract.deleteDir() }
+        tmpExtract.mkdirs()
+        logger.lifecycle "[ffmpeg] extracting headers from ${tarball.name}"
+        def proc = new ProcessBuilder('tar', '-xf', tarball.absolutePath, '-C', tmpExtract.absolutePath)
+                .redirectErrorStream(true).start()
+        proc.inputStream.eachLine { logger.info "[ffmpeg.tar] ${it}" }
+        if (proc.waitFor() != 0) {
+            throw new GradleException(
+                "[ffmpeg] tar extraction failed (exit ${proc.exitValue()}). " +
+                "On Windows ensure bsdtar is on PATH (Windows 10/11 ships it).")
+        }
+
+        def srcRoot = new File(tmpExtract, "ffmpeg-${ffmpegVersion}")
+        if (!srcRoot.exists()) {
+            throw new GradleException("[ffmpeg] expected ${srcRoot} after extraction")
+        }
+        def libavDirs = ['libavcodec', 'libavformat', 'libavutil',
+                         'libswresample', 'libswscale']
+        libavDirs.each { dir ->
+            def from = new File(srcRoot, dir)
+            def to   = new File(outDir, dir)
+            if (to.exists()) { to.deleteDir() }
+            to.mkdirs()
+            from.eachFileMatch(~/.*\.h$/) { hdr ->
+                new File(to, hdr.name).bytes = hdr.bytes
+            }
+        }
+        // avconfig.h is generated by ffmpeg's ./configure for the
+        // target platform; the source tarball doesn't ship it. For a
+        // 64-bit little-endian Windows build (our only target right
+        // now) the values are static, so we hand-craft a minimal
+        // header. If we ever target big-endian Windows or another
+        // architecture this needs to be regenerated by running
+        // ffmpeg's configure for that target.
+        new File(outDir, 'libavutil/avconfig.h').text = '''\
+/* Auto-generated by skiafx.ffmpeg-conventions for win-x64.
+ * This file replaces what `./configure` would emit in a full ffmpeg
+ * build. Keep in sync with the target ABI if cross-compiling. */
+#ifndef AVUTIL_AVCONFIG_H
+#define AVUTIL_AVCONFIG_H
+#define AV_HAVE_BIGENDIAN       0
+#define AV_HAVE_FAST_UNALIGNED  1
+#endif /* AVUTIL_AVCONFIG_H */
+'''
+        // Throw the now-redundant source tree away.
+        tmpExtract.deleteDir()
+        logger.lifecycle "[ffmpeg] headers ready: ${outDir}"
+    }
+}
+
+// Decide which include dir we'll advertise. Wire it into ext so
+// native-conventions picks it up.
+def resolvedIncludeDir
+if (userIncludeDir != null && !userIncludeDir.isBlank()) {
+    resolvedIncludeDir = userIncludeDir
+    logger.lifecycle "[ffmpeg] using user-supplied include dir: ${resolvedIncludeDir}"
+} else {
+    resolvedIncludeDir = autoIncludeDir.get().asFile.absolutePath
+}
+ext.ffmpegIncludeDir = resolvedIncludeDir
+ext.ffmpegFetchTask  = fetchTask
+
+// When the auto-fetch path is in play, make the native configure
+// step depend on it so headers are present before CMake runs.
+if (userIncludeDir == null || userIncludeDir.isBlank()) {
+    tasks.matching { it.name == 'nativeConfigure' }.configureEach {
+        dependsOn fetchTask
+    }
+}
+
+// ===========================================================================
+// Prebuilt runtime DLLs (Windows) — gyan.dev essentials_build-shared
+// ===========================================================================
+//
+// The runtime loader (ffmpeg_loader.cpp) opens avcodec-*.dll etc.
+// dynamically. To make the demo "just work" without asking the user
+// to install ffmpeg system-wide, we ALSO fetch a prebuilt shared
+// build per platform and stage it under build/generated/ffmpeg/
+// runtime/<platform>/. The sample then defaults to that path when
+// the user hasn't set OPENJFX_MEDIA_FFMPEG_DIR / -Dopenjfx.media.ffmpeg.dir.
+//
+// Source: GyanD/codexffmpeg GitHub releases — the de-facto Windows
+// build maintained by gyan.dev and updated alongside upstream
+// ffmpeg releases. The asset name pattern is stable across versions.
+//
+// Other platforms (macOS / Linux) are no-ops for now; users on
+// those targets set the env var to their system ffmpeg.
+// ===========================================================================
+
+def hostOs = System.getProperty('os.name').toLowerCase()
+def hostArchProp = System.getProperty('os.arch').toLowerCase()
+def hostPlatform = hostOs.contains('win') ? 'win'
+                 : hostOs.contains('mac') ? 'mac'
+                 : 'linux'
+def hostArch = (hostArchProp in ['amd64', 'x86_64']) ? 'x64' : 'arm64'
+
+def runtimeDir = layout.buildDirectory
+        .dir("generated/ffmpeg/runtime/${hostPlatform}-${hostArch}")
+def runtimeDownloadDir = layout.buildDirectory.dir("generated/ffmpeg/runtime-download")
+
+def fetchRuntimeTask = tasks.register('fetchFfmpegRuntime') {
+    group = 'build'
+    description = "Download prebuilt ffmpeg ${ffmpegVersion} shared DLLs " +
+            "for ${hostPlatform}-${hostArch}"
+
+    outputs.dir(runtimeDir)
+    outputs.upToDateWhen {
+        new File(runtimeDir.get().asFile, 'avcodec-61.dll').exists()
+    }
+
+    doLast {
+        def outDir = runtimeDir.get().asFile
+        def dlDir  = runtimeDownloadDir.get().asFile
+        if (hostPlatform != 'win' || hostArch != 'x64') {
+            logger.lifecycle "[ffmpeg.runtime] no prebuilt available for " +
+                    "${hostPlatform}-${hostArch}; users must install ffmpeg " +
+                    "and set OPENJFX_MEDIA_FFMPEG_DIR"
+            outDir.mkdirs()
+            return
+        }
+        outDir.mkdirs()
+        dlDir.mkdirs()
+
+        // BtbN's auto-built "latest" win64 LGPL shared build. The URL
+        // is stable across rebuilds (BtbN re-uploads the `latest` tag
+        // when master advances). The DLL major versions match our
+        // pinned ffmpeg ${ffmpegVersion} headers (avcodec-61, avutil-59,
+        // …) because both track the same upstream branch.
+        //
+        // We DON'T verify a SHA-256 here — the upstream zip is
+        // rebuilt on every commit so its hash drifts. If supply-chain
+        // integrity is a concern, override this fetch with a
+        // pre-staged ffmpegDir Gradle property pointing at a
+        // user-vendored install.
+        def candidates = [
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip",
+            // Fallback for known-stable gyan.dev release naming.
+            "https://github.com/GyanD/codexffmpeg/releases/download/${ffmpegVersion}/ffmpeg-${ffmpegVersion}-full_build-shared.7z",
+        ]
+        def zipFile = null
+        Throwable lastErr = null
+        for (url in candidates) {
+            def name = url.tokenize('/').last()
+            def f = new File(dlDir, name)
+            if (f.exists() && f.length() > 0) { zipFile = f; break }
+            try {
+                logger.lifecycle "[ffmpeg.runtime] downloading ${url}"
+                f.withOutputStream { os ->
+                    new URI(url).toURL().openStream().withStream { is ->
+                        os << is
+                    }
+                }
+                zipFile = f
+                break
+            } catch (Throwable t) {
+                lastErr = t
+                logger.warn "[ffmpeg.runtime] ${url} failed: ${t.message}"
+                f.delete()
+            }
+        }
+        if (zipFile == null) {
+            throw new GradleException(
+                "[ffmpeg.runtime] no upstream archive could be fetched. " +
+                "Tried: ${candidates}. Last error: ${lastErr}")
+        }
+
+        // bsdtar (Win10+) handles .zip via -xf. Extract into a tmp
+        // dir, copy just the bin/*.dll files into outDir.
+        def tmp = new File(dlDir, "extract-${ffmpegVersion}")
+        if (tmp.exists()) tmp.deleteDir()
+        tmp.mkdirs()
+        logger.lifecycle "[ffmpeg.runtime] extracting ${zipFile.name}"
+        def proc = new ProcessBuilder('tar', '-xf', zipFile.absolutePath,
+                                       '-C', tmp.absolutePath)
+                .redirectErrorStream(true).start()
+        proc.inputStream.eachLine { logger.info "[ffmpeg.runtime.tar] ${it}" }
+        if (proc.waitFor() != 0) {
+            throw new GradleException(
+                "[ffmpeg.runtime] extraction failed (exit ${proc.exitValue()})")
+        }
+
+        // Find the bin/ dir inside the extracted tree. BtbN's layout
+        // is ffmpeg-master-latest-win64-lgpl-shared/bin/*.dll;
+        // gyan's is ffmpeg-X.Y-full_build-shared/bin/*.dll. We just
+        // walk one level deep until we find a bin/ child.
+        File binDir = null
+        tmp.eachDir { d ->
+            def b = new File(d, 'bin')
+            if (b.exists()) binDir = b
+        }
+        if (binDir == null) {
+            throw new GradleException(
+                "[ffmpeg.runtime] no bin/ dir found in ${zipFile.name}")
+        }
+
+        binDir.eachFileMatch(~/.*\.dll$/) { dll ->
+            new File(outDir, dll.name).bytes = dll.bytes
+        }
+        tmp.deleteDir()
+        def dllCount = outDir.listFiles({ f -> f.name.endsWith('.dll') } as FileFilter)?.length ?: 0
+        logger.lifecycle "[ffmpeg.runtime] ${dllCount} DLLs ready: ${outDir}"
+    }
+}
+
+ext.ffmpegRuntimeDir       = runtimeDir.get().asFile.absolutePath
+ext.ffmpegRuntimeFetchTask = fetchRuntimeTask
+

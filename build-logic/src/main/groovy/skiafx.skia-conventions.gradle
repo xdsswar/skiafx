@@ -1,0 +1,217 @@
+/*
+ * skiafx.skia-conventions
+ *
+ * Validates that a local Skia build is reachable and exports its
+ * location as a project property so native-conventions can pass
+ * SKIA_HOME to CMake. Applied to any module that links against Skia
+ * (today: javafx.graphics).
+ *
+ * Resolution order (first hit wins):
+ *   1. `-PskiaHome=...`             (Gradle property, CLI or properties file)
+ *   2. `SKIA_HOME` environment var  (typical dev setup)
+ *
+ * Skia itself is built / staged outside this repo — see CLAUDE.md
+ * "Reference SDK at /jfx-master" and the `reference_skia_home` memo
+ * for the local checkout layout (`out/Release/skia.lib` + headers in
+ * `include/`). We do not pull a JVM Skia binding from Maven; the
+ * Java ↔ Skia bridge is the FFM-based `openjfx_skia_bridge` native
+ * library we build ourselves and ship inside the modular jar.
+ */
+
+def skiaHomeProvider = providers.gradleProperty('skiaHome')
+        .orElse(providers.environmentVariable('SKIA_HOME'))
+
+def skiaHome = skiaHomeProvider.getOrNull()
+
+if (skiaHome == null || skiaHome.isBlank()) {
+    logger.lifecycle "[skia-fx] WARNING: SKIA_HOME is not set. " +
+            "Native modules that link Skia will be configured but not built. " +
+            "Pass `-PskiaHome=/path/to/skia` or `export SKIA_HOME=/path/to/skia`."
+} else {
+    def headersOk = new File(skiaHome, 'include/core/SkSurface.h').exists()
+    if (!headersOk) {
+        throw new GradleException(
+            "[skia-fx] SKIA_HOME=${skiaHome} does not look like a Skia tree " +
+            "(include/core/SkSurface.h missing). See CLAUDE.md for the expected layout.")
+    }
+    ext.skiaHome = skiaHome
+    logger.lifecycle "[skia-fx] Using SKIA_HOME=${skiaHome}"
+}
+
+// ---------------------------------------------------------------------------
+// prepareSkiaSvg — make SvgImage/SvgImageView's native dependencies available
+// to the bridge build automatically, so `buildAll` is self-contained.
+//
+// Skia's SVG module (modules/svg) and its skshaper / skunicode / xml(SkDOM)
+// dependencies are compiled by Skia but NOT merged into the core skia.lib.
+// This task archives each module's own object files into THIN, non-component
+// static libraries (openjfx_svg / openjfx_skshaper / openjfx_skunicode) that
+// link cleanly against skia.lib without duplicate symbols. The bridge's
+// CMakeLists finds them (find_library NAMES openjfx_svg …) and, when present,
+// defines OPENJFX_WITH_SKIA_SVG to light up the svg_* entry points.
+//
+// Behavior:
+//   • thin libs already present & newer than skia core lib → skip (fast).
+//   • module .obj/.o present (Skia built with skia_enable_svg) → archive them.
+//   • objects missing & -PbuildSkiaSvg=true → run gn gen + ninja first.
+//   • objects missing otherwise → log how to enable, and continue (the bridge
+//     degrades to "no SVG", never fails the build).
+//
+// Skia must be built with: skia_enable_svg=true, skia_use_expat=true,
+// skia_use_freetype=true, is_component_build=false (+ skia_use_direct3d=true on
+// Windows). See docs/MODULE_SVG.md.
+// ---------------------------------------------------------------------------
+if (skiaHome != null && !skiaHome.isBlank()) {
+    final String SKIA = skiaHome
+    final boolean isWin = org.gradle.internal.os.OperatingSystem.current().isWindows()
+    final boolean optInBuild = providers.gradleProperty('buildSkiaSvg').orElse('false').get() == 'true'
+    final String gnProp = providers.gradleProperty('skiaGn').orElse('').get()
+    final String ninjaProp = providers.gradleProperty('skiaNinja').orElse('').get()
+    final String libExeProp = providers.gradleProperty('libExe').orElse('').get()
+    // Resolved at configuration time (env reads must not happen in doLast under
+    // the configuration cache).
+    final String programFilesX86 = providers.environmentVariable('ProgramFiles(x86)')
+            .orElse('C:/Program Files (x86)').get()
+
+    tasks.register('prepareSkiaSvg') {
+        group = 'build'
+        description = 'Archive Skia SVG module objects into thin static libs the bridge links.'
+        doLast {
+            def out = new File(SKIA, 'out/Release')
+            // The three thin libs we produce, and the module objects feeding each.
+            def libExt = isWin ? '.lib' : '.a'
+            def libPrefix = isWin ? '' : 'lib'
+            def targets = [
+                'openjfx_svg'      : ['obj/modules/svg/src', 'obj/src/xml'],
+                'openjfx_skshaper' : ['obj/modules/skshaper/src'],
+                'openjfx_skunicode': ['obj/modules/skunicode/src'],
+            ]
+            def coreLib = new File(out, isWin ? 'skia.lib' : 'libskia.a')
+
+            // 1) Up-to-date check: all libs exist and are at least as new as core.
+            boolean allFresh = targets.keySet().every { name ->
+                def lib = new File(out, libPrefix + name + libExt)
+                lib.exists() && (!coreLib.exists() || lib.lastModified() >= coreLib.lastModified())
+            }
+            if (allFresh) {
+                logger.lifecycle "[skia-fx] SVG static libs present and up to date — skipping."
+                return
+            }
+
+            def objExt = isWin ? '.obj' : '.o'
+            boolean objectsPresent = targets.values().flatten().any { rel ->
+                def d = new File(out, rel)
+                d.isDirectory() && (d.listFiles({ f -> f.name.endsWith(objExt) } as java.io.FileFilter)?.length ?: 0) > 0
+            }
+
+            // 2) Optionally build the Skia SVG objects (opt-in; invasive).
+            if (!objectsPresent && optInBuild) {
+                def gn = gnProp ?: new File(SKIA, isWin ? 'bin/gn.exe' : 'bin/gn').absolutePath
+                def ninja = ninjaProp ?: 'ninja'
+                logger.lifecycle "[skia-fx] Building Skia SVG module (gn gen + ninja)…"
+                try {
+                    new ProcessBuilder(gn, 'gen', 'out/Release').directory(new File(SKIA))
+                        .inheritIO().start().waitFor()
+                    new ProcessBuilder(ninja, '-C', 'out/Release',
+                        'skia.lib', 'svg', 'skshaper', 'skunicode_core', 'skunicode_icu')
+                        .directory(new File(SKIA)).inheritIO().start().waitFor()
+                } catch (Exception e) {
+                    logger.warn "[skia-fx] gn/ninja invocation failed: ${e.message}"
+                }
+                objectsPresent = targets.values().flatten().any { rel ->
+                    def d = new File(out, rel)
+                    d.isDirectory() && (d.listFiles({ f -> f.name.endsWith(objExt) } as java.io.FileFilter)?.length ?: 0) > 0
+                }
+            }
+
+            if (!objectsPresent) {
+                logger.warn "[skia-fx] Skia SVG module objects not found under ${out}.\n" +
+                    "  SvgImage/SvgImageView will render nothing until Skia is built with the\n" +
+                    "  SVG module. Build Skia with skia_enable_svg=true, skia_use_expat=true,\n" +
+                    "  skia_use_freetype=true, is_component_build=false (+ skia_use_direct3d=true\n" +
+                    "  on Windows), then re-run — or pass -PbuildSkiaSvg=true to do it now.\n" +
+                    "  See docs/MODULE_SVG.md."
+                return
+            }
+
+            // 3) Locate the archiver.
+            String archiver = null
+            if (isWin) {
+                // Prefer an explicit -PlibExe, else locate via vswhere.
+                archiver = libExeProp ?: null
+                if (!archiver) {
+                    def vswhere = new File(programFilesX86,
+                        'Microsoft Visual Studio/Installer/vswhere.exe')
+                    if (vswhere.exists()) {
+                        try {
+                            def p = new ProcessBuilder(vswhere.absolutePath, '-latest', '-products', '*',
+                                '-requires', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+                                '-property', 'installationPath').redirectErrorStream(true).start()
+                            def inst = p.inputStream.text.trim().readLines().find { it }
+                            p.waitFor()
+                            if (inst) {
+                                def msvc = new File(inst, 'VC/Tools/MSVC')
+                                def ver = msvc.listFiles()?.findAll { it.isDirectory() }?.sort()?.last()
+                                if (ver) {
+                                    def cand = new File(ver, 'bin/Hostx64/x64/lib.exe')
+                                    if (cand.exists()) archiver = cand.absolutePath
+                                }
+                            }
+                        } catch (Exception e) {
+                            logger.warn "[skia-fx] vswhere lookup failed: ${e.message}"
+                        }
+                    }
+                }
+                if (!archiver) {
+                    logger.warn "[skia-fx] Could not locate lib.exe (pass -PlibExe=<path>). " +
+                        "SVG libs not archived; bridge will build without SVG."
+                    return
+                }
+            } else {
+                archiver = 'ar'
+            }
+
+            // 4) Archive each thin lib from its module objects.
+            targets.each { name, dirs ->
+                def objs = []
+                dirs.each { rel ->
+                    def d = new File(out, rel)
+                    if (d.isDirectory()) {
+                        d.listFiles({ f -> f.name.endsWith(objExt) } as java.io.FileFilter)?.each { objs << it.absolutePath }
+                    }
+                }
+                if (objs.isEmpty()) return
+                def libFile = new File(out, libPrefix + name + libExt)
+                libFile.delete()
+                def rsp = new File(out, name + '.rsp')
+                rsp.text = objs.join(System.lineSeparator())
+                try {
+                    def cmd = isWin
+                        ? [archiver, '/nologo', ('/OUT:' + libFile.absolutePath), ('@' + rsp.absolutePath)]
+                        : ([archiver, 'rcs', libFile.absolutePath] + objs)
+                    def proc = new ProcessBuilder(cmd.collect { it.toString() })
+                        .redirectErrorStream(true).start()
+                    def log = proc.inputStream.text
+                    proc.waitFor()
+                    if (proc.exitValue() != 0) {
+                        logger.warn "[skia-fx] archiving ${name} failed: ${log}"
+                    } else {
+                        logger.lifecycle "[skia-fx] archived ${libFile.name} (${objs.size()} objects)."
+                    }
+                } finally {
+                    rsp.delete()
+                }
+            }
+        }
+    }
+
+    // Run before CMake configures the bridge (its find_library needs the libs).
+    tasks.matching { it.name == 'nativeConfigure' }.configureEach {
+        dependsOn 'prepareSkiaSvg'
+    }
+}
+
+// fetch/verify/update tasks from the old Skija world are intentionally
+// not re-introduced. If we ever vendor a Skia binary distribution
+// (e.g. via a GitHub Release attachment) we'll add a fetchSkia task
+// then — but for now Skia is purely a local-toolchain dependency.
