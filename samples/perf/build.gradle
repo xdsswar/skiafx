@@ -1,14 +1,19 @@
 /*
- * samples/perf — performance benchmarks.
+ * samples/perf — rendering-pipeline benchmark scenes.
  *
- * Houses:
- *   - 300fps animation harness (existing target from CLAUDE.md)
- *   - copy-counter assertion scenes
- *   - frame-pacing measurement under uncapped mode
- *   - memory soak scenarios
+ * Tasks:
+ *   :samples:perf:runPerfBench   — run one scene, JSON metrics on stdout
  *
- * Outputs JSON metrics consumed by `./gradlew runPerfBench` (TBD)
- * for trending in CI.
+ * Scene + run options (forwarded as system properties):
+ *   -Pperf.scene=static|scroll|fade|full   scene to run (default static)
+ *   -Pperf.seconds=20                      sample window after warm-up
+ *   -Pperf.out=path                        also write JSON lines to a file
+ *   -Pperf.width / -Pperf.height           scene size (default 1920x1080)
+ *   -Pperf.cpu=true                        force the software-raster path
+ *                                          (-Dprism.skia.gpu=false)
+ *
+ * Do NOT combine with -Dskia.verbose: the verbose FPS logger consumes the
+ * Copies counters that this harness reads.
  */
 
 plugins {
@@ -29,15 +34,91 @@ application {
         '-Dprism.order=skia',
         '-Djavafx.animation.fullspeed=true',
         '--enable-preview',
+        '--enable-native-access=ALL-UNNAMED',
+        '--add-exports', 'javafx.graphics/com.sun.prism.skia.impl=openjfx.samples.perf',
     ]
+}
+
+// PerfMain reads Copies/PaintStats from com.sun.prism.skia.impl (not
+// exported by javafx.graphics's module-info) — same pattern ensemble
+// uses for com.sun.javafx.sg.prism.
+tasks.named('compileJava') {
+    options.compilerArgs += ['--add-exports',
+        'javafx.graphics/com.sun.prism.skia.impl=openjfx.samples.perf']
+}
+
+// ----------------------------------------------------------------------
+// Dev-tree run config (mirrors samples/ensemble): launch against in-tree
+// build outputs, pointing java.library.path at the javafx.graphics native
+// dir and NativeBridge at the Skia bridge DLL.
+// ----------------------------------------------------------------------
+def repoRoot = rootDir
+def hostOs   = System.getProperty('os.name').toLowerCase()
+def hostPlat = hostOs.contains('win')  ? 'win'
+            : hostOs.contains('mac')   ? 'mac'
+            : 'linux'
+def hostArch = (System.getProperty('os.arch') in ['x86_64', 'amd64']) ? 'x64' : 'arm64'
+def graphicsLib = new File(repoRoot,
+    "javafx.graphics/build/native/${hostPlat}-${hostArch}/lib")
+def skiaBridgeName = hostPlat == 'win'  ? 'openjfx_skia_shared.dll'
+                   : hostPlat == 'mac'  ? 'libopenjfx_skia_shared.dylib'
+                                        : 'libopenjfx_skia_shared.so'
+def skiaBridge  = new File(graphicsLib, skiaBridgeName)
+
+// Forwardable run options, resolved at configuration time (config-cache
+// safe: providers, no Project access at execution time).
+def perfProps = ['perf.scene', 'perf.seconds', 'perf.out',
+                 'perf.width', 'perf.height'].collectEntries { k ->
+    def v = providers.gradleProperty(k)
+             .orElse(providers.systemProperty(k))
+             .getOrNull()
+    [(k): v]
+}.findAll { it.value != null }
+def perfCpu = providers.gradleProperty('perf.cpu')
+               .orElse(providers.systemProperty('perf.cpu'))
+               .getOrNull() == 'true'
+
+def applyPerfRunConfig = { JavaExec t ->
+    t.doFirst {
+        systemProperty 'java.library.path', graphicsLib.absolutePath
+        if (skiaBridge.exists()) {
+            systemProperty 'openjfx.skia.nativeLib', skiaBridge.absolutePath
+        }
+    }
+    perfProps.each { k, v -> t.systemProperty k, v }
+    if (perfCpu) {
+        t.systemProperty 'prism.skia.gpu', 'false'
+    }
+}
+
+tasks.named('run') {
+    applyPerfRunConfig(it)
 }
 
 tasks.register('runPerfBench', JavaExec) {
     group = 'verification'
-    description = 'Run perf benchmarks and emit JSON metrics for trending.'
+    description = 'Run one benchmark scene and emit JSON metrics for trending.'
+    dependsOn 'classes'
     classpath = sourceSets.main.runtimeClasspath
-    mainClass = 'org.openjfx.samples.perf.PerfMain'
-    systemProperty 'perf.outputFormat', 'json'
+    mainClass.set('org.openjfx.samples.perf.PerfMain')
+    mainModule.set('openjfx.samples.perf')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED',
+        '--add-exports', 'javafx.graphics/com.sun.prism.skia.impl=openjfx.samples.perf'
+    systemProperty 'prism.order', 'skia'
+    systemProperty 'javafx.animation.fullspeed', 'true'
+    applyPerfRunConfig(it)
+}
+
+tasks.register('runRasterFillBench', JavaExec) {
+    group = 'verification'
+    description = 'Microbenchmark the native CPU raster fill paths (solid vs gradient), headless.'
+    dependsOn 'classes'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.perf.RasterFillBench')
+    mainModule.set('openjfx.samples.perf')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED',
+        '--add-exports', 'javafx.graphics/com.sun.prism.skia.impl=openjfx.samples.perf'
+    applyPerfRunConfig(it)
 }
 
 description = 'Performance benchmarks and copy-counter target scenes.'

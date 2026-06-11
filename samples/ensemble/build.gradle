@@ -158,6 +158,68 @@ tasks.register('runDualPlayer', JavaExec) {
     mainClass.set('org.openjfx.samples.ensemble.DualStreamPlayer')
     mainModule.set('openjfx.samples.ensemble')
     jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    // Forward source prefill + diagnostics (-P<k>=... or -D<k>=... on the
+    // gradlew command line). dual.video/dual.audio prefill the fields and
+    // auto-load on start; dual.urlfile points at a text file whose first
+    // URL line is the video and second the audio.
+    // skia.media.d3d11ZeroCopy=false routes hw-decoded frames through the
+    // copy-back path instead of WGL_NV_DX_interop2 — the interop layer can
+    // hang the FX thread (and the desktop) on swap-chain resize, e.g. when
+    // leaving fullscreen during 4K playback.
+    ['dual.video', 'dual.audio', 'dual.urlfile', 'skia.verbose',
+     'dual.seektest', 'skia.media.d3d11ZeroCopy', 'skia.media.decode'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    // Native pipeline diagnostics are read with getenv() in jfxmedia —
+    // forward as an ENVIRONMENT variable (accepts -POPENJFX_MEDIA_VERBOSE=1
+    // too, daemon-proof).
+    ['OPENJFX_MEDIA_VERBOSE', 'OPENJFX_MEDIA_DUAL_DEFAULTS',
+     'OPENJFX_MEDIA_AUDIO_BUFFER_MS', 'OPENJFX_MEDIA_AUDIO_QUEUE_TIME',
+     'OPENJFX_MEDIA_PREBUFFER_TIME', 'OPENJFX_MEDIA_SCALETEMPO',
+     'OPENJFX_MEDIA_USE_HWACCEL', 'SKIA_MEDIA_DEBUG'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runMixerDemo', JavaExec) {
+    group = 'application'
+    description = 'Launch MixerDemo (MediaMixer: audio + video files -> mp4).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.MixerDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    ['mixer.audio', 'mixer.video', 'mixer.out'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runMediaStress', JavaExec) {
+    group = 'application'
+    description = 'Media hardening harness: -Dstress.mode=stress|corpus (see MediaStressApp).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.MediaStressApp')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    ['stress.mode', 'stress.media', 'stress.dir', 'stress.iterations', 'stress.generate'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    // Surface native diagnostics during harness runs.
+    ['OPENJFX_MEDIA_VERBOSE', 'SKIA_MEDIA_DEBUG', 'OPENJFX_MEDIA_STALL_TIMEOUT'].each { k ->
+        def v = System.getenv(k)
+        if (v != null) environment k, v
+    }
     applyDevTreeRunConfig(it)
 }
 
@@ -175,7 +237,10 @@ tasks.register('runLoaderDemo', JavaExec) {
 tasks.register('runWebView', JavaExec) {
     group = 'application'
     description = 'Launch WebViewDemo (exercises batch 4 image + batch 5 text/emoji native paths).'
-    dependsOn 'classes'
+    // The Blink engine bundle ships INSIDE javafx.web's (per-platform) module
+    // jar; BlinkBundle reads it via its own jar's resources. Build it so a
+    // clean dev tree can launch the engine.
+    dependsOn 'classes', ':javafx.web:jar'
     classpath  = sourceSets.main.runtimeClasspath
     mainClass.set('org.openjfx.samples.ensemble.WebViewDemo')
     mainModule.set('openjfx.samples.ensemble')
@@ -239,11 +304,45 @@ tasks.register('runShowcase', JavaExec) {
     // Tag the benchmark CSV as the skia-fx run for A/B comparison.
     systemProperty 'showcase.bench.label', 'skia-fx'
     // Forward optional benchmark knobs from -P<k>=... or -D<k>=...
+    // prism.skia.gpu=false runs the showcase on the CPU software-raster
+    // tier (same flag runCpuDemo bakes in) for A/B profiling.
     ['showcase.bench.nodes', 'showcase.bench.out', 'showcase.bench.record',
-     'showcase.bench.label'].each { k ->
+     'showcase.bench.label', 'prism.skia.gpu', 'skia.verbose',
+     'skia.paint.diag'].each { k ->
         def v = project.findProperty(k)
         if (v == null) v = System.getProperty(k)
         if (v != null) systemProperty k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runCpuDemo', JavaExec) {
+    group = 'application'
+    description = 'Launch CpuDemo on the CPU rendering path (-Dprism.skia.gpu=false, software raster + readback).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.CpuDemo')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    // Skip every GPU tier (D3D12 swap chain, GL direct, GPU readback) so
+    // the whole frame is rasterized by Skia on the CPU and presented via
+    // the readback blit — the path a GPU-less / driver-broken machine gets.
+    systemProperty 'prism.skia.gpu', 'false'
+    // Optional diagnostics, forwarded from -P<k>=... or -D<k>=...
+    ['skia.verbose', 'skia.paint.diag', 'skia.raster.bgra',
+     'skia.partial.present', 'prism.dirtyopts',
+     'javafx.pulseLogger', 'javafx.pulseLogger.threshold'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    // Native-side diagnostics (read with getenv in the C++ bridge) — must
+    // reach the forked JVM as environment variables. Same pattern as
+    // runWebView.
+    ['OPENJFX_SKIA_DRAW_DIAG', 'OPENJFX_SKIA_PRESENT_DIAG'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
     }
     applyDevTreeRunConfig(it)
 }

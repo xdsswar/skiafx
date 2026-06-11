@@ -11,27 +11,26 @@ import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Scene;
 import javafx.scene.control.*;
+import javafx.scene.input.*;
 import javafx.scene.layout.*;
 import javafx.scene.shape.SVGPath;
 import javafx.scene.text.Text;
 import javafx.scene.text.TextFlow;
-import javafx.scene.web.ContextMenuContext;
-import javafx.scene.web.DownloadRequest;
-import javafx.scene.web.NetworkExchange;
-import javafx.scene.web.NetworkFilter;
-import javafx.scene.web.NetworkInterceptor;
-import javafx.scene.web.WebEngine;
-import javafx.scene.web.WebHistory;
-import javafx.scene.web.WebView;
+import javafx.scene.web.*;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 import javafx.util.Subscription;
 
 import netscape.javascript.JSObject;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 /**
  * Browser-style demo for the Blink-backed {@code WebView}: a gradient hero band
@@ -64,12 +63,13 @@ public class WebViewDemo extends Application<Stage> {
         "M15.5 14h-.79l-.28-.27a6.5 6.5 0 1 0-.7.7l.27.28v.79l5 4.99L20.49 19l-4.99-5z"
             + "m-6 0A4.5 4.5 0 1 1 14 9.5 4.5 4.5 0 0 1 9.5 14z";
 
-    // URL globs for common ad / tracker endpoints, blocked by the demo's
-    // NetworkInterceptor. Glob: '*' = any run. Matched against the full URL.
-    // Includes a few YouTube ad/telemetry endpoints (e.g. /pagead/, stats/ads).
-    // This is a demo of the Network facade, not a complete ad blocker — YouTube
-    // serves video and ads from the same hosts, so some ads still get through.
-    private static final String[] AD_PATTERNS = {
+    // Classpath resource holding the ad/tracker block list (one entry per line;
+    // see the file's header for the format). Built from Peter Lowe's ad-server
+    // list plus YouTube-specific URL globs; loaded once on first use.
+    private static final String AD_LIST_RESOURCE = "ad-block-list.txt";
+
+    // Minimal fallback patterns if the resource is missing from the classpath.
+    private static final String[] AD_PATTERNS_FALLBACK = {
         "*doubleclick.net/*",
         "*googlesyndication.com/*",
         "*googleadservices.com/*",
@@ -85,6 +85,9 @@ public class WebViewDemo extends Application<Stage> {
         "*youtube.com/ptracking*",
         "*youtube.com/get_midroll*",
     };
+
+    /** Lazily loaded URL globs from {@link #AD_LIST_RESOURCE}. */
+    private static List<String> adPatterns;
 
     /** Active ad-block registration (null when off) and a running blocked count. */
     private Subscription adBlockSub;
@@ -335,6 +338,49 @@ public class WebViewDemo extends Application<Stage> {
             blockAds.setOnAction(a -> setAdBlockEnabled(!isAdBlockOn(), engine));
             menu.getItems().addAll(homeItem, blockAds);
         });
+
+        // ---- Page-driven fullscreen (e.g. YouTube's fullscreen button) ------
+        // When a page requests fullscreen we put the Stage into fullscreen AND
+        // hide the browser chrome (toolbar / footer / side dock) so the WebView —
+        // and the video inside it — fills the entire screen, exactly like a real
+        // browser. Driving the chrome's visibility off a listener on the Stage's
+        // fullScreen property keeps it correct no matter what flips that property
+        // (a page request below, or the Esc handling further down).
+        stage.fullScreenProperty().addListener((o, was, full) -> {
+            boolean chrome = !full;
+            toolbar.setVisible(chrome);  toolbar.setManaged(chrome);
+            footer.setVisible(chrome);   footer.setManaged(chrome);
+            sideDock.setVisible(chrome); sideDock.setManaged(chrome);
+        });
+
+        // Let the page's own controls drive fullscreen the way a real browser
+        // does: suppress JavaFX's built-in exit hint, and route Esc back into the
+        // page (document.exitFullscreen) instead of letting JavaFX drop out of
+        // fullscreen behind the page's back — which would leave YouTube's UI
+        // thinking it is still fullscreen. If nothing in the page is fullscreen,
+        // Esc just leaves the Stage's fullscreen directly.
+        stage.setFullScreenExitHint("");
+        stage.setFullScreenExitKeyCombination(KeyCombination.NO_MATCH);
+        scene.addEventFilter(KeyEvent.KEY_PRESSED, e -> {
+            if (e.getCode() == KeyCode.ESCAPE && stage.isFullScreen()) {
+                Object el = null;
+                try {
+                    el = engine.executeScript("document.fullscreenElement");
+                } catch (Exception ignore) {
+                    // executeScript may be unavailable mid-navigation
+                }
+                if (el != null) {
+                    engine.executeScript("document.exitFullscreen();");
+                } else {
+                    stage.setFullScreen(false);
+                }
+                e.consume();
+            }
+        });
+
+        // A page enters/exits fullscreen (the Fullscreen API) → mirror it on the
+        // Stage; the listener above shows/hides the chrome to match.
+        engine.setFullscreenHandler(request -> stage.setFullScreen(request.isEntering()));
     }
 
     /**
@@ -419,6 +465,51 @@ public class WebViewDemo extends Application<Stage> {
     }
 
     /**
+     * Loads the block list from {@link #AD_LIST_RESOURCE} (system class loader,
+     * same reasoning as the CSS lookup in {@code start()}). Lines with a {@code *}
+     * are URL globs used as-is; bare lines are ad-server domains, each expanded to
+     * {@code *://<domain>/*} (exact host) and {@code *.<domain>/*} (subdomains —
+     * the leading dot prevents prefix false-positives like "loads.com" matching
+     * "ads.com"). Falls back to {@link #AD_PATTERNS_FALLBACK} when missing.
+     */
+    private static List<String> adPatterns() {
+        if (adPatterns != null) {
+            return adPatterns;
+        }
+        List<String> globs = new ArrayList<>();
+        InputStream in = ClassLoader.getSystemResourceAsStream(AD_LIST_RESOURCE);
+        if (in != null) {
+            try (BufferedReader r = new BufferedReader(
+                    new InputStreamReader(in, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = r.readLine()) != null) {
+                    line = line.trim();
+                    if (line.isEmpty() || line.startsWith("#")) {
+                        continue;
+                    }
+                    if (line.indexOf('*') >= 0 || line.indexOf('?') >= 0) {
+                        globs.add(line);
+                    } else {
+                        globs.add("*://" + line + "/*");
+                        globs.add("*." + line + "/*");
+                    }
+                }
+            } catch (Exception ex) {
+                System.err.println("[ad-block] failed reading " + AD_LIST_RESOURCE
+                    + ": " + ex);
+            }
+        }
+        if (globs.isEmpty()) {
+            System.err.println("[ad-block] " + AD_LIST_RESOURCE
+                + " not found on classpath — using built-in fallback patterns");
+            globs.addAll(List.of(AD_PATTERNS_FALLBACK));
+        }
+        System.out.println("[ad-block] " + globs.size() + " URL patterns loaded");
+        adPatterns = globs;
+        return globs;
+    }
+
+    /**
      * Turns the ad/tracker blocker on or off and keeps the toggle button in sync,
      * whether driven from the toolbar button or the context menu. Registering on
      * the engine's {@link javafx.scene.web.Network} arms interception for the
@@ -428,14 +519,20 @@ public class WebViewDemo extends Application<Stage> {
     private void setAdBlockEnabled(boolean on, WebEngine engine) {
         if (on && adBlockSub == null) {
             NetworkFilter.Builder b = NetworkFilter.builder();
-            for (String p : AD_PATTERNS) {
+            for (String p : adPatterns()) {
                 b.includeUrlPattern(p);
             }
+            // Per-block logging only under -Dskia.verbose=true: with the full
+            // block list a single page can block hundreds of requests, which
+            // would otherwise bury the console.
+            final boolean verbose = Boolean.getBoolean("skia.verbose");
             adBlockSub = engine.getNetwork().add(b.build(), new NetworkInterceptor() {
                 @Override public void onRequest(NetworkExchange ex) {
                     adsBlocked++;
+                    if (verbose) {
+                        System.out.println("[ad-block] blocked " + ex.request().url());
+                    }
                     // Callbacks run on the FX thread, so updating the button is safe.
-                    System.out.println("[ad-block] blocked " + ex.request().url());
                     if (adBlockBtn != null) {
                         adBlockBtn.setText("Ad-block: " + adsBlocked);
                     }

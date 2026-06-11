@@ -28,6 +28,11 @@ public final class MediaFfmpegConfig {
     private static native void nativeSetEnv(String name, String value);
 
     private static volatile Boolean initialized;
+    // Directory of the last FAILED attempt. Success latches forever, but
+    // a failure must be retryable with a NEW directory — the failure
+    // message itself tells the user to call Media.setFfmpegDirectory()
+    // and try again, which would be a lie if the first failure latched.
+    private static volatile String lastFailedDir;
 
     /**
      * Best-effort load of ffmpeg DLLs.
@@ -40,7 +45,8 @@ public final class MediaFfmpegConfig {
      *         result if they're happy to fall through to mfwrapper.
      */
     public static boolean initialize(String userDir) {
-        if (initialized != null) return initialized;
+        Boolean done = initialized;
+        if (done != null && done.booleanValue()) return true;
         String dir = userDir;
         String src = "argument";
         if (dir == null || dir.isBlank()) {
@@ -50,6 +56,15 @@ public final class MediaFfmpegConfig {
         if (dir == null || dir.isBlank()) {
             dir = System.getenv("OPENJFX_MEDIA_FFMPEG_DIR");
             src = "env var";
+        }
+        if (done != null) {
+            // Previous attempt failed: retry only when pointed at a NEW
+            // directory (setFfmpegDirectory / property changed since).
+            String failed = lastFailedDir;
+            if (dir == null || dir.isBlank()
+                    || (failed != null && failed.equals(dir))) {
+                return false;
+            }
         }
         if (isDebugEnabled()) {
             System.err.println("[MediaFfmpegConfig] resolved ffmpeg dir from " + src
@@ -97,7 +112,11 @@ public final class MediaFfmpegConfig {
         propagateDecodeMode();
 
         try {
-            initialized = nativeInit(dir);
+            boolean ok = nativeInit(dir);
+            if (!ok) {
+                lastFailedDir = dir;
+            }
+            initialized = ok;
         } catch (UnsatisfiedLinkError ule) {
             System.err.println("[MediaFfmpegConfig] nativeInit not bound: " + ule);
             return false;
@@ -181,4 +200,23 @@ public final class MediaFfmpegConfig {
     public static boolean isAvailable() {
         return initialized != null && initialized.booleanValue();
     }
+
+    /**
+     * The native loader's human-readable status — where ffmpeg loaded
+     * from and which versions, or precisely why the load failed (ABI
+     * mismatch, mixed builds, missing DLLs). {@code null} when no load
+     * has been attempted yet.
+     */
+    public static String getStatus() {
+        if (initialized == null) {
+            return null;
+        }
+        try {
+            return nativeGetStatus();
+        } catch (UnsatisfiedLinkError ule) {
+            return null;
+        }
+    }
+
+    private static native String nativeGetStatus();
 }

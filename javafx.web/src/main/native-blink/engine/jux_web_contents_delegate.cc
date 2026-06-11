@@ -437,6 +437,16 @@ void JuxWebContentsDelegate::DOMContentLoaded(
   // Skipping the request when detached honors that contract.
   if (callbacks_) {
     JuxRequestDomTree(handle_);
+  } else {
+    // Detached page (the off-screen print preview): never surface DOM data
+    // to Java — but the renderer's document listeners (the capture-phase
+    // mousedown powering the engine-drawn <select> dropdown) only arm once
+    // the DOM pipe is bound, and for attached pages that binding rode on the
+    // JuxRequestDomTree call this guard skips. Bind the pipe WITHOUT
+    // requesting the tree so the preview's selects keep working. (This is
+    // what the pre-guard code did implicitly; the guard's leak fix and the
+    // dropdowns are both preserved.)
+    JuxBindDomPipe(handle_);
   }
 }
 

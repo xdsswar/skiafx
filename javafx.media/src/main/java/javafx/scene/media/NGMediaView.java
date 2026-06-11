@@ -43,6 +43,17 @@ class NGMediaView extends NGNode {
     private MediaPlayer player;
     private MediaFrameTracker frameTracker;
 
+    // skia-fx: the decoded frame's DISPLAY size, published by the render
+    // thread (renderContent) and read by the layout thread (setViewport)
+    // to drive the preserve-ratio aspect. The decode pipeline reports
+    // these PAR-corrected (VideoDataBuffer.getWidth/getHeight), so they
+    // give the true on-screen aspect even for anamorphic / non-square-
+    // pixel content — unlike Media.getWidth/getHeight, which are the
+    // encoded pixel dimensions. Volatile ints: a benign cross-thread
+    // race that at worst sizes one frame with the previous aspect.
+    private volatile int frameDisplayW = 0;
+    private volatile int frameDisplayH = 0;
+
     public void renderNextFrame() {
         visualsChanged();
     }
@@ -115,20 +126,38 @@ class NGMediaView extends NGNode {
             newW = w;
             newH = h;
         } else if (preserveRatio) {
-            // FIXME: we should get the aspect ratio from the Media itself instead of assuming
-            // (JDK-8092177)
+            // skia-fx fix (was JDK-8092177 FIXME_ "assume the aspect ratio"):
+            // derive the aspect from the decoded frame's DISPLAY size when
+            // we have one. The decode pipeline reports it PAR-corrected, so
+            // anamorphic / non-square-pixel video is no longer stretched.
+            // Falls back to the media's encoded width/height (the old
+            // assumption) until the first frame arrives, and only when no
+            // explicit viewport (vw/vh) was supplied — an app-set viewport
+            // is authoritative. Square-pixel content is unaffected: the
+            // frame's display dims equal the encoded dims, so the result is
+            // byte-identical to the previous behaviour.
+            float arW = w;
+            float arH = h;
+            if (vw <= 0 || vh <= 0) {
+                int fw = frameDisplayW;
+                int fh = frameDisplayH;
+                if (fw > 0 && fh > 0) {
+                    arW = fw;
+                    arH = fh;
+                }
+            }
             if (fitWidth <= 0.0) {
-                newW = h > 0 ? w * (fitHeight / h) : 0.0f;
+                newW = arH > 0 ? arW * (fitHeight / arH) : 0.0f;
                 newH = fitHeight;
             } else if (fitHeight <= 0.0) {
                 newW = fitWidth;
-                newH = w > 0 ? h * (fitWidth / w) : 0.0f;
+                newH = arW > 0 ? arH * (fitWidth / arW) : 0.0f;
             } else {
-                if (w == 0.0f) w = fitWidth;
-                if (h == 0.0f) h = fitHeight;
-                float scale = Math.min(fitWidth / w, fitHeight / h);
-                newW = w * scale;
-                newH = h * scale;
+                if (arW == 0.0f) arW = fitWidth;
+                if (arH == 0.0f) arH = fitHeight;
+                float scale = Math.min(fitWidth / arW, fitHeight / arH);
+                newW = arW * scale;
+                newH = arH * scale;
             }
         } else if (fitHeight <= 0.0) {
             newH = h;
@@ -167,6 +196,12 @@ class NGMediaView extends NGNode {
         if (null == frame) {
             return;
         }
+
+        // Publish the true display size for the preserve-ratio aspect in
+        // setViewport (see the fields' comment). Picked up on the next
+        // layout pass; a no-op for square-pixel content.
+        frameDisplayW = frame.getWidth();
+        frameDisplayH = frame.getHeight();
 
         // Note: the producer's view-size hint channel (MediaTargetSize)
         // used to be published from here on every render pulse. With

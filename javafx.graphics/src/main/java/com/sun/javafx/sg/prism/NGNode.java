@@ -44,10 +44,12 @@ import com.sun.javafx.geom.transform.NoninvertibleTransformException;
 import com.sun.javafx.tk.quantum.QuantumToolkit;
 import com.sun.prism.CompositeMode;
 import com.sun.prism.skia.SkiaGraphics;
+import com.sun.prism.skia.impl.SkiaGpu;
 import com.sun.prism.Graphics;
 import com.sun.prism.GraphicsPipeline;
 import com.sun.prism.RTTexture;
 import com.sun.prism.ReadbackGraphics;
+import com.sun.prism.impl.Disposer;
 import com.sun.prism.impl.PrismSettings;
 import com.sun.scenario.effect.Blend;
 import com.sun.scenario.effect.Effect;
@@ -253,6 +255,81 @@ public abstract class NGNode {
      * only set this if the application has requested that the node be cached.
      */
     private CacheFilter cacheFilter;
+
+    // ---- skia-fx: CPU-only automatic subtree bitmap caching --------------
+    // When the pipeline is on the software-raster path, an expensive subtree
+    // that is being faded (group opacity < 1) is re-rasterized in full every
+    // frame (NGNode.renderOpacity rebuilds an offscreen each frame). For such
+    // nodes we auto-attach a bitmap cache so the fade becomes a cheap cached
+    // blit, then auto-detach when the fade ends so the at-rest frame is
+    // pixel-identical to the uncached path.
+    //
+    // The auto cache lives in its OWN field, written ONLY on the render
+    // thread (maybeAutoCache, called from doRender). The app-owned
+    // cacheFilter stays FX-thread-owned, so the two threads never write the
+    // same field (the race that sank the first landing of this feature).
+    // getCacheFilter() returns the effective filter: the app's wins, and the
+    // render thread detaches the auto cache the moment an app cache appears.
+    private CacheFilter autoCacheFilter;     // render-thread-only writes
+    private AutoCacheRecord autoCacheRec;    // lifecycle owner (leak-proof)
+    private int autoCacheHot;                // consecutive eligible frames
+
+    // Policy (overridable for tuning; no rebuild needed).
+    private static final boolean AUTO_CACHE_ENABLED =
+            !"false".equals(System.getProperty("skia.autocache"));
+    private static final int AUTO_CACHE_ATTACH_FRAMES =
+            Integer.getInteger("javafx.autocache.attachFrames", 3);
+    // Logical px^2 bounds: below MIN a full re-raster is cheap and the texture
+    // alloc/blit overhead dominates; above MAX the cache texture itself is a
+    // memory hazard so leave such a node uncached.
+    private static final float AUTO_CACHE_MIN_AREA_PX =
+            Integer.getInteger("javafx.autocache.minArea", 256 * 256);
+    private static final float AUTO_CACHE_MAX_AREA_PX =
+            Integer.getInteger("javafx.autocache.maxArea", 4096 * 4096);
+    private static final int AUTO_CACHE_MIN_CHILDREN =
+            Integer.getInteger("javafx.autocache.minChildren", 8);
+
+    /**
+     * Owns the auto cache's disposal across every exit path: normal detach
+     * (render thread), {@link NGNode#release()} (FX thread enqueues, render
+     * thread disposes via {@link Disposer#disposeRecord}), and node GC (the
+     * record is registered with {@link Disposer#addRecord} keyed on the
+     * node). One record per node, reused across attach/detach cycles so a
+     * pulsing fade doesn't accumulate disposer entries. All methods
+     * idempotent; dispose() permanently kills the record so a released node
+     * can never re-attach.
+     */
+    private static final class AutoCacheRecord implements Disposer.Record {
+        private CacheFilter filter;   // non-null while attached
+        private boolean dead;         // node released / collected
+
+        /** Render thread: adopt a freshly created filter. False if dead. */
+        synchronized boolean attach(CacheFilter f) {
+            if (dead) return false;
+            filter = f;
+            return true;
+        }
+
+        /** Render thread: dispose the filter + release the registry slot. */
+        synchronized void detach() {
+            if (filter != null) {
+                filter.dispose();
+                filter = null;
+                AutoCacheRegistry.release();
+            }
+        }
+
+        /** Disposer (render thread): terminal cleanup. */
+        @Override public synchronized void dispose() {
+            dead = true;
+            if (filter != null) {
+                filter.dispose();
+                filter = null;
+                AutoCacheRegistry.release();
+            }
+        }
+    }
+    // ---------------------------------------------------------------------
 
     /**
      * A filter used whenever an effect is placed on the node. Of course
@@ -704,7 +781,16 @@ public abstract class NGNode {
     public final float getOpacity() { return opacity; }
     public final Blend.Mode getNodeBlendMode() { return nodeBlendMode; }
     public final boolean isDepthTest() { return depthTest; }
-    public final CacheFilter getCacheFilter() { return cacheFilter; }
+    /**
+     * The effective cache filter: the app-owned one (set via
+     * {@code Node.setCache}) wins; otherwise the render-thread auto cache,
+     * if attached (software path only). Render-path dispatch, dirty-bounds
+     * computation and invalidation all route through this so the auto cache
+     * behaves exactly like an app cache while attached.
+     */
+    public final CacheFilter getCacheFilter() {
+        return cacheFilter != null ? cacheFilter : autoCacheFilter;
+    }
     public final EffectFilter getEffectFilter() { return effectFilter; }
     public final NGNode getClipNode() { return clipNode; }
 
@@ -997,8 +1083,12 @@ public abstract class NGNode {
      * reconstructed.
      */
     protected final void invalidateCache() {
-        if (cacheFilter != null) {
-            cacheFilter.invalidate();
+        // Route through the effective filter so a content change reaches an
+        // attached auto cache too (runs during FX-thread sync, render thread
+        // parked — the pulse handoff publishes the read safely).
+        CacheFilter cf = getCacheFilter();
+        if (cf != null) {
+            cf.invalidate();
         }
     }
 
@@ -1326,8 +1416,11 @@ public abstract class NGNode {
                                           final BaseTransform tx,
                                           final GeneralTransform3D pvTx)
     {
-        if (cacheFilter != null) {
-            return cacheFilter.computeDirtyBounds(dirtyRegionTemp, tx, pvTx);
+        // Effective filter: dirty bounds must match what renderCached will
+        // actually draw, including an attached auto cache.
+        CacheFilter cf = getCacheFilter();
+        if (cf != null) {
+            return cf.computeDirtyBounds(dirtyRegionTemp, tx, pvTx);
         }
         // The passed in region is a scratch object that exists for me to use,
         // such that I don't have to create a temporary object. So I just
@@ -2096,6 +2189,11 @@ public abstract class NGNode {
         // The clip must be below the cache filter, as this is expected in the
         // CacheFilter in order to apply scrolling optimization
         g.transform(getTransform());
+        // skia-fx: on the software-raster path, auto-attach/detach a bitmap
+        // cache for expensive animating (fading) subtrees BEFORE the dispatch
+        // cascade below, so an attach/detach takes effect this same frame. A
+        // no-op (one volatile read) on the GPU path.
+        maybeAutoCache();
         // Try to keep track of whether this node was *really* painted. Still an
         // approximation, but somewhat more accurate (at least it doesn't include
         // groups which don't paint anything themselves).
@@ -2405,6 +2503,111 @@ public abstract class NGNode {
         Effect.releaseCompatibleImage(fctx, img);
     }
 
+    /**
+     * skia-fx: CPU-only automatic subtree bitmap caching.
+     *
+     * <p>On the software-raster path only, attach a {@link CacheFilter} to an
+     * expensive subtree that is being faded (group opacity &lt; 1) with stable
+     * content, so the per-frame full re-rasterization in {@link #renderOpacity}
+     * is replaced by a reused cached blit; detach it again once the animation
+     * stops so the at-rest frame renders through the normal {@link #renderContent}
+     * path (pixel-identical to the uncached pipeline). Reuses the existing
+     * CacheFilter wholesale (HiDPI, invalidation, memory budgeting, lifecycle).</p>
+     *
+     * <p>Render-thread only — this is the sole writer of
+     * {@link #autoCacheFilter}; the app-owned {@link #cacheFilter} is never
+     * touched here. The GPU path returns after one volatile read and never
+     * reaches the auto-cache fields, so its behaviour is byte-identical.</p>
+     */
+    private void maybeAutoCache() {
+        // GPU / parity gate first — the only cost paid on the GPU path.
+        if (!AUTO_CACHE_ENABLED || !SkiaGpu.isResolvedSoftware()) {
+            return;
+        }
+        // An app-owned cache (Node.setCache) always wins: drop ours. The
+        // separate-field design makes this reconciliation automatic — we
+        // never dispose or null the app's filter.
+        if (cacheFilter != null) {
+            if (autoCacheFilter != null) detachAutoCache(); else autoCacheHot = 0;
+            return;
+        }
+        // Only aggregating groups (Group/Region) hold a costly subtree worth
+        // flattening; leaf shapes/text gain nothing from a cache + blit.
+        if (!(this instanceof NGGroup)) {
+            if (autoCacheFilter != null) detachAutoCache(); else autoCacheHot = 0;
+            return;
+        }
+        // Structural disqualifiers: a cached flatten could differ from the
+        // uncached result, or interacts badly with these paths. Stay conservative.
+        if (needsBlending() || isShape3D() || !isContentBounds2D()
+                || getEffectFilter() != null || getClipNode() != null) {
+            if (autoCacheFilter != null) detachAutoCache(); else autoCacheHot = 0;
+            return;
+        }
+        // Size / child-count band: skip the cheap, the pathologically large,
+        // and the structurally trivial.
+        float area = transformedBounds.getWidth() * transformedBounds.getHeight();
+        if (area < AUTO_CACHE_MIN_AREA_PX || area > AUTO_CACHE_MAX_AREA_PX
+                || ((NGGroup) this).getChildren().size() < AUTO_CACHE_MIN_CHILDREN) {
+            if (autoCacheFilter != null) detachAutoCache(); else autoCacheHot = 0;
+            return;
+        }
+
+        // Trigger (conservative): group opacity < 1 (a fade) with stable
+        // content. The uncached path for opacity < 1 (renderOpacity) ALSO
+        // flattens the subtree to an offscreen, so a cached flatten is
+        // pixel-equivalent — and far cheaper since it is reused instead of
+        // rebuilt every frame. A content change (childDirty) would rebuild the
+        // cache every frame (a net loss), so it must be stable to attach.
+        boolean fading = getOpacity() < 1f;
+
+        if (autoCacheFilter != null) {
+            // Detach the instant the fade ends. This runs before the dispatch
+            // cascade, so THIS frame already renders full-fidelity. The
+            // opacity->1 change marked the node dirty, so it is being painted
+            // this frame — the settled frame is pixel-identical to the
+            // uncached pipeline with no extra repaint.
+            if (!fading) {
+                detachAutoCache();
+            }
+            return;
+        }
+
+        if (fading && !childDirty) {
+            if (++autoCacheHot >= AUTO_CACHE_ATTACH_FRAMES
+                    && AutoCacheRegistry.tryAcquire()) {
+                if (autoCacheRec == null) {
+                    autoCacheRec = new AutoCacheRecord();
+                    // GC backstop: a node dropped without release() still
+                    // frees its filter + slot when the disposer notices.
+                    Disposer.addRecord(this, autoCacheRec);
+                }
+                CacheFilter f = new CacheFilter(this, CacheHint.SPEED);
+                if (autoCacheRec.attach(f)) {
+                    autoCacheFilter = f;
+                    if (PULSE_LOGGING_ENABLED) {
+                        PulseLogger.incrementCounter("Auto-cache attached (CPU)");
+                    }
+                } else {
+                    // Node was released between checks: clean up immediately.
+                    f.dispose();
+                    AutoCacheRegistry.release();
+                }
+            }
+        } else {
+            autoCacheHot = 0;
+        }
+    }
+
+    /** skia-fx: tear down an auto-attached cache (render thread only). */
+    private void detachAutoCache() {
+        if (autoCacheRec != null) {
+            autoCacheRec.detach();
+        }
+        autoCacheFilter = null;
+        autoCacheHot = 0;
+    }
+
     private void renderCached(Graphics g) {
         // We will punt on 3D completely for caching.
         // The first check is for any of its children contains a 3D Transform.
@@ -2413,7 +2616,42 @@ public abstract class NGNode {
         // bitmaps for the screen and for which there is no cacheFilter.
         if (isContentBounds2D() && g.getTransformNoClone().is2D() &&
                 !(g instanceof com.sun.prism.PrinterGraphics)) {
-            getCacheFilter().render(g);
+            // skia-fx: on the software-raster path, bypass a cache whose
+            // content changed this frame. A cache rebuild (renderNodeToCache)
+            // renders the ENTIRE subtree to a texture, ignoring the screen
+            // dirty region, so a node cached around a continuous animation
+            // (e.g. a perpetual pulse inside a ScrollPane's content cache)
+            // re-rasterizes everything every frame — strictly worse than no
+            // cache. A direct render is dirty-region-limited and far cheaper,
+            // and pixel-identical (the cache would be rebuilt from the same
+            // content). Only when opacity >= 1, so a cache used for group-
+            // opacity flattening (the fade path via renderOpacity) is never
+            // bypassed. GPU path: gated out, byte-identical.
+            if (SkiaGpu.isResolvedSoftware()
+                    && getOpacity() >= 1f
+                    && (dirty == DirtyFlag.DIRTY || childDirty)) {
+                renderCacheBypass(g);
+            } else {
+                getCacheFilter().render(g);
+            }
+        } else {
+            renderContent(g);
+        }
+    }
+
+    /**
+     * skia-fx: render this node as the dispatch cascade would WITHOUT a cache
+     * (clip, else effect, else content) — used to bypass a thrashing cache on
+     * the software path. Mirrors the post-cache order in {@link #doRender} and
+     * in {@link CacheFilter#renderNodeToCache}, so the on-screen result is
+     * pixel-identical to the uncached path; in particular it preserves the
+     * node's clip (skipping it would let content overflow the viewport).
+     */
+    private void renderCacheBypass(Graphics g) {
+        if (getClipNode() != null) {
+            renderClip(g);
+        } else if (getEffectFilter() != null && effectsSupported()) {
+            renderEffect(g);
         } else {
             renderContent(g);
         }
@@ -2512,6 +2750,16 @@ public abstract class NGNode {
      **************************************************************************/
 
     public void release() {
+        // skia-fx: a node leaving the scene mid-fade still owns an auto
+        // cache. This runs on the FX thread (render thread parked for the
+        // sync), so don't dispose the GPU-affine filter here — enqueue its
+        // record; the render thread disposes it on the next pulse's
+        // Disposer.cleanUp() and the registry slot frees. dispose() also
+        // marks the record dead so a released node can never re-attach.
+        if (autoCacheRec != null) {
+            Disposer.disposeRecord(autoCacheRec);
+            autoCacheFilter = null; // safe: node is never rendered again
+        }
     }
 
     @Override public String toString() {

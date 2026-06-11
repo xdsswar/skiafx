@@ -494,6 +494,126 @@ JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinView__1uploadPixels
 
 /*
  * Class:     com_sun_glass_ui_win_WinView
+ * Method:    _uploadPixelsRect
+ * Signature: (JLcom/sun/glass/ui/Pixels;IIII)V
+ *
+ * Partial-blit variant of _uploadPixels for the readback present tier:
+ * only the given rect is pushed through GDI; the rest of the window keeps
+ * its previous (DWM-retained) content. The pixels buffer is always fully
+ * coherent — the caller tracks per-buffer staleness — so transparent
+ * (layered) windows, which UpdateLayeredWindow can only update whole,
+ * simply fall back to the full upload path.
+ */
+JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinView__1uploadPixelsRect
+    (JNIEnv *env, jobject jThis, jlong ptr, jobject jPixels,
+     jint jX, jint jY, jint jW, jint jH)
+{
+    ENTER_MAIN_THREAD()
+    {
+        HWND hWnd = view->GetHostHwnd();
+        if (!::IsWindow(hWnd)) {
+            return;
+        }
+
+        GlassWindow *pWindow = GlassWindow::FromHandle(hWnd);
+        Pixels pixels(GetEnv(), jPixels);
+
+        const int fullW = pixels.GetWidth();
+        const int fullH = pixels.GetHeight();
+
+        // Clamp the rect to the buffer; degenerate -> full blit.
+        int rx = x, ry = y, rw = w, rh = h;
+        if (rx < 0) { rw += rx; rx = 0; }
+        if (ry < 0) { rh += ry; ry = 0; }
+        if (rx + rw > fullW) rw = fullW - rx;
+        if (ry + rh > fullH) rh = fullH - ry;
+        const bool fullBlit = (rw <= 0 || rh <= 0
+                               || (rx == 0 && ry == 0 && rw == fullW && rh == fullH));
+
+        if (!pWindow || !pWindow->IsTransparent()) {
+            BITMAPINFOHEADER bmi;
+            ZeroMemory(&bmi, sizeof(bmi));
+            bmi.biSize = sizeof(bmi);
+            bmi.biPlanes = 1;
+            bmi.biBitCount = 32;
+            bmi.biCompression = BI_RGB;
+
+            HDC hdcDst = ::GetDC(hWnd);
+            if (fullBlit) {
+                bmi.biWidth = fullW;
+                bmi.biHeight = -fullH;
+                ::SetDIBitsToDevice(
+                        hdcDst,
+                        0, 0, fullW, fullH,
+                        0, 0,
+                        0, fullH,
+                        pixels.GetBits(),
+                        (BITMAPINFO*)&bmi, DIB_RGB_COLORS);
+            } else {
+                // Describe a top-down DIB of fullW x rh whose bits start at
+                // the rect's top row (stride preserved via biWidth = fullW).
+                // With cScanLines == dwHeight == rh and ySrc == 0 the
+                // bottom-up-vs-top-down ySrc ambiguity cannot bite: the
+                // whole mini-DIB is the source.
+                bmi.biWidth = fullW;
+                bmi.biHeight = -rh;
+                const BYTE* bits = static_cast<const BYTE*>(pixels.GetBits())
+                                 + static_cast<size_t>(ry) * fullW * 4;
+                ::SetDIBitsToDevice(
+                        hdcDst,
+                        rx, ry, rw, rh,
+                        rx, 0,
+                        0, rh,
+                        bits,
+                        (BITMAPINFO*)&bmi, DIB_RGB_COLORS);
+            }
+            ::ReleaseDC(hWnd, hdcDst);
+        } else { // IsTransparent() == TRUE -> UpdateLayeredWindow needs the whole window
+            RECT rect;
+            ::GetWindowRect(hWnd, &rect);
+            SIZE size = { rect.right - rect.left, rect.bottom - rect.top };
+
+            if (size.cx != fullW || size.cy != fullH) {
+                return;
+            }
+
+            POINT ptSrc = { 0, 0 };
+            POINT ptDst = { rect.left, rect.top };
+
+            BLENDFUNCTION bf;
+            bf.SourceConstantAlpha = pWindow->GetAlpha();
+            bf.AlphaFormat = AC_SRC_ALPHA;
+            bf.BlendOp = AC_SRC_OVER;
+            bf.BlendFlags = 0;
+
+            DIBitmap bitmap(pixels);
+
+            HDC hdcDst = ::GetDC(NULL);
+            HDC hdcSrc = ::CreateCompatibleDC(NULL);
+            HBITMAP oldBitmap = (HBITMAP)::SelectObject(hdcSrc, bitmap);
+
+            ::UpdateLayeredWindow(hWnd, hdcDst, &ptDst, &size, hdcSrc, &ptSrc,
+                    RGB(0, 0, 0), &bf, ULW_ALPHA);
+
+            ::SelectObject(hdcSrc, oldBitmap);
+            ::DeleteDC(hdcSrc);
+            ::ReleaseDC(NULL, hdcDst);
+        }
+    }
+    DECL_jobject(jPixels);
+    jint x, y, w, h;
+    LEAVE_MAIN_THREAD_WITH_view;
+
+    ARG(jPixels) = jPixels;
+    ARG(x) = jX;
+    ARG(y) = jY;
+    ARG(w) = jW;
+    ARG(h) = jH;
+    PERFORM();
+}
+
+/*
+ * Class:     com_sun_glass_ui_win_WinView
  * Method:    _scheduleRepaint
  * Signature: (J)V
  */

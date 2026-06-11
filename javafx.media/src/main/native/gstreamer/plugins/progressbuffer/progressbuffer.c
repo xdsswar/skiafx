@@ -31,6 +31,21 @@
 #define NO_RANGE_REQUEST -1
 #endif
 
+/* skia-fx: cached OPENJFX_MEDIA_VERBOSE gate — getrange/chain are
+ * per-buffer hot paths; never call g_getenv there. */
+static gboolean pb_verbose(void)
+{
+    static gsize once = 0;
+    static gboolean on = FALSE;
+    if (g_once_init_enter(&once))
+    {
+        const gchar* v = g_getenv("OPENJFX_MEDIA_VERBOSE");
+        on = (v != NULL && v[0] != '\0' && v[0] != '0');
+        g_once_init_leave(&once, 1);
+    }
+    return on;
+}
+
 /***********************************************************************************
  * Debug category init
  ***********************************************************************************/
@@ -94,6 +109,25 @@ struct _ProgressBuffer
 
     gboolean      instant_seek;
     gboolean      is_source_seeking;
+
+    // skia-fx: parsed fragmented-mp4 segment index (sidx). Maps seek TIME
+    // to the exact fragment (moof) byte offset, so a TIME seek qtdemux
+    // forwards (it can't byte-seek fragmented mp4 itself) lands on a clean
+    // fragment boundary instead of mid-fragment (which corrupts). Parsed
+    // once, lazily, from the cached file head. See progress_buffer_parse_sidx.
+    gboolean      sidx_parsed;     // parse attempted
+    gboolean      sidx_valid;      // parse succeeded
+    guint32       sidx_timescale;  // ticks per second
+    guint         sidx_count;      // fragment count
+    gint64*       sidx_time;       // [count+1] cumulative start ticks
+    gint64*       sidx_byte;       // [count+1] cumulative start byte offset
+    // The exact TIME (ns) the demuxer asked to seek to, before we snapped it
+    // down to the enclosing fragment's byte. The fragment starts a little
+    // earlier than this; the TIME segment we then emit to qtdemux carries
+    // THIS requested time as its start so the sink clips the pre-target
+    // frames and the video resumes in lock-step with the (sample-accurate)
+    // audio instead of a fragment-length behind. -1 = none pending.
+    gint64        req_seek_time_ns;
 
 #if ENABLE_PULL_MODE
     gint64       range_start;
@@ -262,6 +296,16 @@ static void progress_buffer_init(ProgressBuffer *element)
     element->bandwidth_timer = g_timer_new();
     element->is_source_seeking = FALSE;
 
+    // skia-fx: sidx (fragmented-mp4 fragment index) parsed lazily once the
+    // head is cached; persists across seeks/flushes (head never changes).
+    element->sidx_parsed = FALSE;
+    element->sidx_valid = FALSE;
+    element->sidx_timescale = 0;
+    element->sidx_count = 0;
+    element->sidx_time = NULL;
+    element->sidx_byte = NULL;
+    element->req_seek_time_ns = -1;
+
 #if ENABLE_PULL_MODE
     element->monitor_thread = NULL;
 #endif
@@ -346,6 +390,10 @@ static void progress_buffer_finalize (GObject *object)
     g_cond_clear(&element->add_cond);
     g_timer_destroy(element->bandwidth_timer);
 
+    // skia-fx: release the parsed sidx tables.
+    g_free(element->sidx_time);
+    g_free(element->sidx_byte);
+
     G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
@@ -400,7 +448,7 @@ static gboolean progress_buffer_activatepull_src(GstPad *pad, GstObject *parent,
     {
         g_mutex_lock(&element->lock);
         element->srcresult = GST_FLOW_FLUSHING;
-        g_cond_signal(&element->add_cond);
+        g_cond_broadcast(&element->add_cond);
         g_mutex_unlock(&element->lock);
 
         g_thread_join(element->monitor_thread);
@@ -440,7 +488,7 @@ static gboolean progress_buffer_activatepush_src(GstPad *pad, GstObject *parent,
     {
         g_mutex_lock(&element->lock);
         element->srcresult = GST_FLOW_FLUSHING;
-        g_cond_signal(&element->add_cond);
+        g_cond_broadcast(&element->add_cond);
         g_mutex_unlock(&element->lock);
 
         return gst_pad_stop_task(pad);
@@ -672,7 +720,7 @@ static GstFlowReturn progress_buffer_enqueue_item(ProgressBuffer *element, GstMi
     }
 
     if (signal)
-        g_cond_signal(&element->add_cond);
+        g_cond_broadcast(&element->add_cond);
 
     return GST_FLOW_OK;
 }
@@ -680,6 +728,254 @@ static GstFlowReturn progress_buffer_enqueue_item(ProgressBuffer *element, GstMi
 /***********************************************************************************
  * Seek implementation
  ***********************************************************************************/
+// skia-fx: read exactly n cached bytes at offset into out. Caller holds
+// element->lock. FALSE if the bytes aren't cached yet.
+static gboolean pb_cache_read_exact(ProgressBuffer *element, gint64 offset, guint n, guint8 *out)
+{
+    if (element->cache == NULL)
+        return FALSE;
+    // offset is stream-absolute; the cache window starts at cache_read_offset.
+    // A negative cache position means the head isn't in this window (the
+    // source has range-seeked past it) — fail so the parse retries later.
+    gint64 cachePos = offset - element->cache_read_offset;
+    if (cachePos < 0)
+        return FALSE;
+    GstBuffer *b = NULL;
+    if (cache_read_buffer_from_position(element->cache, cachePos, n, &b) != GST_FLOW_OK || b == NULL)
+        return FALSE;
+    gsize got = gst_buffer_extract(b, 0, out, n);
+    gst_buffer_unref(b); // INLINE - gst_buffer_unref()
+    return got == n;
+}
+
+static inline guint32 pb_rd_be32(const guint8 *p)
+{ return ((guint32)p[0] << 24) | ((guint32)p[1] << 16) | ((guint32)p[2] << 8) | (guint32)p[3]; }
+
+static inline guint64 pb_rd_be64(const guint8 *p)
+{ return ((guint64)pb_rd_be32(p) << 32) | (guint64)pb_rd_be32(p + 4); }
+
+// skia-fx: parse the fragmented-mp4 sidx from the cached head into a
+// time/byte table. Caller holds element->lock. Lazy + one-shot
+// (sidx_parsed latches). Returns sidx_valid.
+static gboolean progress_buffer_parse_sidx(ProgressBuffer *element)
+{
+    if (element->sidx_parsed)
+        return element->sidx_valid;
+    element->sidx_parsed = TRUE; // attempt once (retried only if data was short — see below)
+
+    // Walk top-level boxes from 0 looking for "sidx".
+    gint64 off = 0, sidxOff = -1;
+    guint64 sidxSize = 0;
+    guint  sidxHdr = 8;
+    for (int i = 0; i < 64; i++)
+    {
+        guint8 hdr[16];
+        if (!pb_cache_read_exact(element, off, 8, hdr))
+        { element->sidx_parsed = FALSE; return FALSE; } // head not downloaded yet — retry later
+        guint64 size = pb_rd_be32(hdr);
+        guint hdrLen = 8;
+        if (size == 1)
+        {
+            if (!pb_cache_read_exact(element, off + 8, 8, hdr + 8))
+            { element->sidx_parsed = FALSE; return FALSE; }
+            size = pb_rd_be64(hdr + 8);
+            hdrLen = 16;
+        }
+        if (size < hdrLen) break; // malformed
+        if (memcmp(hdr + 4, "sidx", 4) == 0)
+        { sidxOff = off; sidxSize = size; sidxHdr = hdrLen; break; }
+        off += (gint64) size;
+    }
+    if (sidxOff < 0) return FALSE; // not a fragmented mp4 with a sidx
+
+    // Parse the sidx fullbox.
+    gint64 p = sidxOff + sidxHdr;
+    guint8 vf[4];
+    if (!pb_cache_read_exact(element, p, 4, vf)) { element->sidx_parsed = FALSE; return FALSE; }
+    guint version = vf[0];
+    p += 4;
+    p += 4; // reference_ID
+    guint8 ts[4];
+    if (!pb_cache_read_exact(element, p, 4, ts)) { element->sidx_parsed = FALSE; return FALSE; }
+    guint32 timescale = pb_rd_be32(ts);
+    p += 4;
+    guint64 first_offset;
+    if (version == 0)
+    {
+        guint8 fo[8];
+        if (!pb_cache_read_exact(element, p, 8, fo)) { element->sidx_parsed = FALSE; return FALSE; }
+        first_offset = pb_rd_be32(fo + 4); // [0..3]=earliest_pt, [4..7]=first_offset
+        p += 8;
+    }
+    else
+    {
+        guint8 fo[16];
+        if (!pb_cache_read_exact(element, p, 16, fo)) { element->sidx_parsed = FALSE; return FALSE; }
+        first_offset = pb_rd_be64(fo + 8); // [0..7]=earliest_pt, [8..15]=first_offset
+        p += 16;
+    }
+    guint8 rc[4];
+    if (!pb_cache_read_exact(element, p, 4, rc)) { element->sidx_parsed = FALSE; return FALSE; }
+    guint count = ((guint) rc[2] << 8) | (guint) rc[3]; // reserved(2)+reference_count(2)
+    p += 4;
+    if (timescale == 0 || count == 0 || count > 200000) return FALSE;
+
+    guint8 *refs = (guint8 *) g_try_malloc((gsize) count * 12);
+    if (refs == NULL) return FALSE;
+    if (!pb_cache_read_exact(element, p, count * 12, refs))
+    { g_free(refs); element->sidx_parsed = FALSE; return FALSE; } // refs not fully downloaded — retry later
+
+    element->sidx_time = (gint64 *) g_try_malloc((gsize)(count + 1) * sizeof(gint64));
+    element->sidx_byte = (gint64 *) g_try_malloc((gsize)(count + 1) * sizeof(gint64));
+    if (element->sidx_time == NULL || element->sidx_byte == NULL)
+    { g_free(refs); g_free(element->sidx_time); g_free(element->sidx_byte);
+      element->sidx_time = element->sidx_byte = NULL; return FALSE; }
+
+    gint64 curTime = 0;
+    gint64 curByte = (gint64)(sidxOff + (gint64) sidxSize) + (gint64) first_offset; // first moof
+    for (guint i = 0; i < count; i++)
+    {
+        element->sidx_time[i] = curTime;
+        element->sidx_byte[i] = curByte;
+        guint32 refTypeSize = pb_rd_be32(refs + i * 12);
+        guint32 refSize = refTypeSize & 0x7fffffffu;       // referenced_size
+        guint32 dur     = pb_rd_be32(refs + i * 12 + 4);   // subsegment_duration (ticks)
+        curByte += (gint64) refSize;
+        curTime += (gint64) dur;
+    }
+    element->sidx_time[count] = curTime; // end sentinel
+    element->sidx_byte[count] = curByte;
+    g_free(refs);
+
+    element->sidx_timescale = timescale;
+    element->sidx_count = count;
+    element->sidx_valid = TRUE;
+    if (pb_verbose())
+        g_print("[pb-sidx] %s parsed %u fragments, timescale=%u, firstMoof=%lld, totalDur=%.1fs\n",
+                GST_ELEMENT_NAME(element), count, timescale,
+                (long long) element->sidx_byte[0], (double) curTime / (double) timescale);
+    return TRUE;
+}
+
+// skia-fx: parse the sidx if not yet done, saving/restoring the shared cache
+// read position (the parse reads the cached head, which moves it, and the
+// streaming loop reads sequentially from there). Caller holds element->lock.
+static gboolean progress_buffer_ensure_sidx(ProgressBuffer *element)
+{
+    if (!element->sidx_parsed && element->cache != NULL)
+    {
+        gint64 saved = cache_get_read_position(element->cache);
+        progress_buffer_parse_sidx(element);
+        cache_set_read_position(element->cache, saved);
+    }
+    return element->sidx_valid;
+}
+
+// skia-fx: map a TIME (ns) to the start byte of the fragment containing it,
+// using the parsed sidx. Caller holds element->lock. -1 if unavailable.
+static gint64 progress_buffer_sidx_byte_for_time(ProgressBuffer *element, gint64 timeNs)
+{
+    if (!progress_buffer_ensure_sidx(element))
+        return -1;
+    // target ticks = timeNs * timescale / 1e9
+    gint64 targetTicks = (gint64) gst_util_uint64_scale(
+        (guint64)(timeNs < 0 ? 0 : timeNs), (guint64) element->sidx_timescale, GST_SECOND);
+    // find last fragment whose start <= targetTicks
+    guint lo = 0, hi = element->sidx_count;
+    while (lo + 1 < hi)
+    {
+        guint mid = (lo + hi) / 2;
+        if (element->sidx_time[mid] <= targetTicks) lo = mid; else hi = mid;
+    }
+    return element->sidx_byte[lo];
+}
+
+// skia-fx: map a byte offset to the TIME (ns) of the fragment containing it
+// (inverse of the above). Caller holds element->lock. -1 if unavailable.
+static gint64 progress_buffer_sidx_time_for_byte(ProgressBuffer *element, gint64 byteOff)
+{
+    if (!progress_buffer_ensure_sidx(element))
+        return -1;
+    // find last fragment whose start byte <= byteOff
+    guint lo = 0, hi = element->sidx_count;
+    while (lo + 1 < hi)
+    {
+        guint mid = (lo + hi) / 2;
+        if (element->sidx_byte[mid] <= byteOff) lo = mid; else hi = mid;
+    }
+    return (gint64) gst_util_uint64_scale(
+        (guint64) element->sidx_time[lo], GST_SECOND, (guint64) element->sidx_timescale);
+}
+
+// skia-fx: total media duration (ns) from the sidx, or -1. Caller holds lock.
+static gint64 progress_buffer_sidx_total_duration(ProgressBuffer *element)
+{
+    if (!progress_buffer_ensure_sidx(element))
+        return -1;
+    return (gint64) gst_util_uint64_scale(
+        (guint64) element->sidx_time[element->sidx_count], GST_SECOND,
+        (guint64) element->sidx_timescale);
+}
+
+// skia-fx: rewrite a BYTES segment event into a TIME segment for a fragmented
+// mp4 (sidx present). qtdemux only drives fragmented playback correctly when
+// its upstream is in TIME format — then it treats each seek as "re-download
+// the fragment" (forwarded upstream, where we sidx-map it to a byte) and
+// derives frame times from the moof tfdt. Fed a BYTES segment it instead
+// looks the offset up in its (incomplete) fragment sample table and freezes.
+// Returns a new TIME segment event (caller owns it) or NULL to keep the
+// original. Caller holds element->lock.
+static GstEvent *progress_buffer_maybe_time_segment(ProgressBuffer *element, GstEvent *event)
+{
+    if (GST_EVENT_TYPE(event) != GST_EVENT_SEGMENT)
+        return NULL;
+
+    const GstSegment *inSeg = NULL;
+    gst_event_parse_segment(event, &inSeg);
+    if (inSeg == NULL || inSeg->format != GST_FORMAT_BYTES)
+        return NULL;
+
+    gint64 fragTime = progress_buffer_sidx_time_for_byte(element, (gint64) inSeg->start);
+    if (fragTime < 0)
+        return NULL; // not a fragmented mp4 (or sidx not yet available)
+
+    // Display origin: the exact seek target if this segment follows a seek
+    // (so the sink clips the fragment's pre-target frames and lines up with
+    // the sample-accurate audio), otherwise the fragment start (linear /
+    // initial segment). The fragment's keyframe (at fragTime <= reqTime) is
+    // still fed to qtdemux for decode; it just isn't displayed.
+    gint64 originTime = fragTime;
+    if (element->req_seek_time_ns >= 0 && element->req_seek_time_ns >= fragTime)
+        originTime = element->req_seek_time_ns;
+    element->req_seek_time_ns = -1; // one-shot, consumed by this segment
+
+    GstSegment seg;
+    gst_segment_init(&seg, GST_FORMAT_TIME);
+    seg.rate = inSeg->rate;
+    seg.applied_rate = inSeg->applied_rate;
+    seg.start = (guint64) originTime;
+    seg.time = (guint64) originTime;
+    seg.position = (guint64) originTime;
+    // skia-fx: do NOT bound the segment by the sidx total duration. A sidx can
+    // under-report (chained/partial sidx, or a parse that only saw the first
+    // index), and a too-short stop makes qtdemux EOS the video early — the
+    // position then jumps to that bogus end and the progress bar shoots to the
+    // end ("seek goes crazy"). Leave it unbounded like the audio chain; the
+    // real EOS comes from the byte stream ending.
+    seg.stop = GST_CLOCK_TIME_NONE;
+    seg.duration = GST_CLOCK_TIME_NONE;
+
+    GstEvent *timeEvent = gst_event_new_segment(&seg);
+    gst_event_set_seqnum(timeEvent, gst_event_get_seqnum(event));
+
+    if (pb_verbose())
+        g_print("[pb-sidx-seg] %s BYTES start=%lld -> TIME frag=%.3fs origin=%.3fs stop=unbounded\n",
+                GST_ELEMENT_NAME(element), (long long) inSeg->start,
+                fragTime / 1e9, originTime / 1e9);
+
+    return timeEvent;
+}
+
 static gboolean progress_buffer_perform_push_seek(ProgressBuffer *element, GstPad *pad, GstEvent *event)
 {
     GstFormat    format;
@@ -689,9 +985,43 @@ static gboolean progress_buffer_perform_push_seek(ProgressBuffer *element, GstPa
     gint64       position;
     GstSegment   segment;
     guint32      seqnum;
+    gboolean     est_forced = FALSE; // sidx-mapped TIME seek: force a real range request
 
     gst_event_parse_seek(event, &rate, &format, &flags, &start_type, &position, &stop_type, NULL);
     seqnum = gst_event_get_seqnum(event);
+
+    if (pb_verbose())
+        g_print("[pb-pushseek] %s incoming fmt=%d pos=%lld flags=0x%x seqnum=%u\n",
+                GST_ELEMENT_NAME(element), (int) format, (long long) position,
+                (unsigned) flags, (unsigned) seqnum);
+
+    // skia-fx: qtdemux can't byte-seek a fragmented mp4 in push mode, so it
+    // forwards the seek to us in TIME. Map it to the exact fragment (moof)
+    // byte via the parsed sidx — fragment-aligned, so qtdemux resyncs
+    // cleanly (an unaligned/estimated byte corrupts). If we have no sidx
+    // (not fragmented mp4, or head not downloaded) the TIME seek is
+    // rejected below, unchanged.
+    if (format == GST_FORMAT_TIME && start_type == GST_SEEK_TYPE_SET)
+    {
+        g_mutex_lock(&element->lock);
+        gint64 fragByte = progress_buffer_sidx_byte_for_time(element, position);
+        if (fragByte >= 0)
+            // Remember the exact requested time so the TIME segment we emit
+            // after this seek snaps the sink's display origin to it (not to
+            // the earlier fragment boundary) — keeps video synced to audio
+            // on both forward and backward seeks.
+            element->req_seek_time_ns = position;
+        g_mutex_unlock(&element->lock);
+        if (fragByte >= 0)
+        {
+            if (pb_verbose())
+                g_print("[pb-sidx-seek] %s TIME %lld ns -> fragment BYTE %lld\n",
+                        GST_ELEMENT_NAME(element), (long long) position, (long long) fragByte);
+            position = fragByte;
+            format = GST_FORMAT_BYTES;
+            est_forced = TRUE; // target fragment isn't in cache — fetch it
+        }
+    }
 
     if (format != GST_FORMAT_BYTES || start_type != GST_SEEK_TYPE_SET)
         return FALSE;
@@ -716,7 +1046,7 @@ static gboolean progress_buffer_perform_push_seek(ProgressBuffer *element, GstPa
     // Signal the task to stop if it's waiting.
     g_mutex_lock(&element->lock);
     element->srcresult = GST_FLOW_FLUSHING;
-    g_cond_signal(&element->add_cond);
+    g_cond_broadcast(&element->add_cond);
     g_mutex_unlock(&element->lock);
 
     GST_PAD_STREAM_LOCK(pad); // Wait for task to stop
@@ -725,7 +1055,12 @@ static gboolean progress_buffer_perform_push_seek(ProgressBuffer *element, GstPa
     element->srcresult = GST_FLOW_OK;
 
 #ifdef ENABLE_SOURCE_SEEKING
-    element->instant_seek = (position >= element->sink_segment.start &&
+    // skia-fx: a sidx-mapped fragment byte is (almost always) outside the
+    // cached window, so an "instant" seek would read stale/short cache and
+    // hand qtdemux a truncated fragment (-> MEDIA_CORRUPTED). Force the
+    // real upstream range-request path for it.
+    element->instant_seek = (!est_forced &&
+                             position >= element->sink_segment.start &&
                              (position - (gint64)element->sink_segment.position) <= element->bandwidth * element->wait_tolerance);
 
     if (element->instant_seek)
@@ -811,6 +1146,18 @@ static GstFlowReturn progress_buffer_chain(GstPad *pad, GstObject *parent, GstBu
     else
         result = progress_buffer_enqueue_item(element, GST_MINI_OBJECT_CAST(data));
 
+    /* skia-fx diagnostic (OPENJFX_MEDIA_VERBOSE): a non-OK chain return
+     * pauses the upstream javasource task permanently — log why. */
+    if (result != GST_FLOW_OK)
+    {
+        if (pb_verbose())
+            g_print("[pb-chain] %s returning flow=%d (eos=%d unexpected=%d pos=%"
+                    G_GINT64_FORMAT " stop=%" G_GINT64_FORMAT ")\n",
+                    GST_ELEMENT_NAME(element), (int)result,
+                    (int)element->eos_status.eos, (int)element->unexpected,
+                    element->sink_segment.position, element->sink_segment.stop);
+    }
+
     g_mutex_unlock(&element->lock);
 
 // INLINE - gst_buffer_unref()
@@ -832,6 +1179,20 @@ static void send_underrun_message(ProgressBuffer* element)
 {
     GstStructure *s = gst_structure_new_empty(PB_MESSAGE_UNDERRUN);
     GstMessage *msg = gst_message_new_application(GST_OBJECT(element), s);
+
+    /* skia-fx: diagnostic (OPENJFX_MEDIA_VERBOSE only, capped) — shows
+     * WHICH progressbuffer starves and when. */
+    {
+        static guint64 _urCount = 0;
+        if (pb_verbose() &&
+            (_urCount < 20 || (_urCount % 200) == 0))
+        {
+            g_print("[pb-underrun] %s #%llu\n",
+                    GST_ELEMENT_NAME(element),
+                    (unsigned long long)_urCount);
+        }
+        _urCount++;
+    }
 
     gst_element_post_message(GST_ELEMENT(element), msg);
 }
@@ -874,8 +1235,23 @@ next_item:
                     result = GST_FLOW_EOS;
                     break;
                 case GST_EVENT_SEGMENT:
+                {
                     skip = FALSE;
+                    // skia-fx: for a fragmented mp4 (sidx present) hand qtdemux
+                    // a TIME segment instead of BYTES, so it drives fragmented
+                    // playback/seek via the moof tfdt instead of its incomplete
+                    // sample table (which freezes the video). No-op for every
+                    // other stream (sidx absent -> NULL). The cached head is
+                    // present by now (the loop only runs past the buffering
+                    // threshold), so the lazy sidx parse can succeed here.
+                    GstEvent *timeSeg = progress_buffer_maybe_time_segment(element, event);
+                    if (timeSeg != NULL)
+                    {
+                        gst_event_unref(event); // INLINE - gst_event_unref()
+                        event = timeSeg;
+                    }
                     break;
+                }
                 default:
                     if (skip)
                     {
@@ -1057,17 +1433,87 @@ static GstFlowReturn progress_buffer_getrange(GstPad *pad, GstObject *parent, gu
     ProgressBuffer *element = PROGRESS_BUFFER(parent);
     GstFlowReturn  result = GST_FLOW_OK;
     guint64        end_position = start_position + size;
-    gboolean       needs_seeking = FALSE;
+
+    // skia-fx: this function used to return GST_FLOW_FLUSHING on a cache
+    // miss (range not downloaded yet). A pull-mode demuxer (matroskademux
+    // drives the dual-source companion in pull mode) treats FLUSHING as
+    // "shut down": it silently pauses its streaming task — permanently,
+    // because the FX_EVENT_RANGE_READY custom event progressbuffer emits
+    // later means nothing to it. The companion chain then went dead a
+    // couple of seconds in (whatever was pulled before the first miss),
+    // the audio sink starved, the audio master clock froze, and the whole
+    // pipeline wedged at 00:00 ("plays two notes then freezes"; a manual
+    // seek sometimes revived it only because the demux's seek handler
+    // restarts its own task).
+    //
+    // The fix: behave like a blocking pull source (queue2's download
+    // mode) — wait until the requested range is cached, an EOS clamps
+    // the stream short, or the element shuts down. Wake-ups come from
+    // enqueue_item (download progress + EOS) and the shutdown /
+    // deactivate paths, which all signal add_cond.
+    /* skia-fx diagnostic (OPENJFX_MEDIA_VERBOSE, capped): trace pulls. */
+    static guint64 _grCount = 0;
+    gboolean _grLog = FALSE;
+    {
+        if (pb_verbose() &&
+            (_grCount < 40 || (_grCount % 500) == 0))
+        {
+            _grLog = TRUE;
+            g_print("[pb-getrange] %s #%llu start=%llu size=%u\n",
+                    GST_ELEMENT_NAME(element), (unsigned long long)_grCount,
+                    (unsigned long long)start_position, size);
+        }
+        _grCount++;
+    }
 
     g_mutex_lock(&element->lock); // Use one lock for push and pull modes
 
-    if (element->sink_segment.stop < (gint64)end_position)
-        result = GST_FLOW_EOS;
-    else if (element->sink_segment.start <= (gint64)start_position &&
-             element->sink_segment.position >= (gint64)end_position)
-        result = cache_read_buffer_from_position(element->cache, start_position, size, buffer);
-    else
+    // Per-pull state: fire UNDERRUN once per pull (not once per wakeup —
+    // enqueue_item signals for every arriving buffer), and latch the
+    // upstream byte-seek per segment generation so wakeups caused by
+    // still-in-flight pre-seek data don't re-push the seek (connection
+    // churn storm on slow links).
+    gboolean underrun_sent = FALSE;
+    gboolean seek_pushed = FALSE;
+    gint64   seek_pushed_seg_start = 0;
+
+    for (;;)
     {
+        gboolean needs_seeking = FALSE;
+
+        if (element->srcresult != GST_FLOW_OK)
+        {
+            // Shutting down / deactivating.
+            result = element->srcresult;
+            break;
+        }
+
+        if (element->sink_segment.stop < (gint64)end_position)
+        {
+            // Requested range crosses the end of stream. Note: the stop
+            // is clamped down to the real size when upstream EOSes (the
+            // initial value comes from the size hint, which can be too
+            // large — e.g. the dual-source companion inherits the
+            // primary's size). Serve a short read for a partial overlap,
+            // EOS when nothing overlaps.
+            if ((gint64)start_position >= element->sink_segment.stop)
+            {
+                result = GST_FLOW_EOS;
+                break;
+            }
+            end_position = element->sink_segment.stop;
+            size = (guint)(end_position - start_position);
+            continue; // re-evaluate with the clamped size
+        }
+
+        if (element->sink_segment.start <= (gint64)start_position &&
+            element->sink_segment.position >= (gint64)end_position)
+        {
+            result = cache_read_buffer_from_position(element->cache, start_position, size, buffer);
+            break;
+        }
+
+        // Range not cached yet — request it and wait.
 #if ENABLE_SOURCE_SEEKING
         needs_seeking = element->sink_segment.start > (gint64)start_position;
         if (needs_seeking)
@@ -1084,20 +1530,62 @@ static GstFlowReturn progress_buffer_getrange(GstPad *pad, GstObject *parent, gu
                 element->range_stop = element->sink_segment.stop;
 
 #if ENABLE_SOURCE_SEEKING
-            needs_seeking = element->bandwidth > 0 &&
-                end_position - element->sink_segment.position > element->bandwidth * element->wait_tolerance;
+            needs_seeking = needs_seeking || (element->bandwidth > 0 &&
+                end_position - element->sink_segment.position > element->bandwidth * element->wait_tolerance);
 #endif
         }
 
-        send_underrun_message(element);
-        result = GST_FLOW_FLUSHING;
+        if (!underrun_sent)
+        {
+            send_underrun_message(element);
+            underrun_sent = TRUE;
+        }
+
+        if (needs_seeking &&
+            (!seek_pushed || element->sink_segment.start != seek_pushed_seg_start))
+        {
+            // Ask the source to jump to the requested offset (range
+            // request on the connection) rather than waiting for the
+            // sequential download to get there. Push outside the lock.
+            // The latch above keeps this to one seek per segment
+            // generation: wakeups from in-flight pre-seek buffers see
+            // the same sink_segment.start and just wait; only a real
+            // SEGMENT update (the source processed our seek) re-arms it.
+            seek_pushed = TRUE;
+            seek_pushed_seg_start = element->sink_segment.start;
+            g_mutex_unlock(&element->lock);
+            gboolean seeked = gst_pad_push_event(element->sinkpad,
+                gst_event_new_seek(element->sink_segment.rate, GST_FORMAT_BYTES, GST_SEEK_FLAG_NONE,
+                    GST_SEEK_TYPE_SET, start_position, GST_SEEK_TYPE_NONE, 0));
+            g_mutex_lock(&element->lock);
+            if (!seeked && element->sink_segment.start > (gint64)start_position)
+            {
+                // Source can't seek backwards — the bytes will never
+                // arrive. Fail the pull rather than wait forever.
+                result = GST_FLOW_ERROR;
+                break;
+            }
+            // Wait for the source to process the seek (its SEGMENT
+            // update signals add_cond) — otherwise this loop would
+            // re-evaluate stale segment state and re-push the seek.
+            if (element->srcresult == GST_FLOW_OK)
+                g_cond_wait(&element->add_cond, &element->lock);
+        }
+        else
+        {
+            g_cond_wait(&element->add_cond, &element->lock);
+        }
     }
 
     g_mutex_unlock(&element->lock);
 
-    if (needs_seeking)
-        gst_pad_push_event(element->sinkpad, gst_event_new_seek(element->sink_segment.rate, GST_FORMAT_BYTES, GST_SEEK_FLAG_NONE,
-            GST_SEEK_TYPE_SET, start_position, GST_SEEK_TYPE_NONE, 0));
+    if (_grLog || result != GST_FLOW_OK)
+    {
+        if (pb_verbose())
+            g_print("[pb-getrange] %s result=%d (start=%llu)\n",
+                    GST_ELEMENT_NAME(element), (int)result,
+                    (unsigned long long)start_position);
+    }
 
     return result;
 #else
@@ -1141,7 +1629,7 @@ static GstStateChangeReturn progress_buffer_change_state (GstElement *e,
             g_mutex_lock(&element->lock);
             element->srcresult = GST_FLOW_FLUSHING;
             progress_buffer_flush_data(element);
-            g_cond_signal(&element->add_cond); // Signal the task to stop if it's waiting.
+            g_cond_broadcast(&element->add_cond); // Signal the task to stop if it's waiting.
             g_mutex_unlock(&element->lock);
             break;
 

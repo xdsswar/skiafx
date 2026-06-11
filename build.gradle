@@ -7,6 +7,8 @@
  * subprojects.
  */
 
+import org.gradle.internal.os.OperatingSystem
+
 plugins {
     id 'base'
     id 'com.github.ben-manes.versions' version '0.51.0'
@@ -75,6 +77,36 @@ tasks.register('sdkSummary') {
         } else {
             println "[sdk] no output yet — run ./gradlew buildAll"
         }
+    }
+}
+
+// =============================================================================
+// packageSdkZip — bundle every jar in sdk/lib (the classes jars AND the
+// per-platform natives classifier jars) into a single distributable archive
+// named skia-fx-<host-triple>-<version>.zip, e.g. skia-fx-win-x64-25.0.0.zip.
+//
+// Only the jars directly in sdk/lib are included — the loose
+// lib/<host-triple>/*.dll files (module-path natives) are intentionally left
+// out, since the classifier jars already carry those natives. Zips whatever
+// is currently in sdk/lib, so run `./gradlew buildAll` first to populate it.
+// =============================================================================
+def os = OperatingSystem.current()
+def hostTriple = (os.windows ? 'win' : os.macOsX ? 'mac' : 'linux') +
+                 '-' + ((System.getProperty('os.arch') in ['x86_64', 'amd64']) ? 'x64' : 'arm64')
+
+tasks.register('packageSdkZip', Zip) {
+    group = 'distribution'
+    description = 'Bundle all jars in sdk/lib into skia-fx-<platform>-<version>.zip.'
+
+    archiveBaseName.set("skia-fx-${hostTriple}")
+    archiveVersion.set(project.version.toString())
+    // Emit the archive into sdk/lib itself: skia-fx-<host-triple>-<version>.zip.
+    destinationDirectory.set(layout.projectDirectory.dir('sdk/lib'))
+
+    // Top-level jars only: the '*.jar' pattern is non-recursive, so the
+    // lib/<host-triple>/ native subdir (and this .zip) are naturally excluded.
+    from(layout.projectDirectory.dir('sdk/lib')) {
+        include '*.jar'
     }
 }
 

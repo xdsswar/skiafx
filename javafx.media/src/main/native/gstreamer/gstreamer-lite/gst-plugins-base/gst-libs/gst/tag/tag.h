@@ -517,24 +517,31 @@ GList *                 gst_tag_to_vorbis_comments              (const GstTagLis
 /* functions to convert GstBuffers with vorbiscomment contents to GstTagLists and back */
 
 GST_TAG_API
+GstTagList *            gst_tag_list_from_vorbiscomment_buffer  (GstBuffer *            buffer,
+                                                                 const guint8 *         id_data,
+                                                                 const guint            id_data_length,
+                                                                 gchar **               vendor_string);
+#endif // GSTREAMER_LITE
+
+/* skia-fx: visible under GSTREAMER_LITE too — flacparse calls it, the
+ * implementation lives in flacparse-lite-plugin.c (the upstream
+ * gstvorbistag.c is pruned from the lite tag library). WITHOUT this
+ * declaration MSVC C implicit-declares the function with an int
+ * return and TRUNCATES the returned 64-bit pointer — crash. */
+GST_TAG_API
 GstTagList *            gst_tag_list_from_vorbiscomment         (const guint8 *         data,
                                                                  gsize                  size,
                                                                  const guint8 *         id_data,
                                                                  const guint            id_data_length,
                                                                  gchar **               vendor_string);
 
-GST_TAG_API
-GstTagList *            gst_tag_list_from_vorbiscomment_buffer  (GstBuffer *            buffer,
-                                                                 const guint8 *         id_data,
-                                                                 const guint            id_data_length,
-                                                                 gchar **               vendor_string);
-
+/* skia-fx: matroska-compat.c provides this one (stub) — declared here
+ * for the same truncated-pointer reason. */
 GST_TAG_API
 GstBuffer *             gst_tag_list_to_vorbiscomment_buffer    (const GstTagList *     list,
                                                                  const guint8 *         id_data,
                                                                  const guint            id_data_length,
                                                                  const gchar *          vendor_string);
-#endif // GSTREAMER_LITE
 
 /* functions for ID3 tag manipulation */
 

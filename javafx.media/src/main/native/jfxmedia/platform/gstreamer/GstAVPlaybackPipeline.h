@@ -50,8 +50,16 @@ public:
     virtual bool IsCodecSupported(GstCaps *pCaps);
     virtual bool CheckCodecSupport();
     virtual bool LoadDecoder(GstCaps *pCaps);
+    // skia-fx: swap the preset audio decoder for ffmpegwrapper when the
+    // demuxer announces a codec the preset can't decode (Opus/Vorbis/
+    // FLAC in MP4). The audio analogue of LoadDecoder.
+    void         SwapAudioDecoderIfNeeded(GstCaps *pCaps);
 
     virtual void CheckQueueSize(GstElement *element);
+    virtual void OnSeekRequested(gint64 seekTimeNs);
+    virtual void OnSeekIssued(gint64 seekTimeNs);
+    virtual void WatchdogTick();
+    void         ArmVideoPrime(gint64 seekTimeNs);
 
     void         SetEncodedVideoFrameRate(float frameRate);
 
@@ -83,6 +91,34 @@ private:
     gfloat                  m_EncodedVideoFrameRate;
     int                     m_videoCodecErrorCode;
     GstClockTime            m_FirstPTS;
+
+    // skia-fx: post-seek video catch-up. After a flushing seek the HD video
+    // fragment must be fetched and decoded from its keyframe up to the seek
+    // target while the audio master clock is already advancing, so the first
+    // displayable video frames arrive "late". With the sink clock-synced
+    // those late frames are dropped by QoS and the picture freezes. While
+    // priming we turn the video sink's sync OFF (late frames render instead
+    // of being dropped) and re-lock to the clock once the video PTS has
+    // caught up to the audio position. -1 origin = not priming.
+    volatile bool           m_bSeekVideoPrime;
+    gint64                  m_SeekPrimeTargetNs;
+
+    // skia-fx: video-stall recovery. If the video chain produces no frame for
+    // a while *and* the audio master keeps advancing (so it is a video-only
+    // stall, not a pause/buffering), the watchdog re-seeks ONLY the video
+    // chain back onto the live audio position — re-fetching the fragment and
+    // re-priming catch-up — instead of leaving a frozen picture. Bounded
+    // attempts (reset whenever a video frame arrives) so it can't loop.
+    volatile gint64         m_lastVideoFrameMonoUs;  // monotonic time of last frame
+    volatile gint64         m_lastVideoFramePtsNs;   // stream PTS of last frame
+    gint64                  m_seekIssuedMonoUs;      // monotonic time of last (re)seek
+    gint64                  m_watchPrevAudioNs;
+    int                     m_videoRecoverAttempts;
+    // Consecutive watchdog ticks the player has been continuously PLAYING
+    // (reset whenever it isn't). Recovery only acts after several of these so
+    // it never fights the buffering system during startup / stall flapping —
+    // a video underrun there already drives the proper whole-pipeline stall.
+    int                     m_consecPlayingTicks;
 };
 
 #endif  //_GST_AV_PLAYBACK_PIPELINE_H_

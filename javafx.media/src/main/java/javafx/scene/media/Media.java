@@ -26,6 +26,7 @@
 package javafx.scene.media;
 
 import com.sun.media.jfxmedia.MetadataParser;
+import com.sun.media.jfxmediaimpl.MediaFfmpegConfig;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.FileNotFoundException;
@@ -206,6 +207,57 @@ public final class Media {
         if (v != null && !v.isEmpty()) return v;
         String env = System.getenv("OPENJFX_MEDIA_FFMPEG_DIR");
         return (env != null && !env.isEmpty()) ? env : null;
+    }
+
+    /**
+     * Reports whether the ffmpeg runtime libraries are available to the
+     * media engine. The first call attempts to locate and load them from
+     * the configured directory (see {@link #setFfmpegDirectory}), the
+     * {@code OPENJFX_MEDIA_FFMPEG_DIR} environment variable, or the
+     * system path; the result is cached.
+     *
+     * <p>When ffmpeg is unavailable, common formats still play through
+     * the platform decoders (MP4/AAC/H.264, MP3, WAV). Formats decoded
+     * by ffmpeg — WebM/MKV (VP8/VP9/AV1, Opus, Vorbis) and dual-source
+     * {@code Media(audio, video)} audio — require it, and attempting to
+     * play them surfaces a {@code MediaException}. Use this method to
+     * detect the situation up front and inform the user.</p>
+     *
+     * <p>An ffmpeg whose ABI does not match the engine's expectations is
+     * refused (reported as unavailable) rather than risk corrupting
+     * playback.</p>
+     *
+     * @return {@code true} when ffmpeg is loaded and usable
+     */
+    public static boolean isFfmpegAvailable() {
+        try {
+            return MediaFfmpegConfig.initialize(null);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Returns a human-readable description of the ffmpeg runtime's load
+     * state: where the libraries were loaded from and their versions on
+     * success, or the precise reason the load failed (libraries not
+     * found, ABI mismatch, mixed builds from different ffmpeg versions).
+     * Intended for diagnostics and error reporting alongside
+     * {@link #isFfmpegAvailable()}.
+     *
+     * <p>This API is part of the skia-fx fork and is experimental.</p>
+     *
+     * @return the loader status message, or {@code null} when no load
+     *         has been attempted yet
+     * @see #isFfmpegAvailable()
+     * @see #setFfmpegDirectory(String)
+     */
+    public static String getFfmpegStatus() {
+        try {
+            return MediaFfmpegConfig.getStatus();
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /**

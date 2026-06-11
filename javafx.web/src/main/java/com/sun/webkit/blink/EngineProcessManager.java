@@ -98,6 +98,40 @@ final class EngineProcessManager {
         List<String> command = new ArrayList<>();
         command.add(exe.toString());
         command.add(channel.getPath().toString());
+        // Pin the engine's display device-scale to 1.0 on EVERY monitor. The
+        // page's render density is supplied entirely by the per-view capture
+        // scale override (= the JavaFX render scale sent with SET_SIZE), so
+        // the engine's own display scale must be a CONSTANT: the hidden
+        // capture window follows the WebView across monitors, and with real
+        // per-monitor DSFs its scale flips asynchronously mid-drag — the
+        // override's divisor and the widget's DIP size both drift (DIP =
+        // pixels / DSF), which rendered the page at the wrong density/size
+        // and froze or shrank the WebView after a cross-DPI monitor move.
+        // With the scale forced to 1.0, DIP == pixels everywhere, the first
+        // SET_SIZE after a DPI change is exact, and the reaction is a single
+        // renderer reflow — no convergence dance. Window-positioning code is
+        // unaffected (it uses Win32 GetDpiForWindow, not display::Display).
+        command.add("--force-device-scale-factor=1");
+        // Off-screen rendering reads frames via CopyFromSurface, which can
+        // only see what viz COMPOSITES. DirectComposition promotes fullscreen
+        // video to an overlay/decode swap chain whose pixels bypass the
+        // composited surface — measured as a ~4 s frame stall on entering
+        // YouTube fullscreen (capture returned nothing until promotion fell
+        // back). With DComp off, everything composites into the readable
+        // surface and fullscreen-enter converges in ~300 ms. The engine
+        // window is never presented on screen, so DComp's presentation
+        // benefits don't apply here. -Dskia.webview.directComposition=true
+        // re-enables it for A/B debugging.
+        if (!Boolean.getBoolean("skia.webview.directComposition")) {
+            command.add("--disable-direct-composition");
+        }
+        // Main-frame capture path. Default: viz FrameSinkVideoCapturer (push,
+        // follows the page's surface across resizes/fullscreen — no frame gap
+        // while heavy pages relayout). -Dskia.webview.pollCapture=true falls
+        // back to the legacy per-tick CopyFromSurface polling.
+        if (Boolean.getBoolean("skia.webview.pollCapture")) {
+            command.add("--jux-poll-capture");
+        }
         command.addAll(switches);
         Path chromiumLog = exe.toAbsolutePath().getParent().resolve("skia-fx-webview-chromium.log");
         if (verbose) {

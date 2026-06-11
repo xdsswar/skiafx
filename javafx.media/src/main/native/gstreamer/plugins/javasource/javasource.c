@@ -628,6 +628,16 @@ next_event:
                 gint     size;
                 GstMapInfo info;
                 g_signal_emit(element, JAVA_SOURCE_GET_CLASS(element)->signals[SIGNAL_READ_NEXT_BLOCK], 0, &size);
+                /* skia-fx diagnostic (OPENJFX_MEDIA_VERBOSE): non-positive
+                 * reads are the interesting ones — they end or stall the
+                 * pump. */
+                if (size <= 0)
+                {
+                    const gchar* v = g_getenv("OPENJFX_MEDIA_VERBOSE");
+                    if (v != NULL && v[0] != '\0' && v[0] != '0')
+                        g_print("[javasource] %s read-next-block returned %d (pos=%" G_GINT64_FORMAT ")\n",
+                                GST_ELEMENT_NAME(element), size, element->position);
+                }
                 if (size > 0)
                 {
                     GstBuffer *buffer = gst_buffer_new_allocate(NULL, size, NULL);
@@ -699,7 +709,20 @@ next_event:
                     goto next_event;
                 }
                 else if (size == OTHER_ERROR_CODE) // Other error
-                    result = GST_FLOW_FLUSHING;
+                {
+                    // skia-fx: -2 means the Java read callback threw (real
+                    // I/O failure — recoverable connection problems return
+                    // EOS instead). Pausing the task with FLUSHING alone
+                    // (the old behaviour) froze the player silently and
+                    // PERMANENTLY: no error event, no EOS, no recovery.
+                    // Post a real ERROR so BusCallback delivers a
+                    // MediaException to the app, then pause.
+                    gst_element_message_full(GST_ELEMENT(element),
+                        GST_MESSAGE_ERROR, GST_RESOURCE_ERROR, GST_RESOURCE_ERROR_READ,
+                        g_strdup("Media source read failed"), NULL,
+                        ("javasource.c"), ("java_source_loop"), 0);
+                    result = GST_FLOW_ERROR;
+                }
                 break;
             }
 
@@ -717,7 +740,15 @@ next_event:
     g_mutex_unlock(&element->lock);
 
     if (result != GST_FLOW_OK)
+    {
+        /* skia-fx diagnostic (OPENJFX_MEDIA_VERBOSE): a paused source
+         * task is permanent unless something restarts it — log why. */
+        const gchar* v = g_getenv("OPENJFX_MEDIA_VERBOSE");
+        if (v != NULL && v[0] != '\0' && v[0] != '0')
+            g_print("[javasource] %s task pausing: flow=%d pos=%" G_GINT64_FORMAT "\n",
+                    GST_ELEMENT_NAME(element), (int)result, element->position);
         gst_pad_pause_task(element->srcpad);
+    }
 }
 
 /***********************************************************************************

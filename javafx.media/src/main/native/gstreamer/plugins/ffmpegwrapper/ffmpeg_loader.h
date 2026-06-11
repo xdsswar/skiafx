@@ -109,6 +109,49 @@ typedef struct OpenJfxFfmpegFns {
     const AVCodecHWConfig* (*avcodec_get_hw_config)(const AVCodec*, int);
     void                   (*avcodec_flush_buffers)(AVCodecContext*);
 
+    // --- avformat (remux / MediaMixer) ---
+    // Optional group: resolved best-effort; remux_ok says whether the
+    // whole set is usable. Decode paths never depend on these.
+    int   remux_ok;
+    int             (*avformat_open_input)(AVFormatContext**, const char*,
+                                           const AVInputFormat*, AVDictionary**);
+    void            (*avformat_close_input)(AVFormatContext**);
+    int             (*avformat_find_stream_info)(AVFormatContext*, AVDictionary**);
+    int             (*avformat_alloc_output_context2)(AVFormatContext**,
+                                                      const AVOutputFormat*,
+                                                      const char*, const char*);
+    void            (*avformat_free_context)(AVFormatContext*);
+    AVStream*       (*avformat_new_stream)(AVFormatContext*, const AVCodec*);
+    int             (*avformat_write_header)(AVFormatContext*, AVDictionary**);
+    int             (*av_write_trailer)(AVFormatContext*);
+    int             (*av_read_frame)(AVFormatContext*, AVPacket*);
+    int             (*av_interleaved_write_frame)(AVFormatContext*, AVPacket*);
+    int             (*avio_open)(AVIOContext**, const char*, int);
+    int             (*avio_closep)(AVIOContext**);
+    int             (*avcodec_parameters_copy)(AVCodecParameters*,
+                                               const AVCodecParameters*);
+    void            (*av_packet_rescale_ts)(AVPacket*, AVRational, AVRational);
+    int             (*av_strerror)(int, char*, size_t);
+
+    // --- avformat (demux / ffmpegdemux catch-all) ---
+    // Optional group: resolved best-effort; demux_ok says whether the
+    // whole set is usable. Existing decode / remux paths never depend on
+    // these — the catch-all GStreamer demuxer (ffmpegdemux) does.
+    int   demux_ok;
+    AVFormatContext* (*avformat_alloc_context)(void);
+    AVIOContext*     (*avio_alloc_context)(unsigned char* buffer, int buffer_size,
+                         int write_flag, void* opaque,
+                         int (*read_packet)(void* opaque, uint8_t* buf, int buf_size),
+                         int (*write_packet)(void* opaque, const uint8_t* buf, int buf_size),
+                         int64_t (*seek)(void* opaque, int64_t offset, int whence));
+    void             (*avio_context_free)(AVIOContext**);
+    int              (*av_seek_frame)(AVFormatContext*, int stream_index,
+                                      int64_t timestamp, int flags);
+    int              (*avformat_seek_file)(AVFormatContext*, int stream_index,
+                                           int64_t min_ts, int64_t ts, int64_t max_ts,
+                                           int flags);
+    void             (*av_freep)(void*);
+
 #ifdef _WIN32
     HMODULE  hAvcodec;
     HMODULE  hAvformat;
@@ -146,6 +189,29 @@ OPENJFX_FFMPEG_EXPORT const char* openjfx_ffmpeg_loader_status(void);
 
 // Unload the DLLs. Safe to call when init was never tried.
 OPENJFX_FFMPEG_EXPORT void openjfx_ffmpeg_loader_shutdown(void);
+
+// ---------------------------------------------------------------------------
+// Remux (MediaMixer): copy the best video stream of `videoPath` and the
+// best audio stream of `audioPath` into an MP4 at `outPath`, without
+// re-encoding. Synchronous; call from a worker thread. `onProgress`
+// (may be NULL) receives a 0..1 fraction; `isCancelled` (may be NULL)
+// is polled between packets — return nonzero to abort. Returns 0 on
+// success; nonzero error code with a human-readable message in errBuf.
+// Implemented in ffmpeg_remux.cpp (fxplugins). Requires the loader's
+// remux symbol group (fails cleanly with a message otherwise).
+// ---------------------------------------------------------------------------
+typedef void (*OpenJfxRemuxProgressFn)(double fraction, void* user);
+typedef int  (*OpenJfxRemuxCancelledFn)(void* user);
+
+// flags bit 0: faststart — relocate the moov atom to the file head at
+// finalize time (mp4 muxer rewrites the file; costs one extra pass).
+#define OPENJFX_REMUX_FLAG_FASTSTART 1
+
+OPENJFX_FFMPEG_EXPORT int openjfx_ffmpeg_remux(
+    const char* audioPath, const char* videoPath, const char* outPath,
+    int flags,
+    OpenJfxRemuxProgressFn onProgress, OpenJfxRemuxCancelledFn isCancelled,
+    void* user, char* errBuf, int errBufLen);
 
 #ifdef __cplusplus
 }

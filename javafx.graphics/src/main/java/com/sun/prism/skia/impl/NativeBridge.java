@@ -70,6 +70,16 @@ public final class NativeBridge {
             ValueLayout.JAVA_INT,   // width
             ValueLayout.JAVA_INT)); // height
 
+    // Optional: BGRA raster variant for the READBACK present tier (swizzle-free
+    // readback). find() so an older native lib degrades to the RGBA path.
+    private static final MethodHandle MH_SURFACE_CREATE_RASTER_BGRA =
+        LOOKUP.find("openjfx_skia_surface_create_raster_bgra")
+            .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_INT)))
+            .orElse(null);
+
     private static final MethodHandle MH_SURFACE_CREATE_GPU = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_create_gpu"),
         FunctionDescriptor.of(
@@ -933,6 +943,18 @@ public final class NativeBridge {
             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT));
 
+    // Optional: dirty-rect readback with caller stride (partial present).
+    // find() so an older native lib degrades to full-frame readback.
+    private static final MethodHandle MH_SURFACE_READ_PIXELS_ARGB_STRIDE =
+        LOOKUP.find("openjfx_skia_surface_read_pixels_argb_stride")
+            .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_INT)))
+            .orElse(null);
+
     private static final MethodHandle MH_SURFACE_READ_PIXELS = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_read_pixels"),
         FunctionDescriptor.of(
@@ -1086,6 +1108,23 @@ public final class NativeBridge {
             return (MemorySegment) MH_SURFACE_CREATE_RASTER.invokeExact(width, height);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_surface_create_raster failed", t);
+        }
+    }
+
+    /**
+     * Creates a CPU-backed SkSurface in BGRA byte order — the READBACK
+     * present tier's format, where the per-frame readback is a straight
+     * row copy instead of a channel swizzle. Falls back to the RGBA
+     * variant when the native lib predates the symbol.
+     */
+    public static MemorySegment surfaceCreateRasterBgra(int width, int height) {
+        if (MH_SURFACE_CREATE_RASTER_BGRA == null) {
+            return surfaceCreateRaster(width, height);
+        }
+        try {
+            return (MemorySegment) MH_SURFACE_CREATE_RASTER_BGRA.invokeExact(width, height);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_create_raster_bgra failed", t);
         }
     }
 
@@ -2365,6 +2404,29 @@ public final class NativeBridge {
             return (int) MH_SURFACE_READ_PIXELS_ARGB.invokeExact(handle, dst, x, y, w, h);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_surface_read_pixels_argb failed", t);
+        }
+    }
+
+    /** True when the native lib ships the dirty-rect readback symbol. */
+    public static boolean hasReadPixelsArgbStride() {
+        return MH_SURFACE_READ_PIXELS_ARGB_STRIDE != null;
+    }
+
+    /**
+     * Dirty-rect readback in INT_ARGB_PRE layout: reads the (x,y,w,h)
+     * sub-rect into the FULL-FRAME buffer {@code dst} (stride
+     * {@code dstRowBytes}), landing it at its natural offset so the
+     * buffer stays a coherent full frame. Callers must check
+     * {@link #hasReadPixelsArgbStride()} first.
+     */
+    public static int surfaceReadPixelsArgbStride(MemorySegment handle, MemorySegment dst,
+                                                  int dstRowBytes,
+                                                  int x, int y, int w, int h) {
+        try {
+            return (int) MH_SURFACE_READ_PIXELS_ARGB_STRIDE.invokeExact(
+                handle, dst, dstRowBytes, x, y, w, h);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_read_pixels_argb_stride failed", t);
         }
     }
 

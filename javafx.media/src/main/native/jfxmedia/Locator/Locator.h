@@ -69,6 +69,11 @@ public:
     // String (or null). Used to pick the companion demuxer + decoder.
     static jstring GetCompanionAudioContentType(JNIEnv *env, jobject locator);
 
+    // Skia-fx: ask the Java Locator for the companion stream's own
+    // content length in bytes (-1 unknown). Used to stamp the correct
+    // "size" onto the companion's javasource instead of the primary's.
+    static jlong GetCompanionAudioSize(JNIEnv *env, jobject locator);
+
     inline const string& GetContentType() { return m_contentType; }
 
     inline const string GetLocation() { return m_location; }
@@ -90,6 +95,14 @@ public:
         m_companionAudioContentType = ct;
     }
 
+    // Skia-fx: companion stream's own size in bytes (-1 unknown). The
+    // primary's size hint must NOT be stamped onto the companion's
+    // javasource — it corrupts byte-based progress/EOS math.
+    inline int64_t GetCompanionAudioSizeHint() { return m_llCompanionAudioSize; }
+    inline void SetCompanionAudioSizeHint(int64_t size) {
+        m_llCompanionAudioSize = size;
+    }
+
     int64_t    GetSizeHint();
 
 protected:
@@ -101,6 +114,8 @@ protected:
     string      m_companionAudioLocation;
     /** Skia-fx: companion audio container content type (http(s) path). */
     string      m_companionAudioContentType;
+    /** Skia-fx: companion stream's own size in bytes (-1 unknown). */
+    int64_t     m_llCompanionAudioSize = -1;
 };
 
 #endif  //_LOCATOR_H_

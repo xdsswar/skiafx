@@ -79,6 +79,28 @@ struct InteropState {
 
 InteropState g_state;
 
+// skia-fx: quiesce window. While a window surface / swap-chain is being
+// resized or rebuilt (fullscreen toggle, monitor move), a concurrent
+// wglDXRegisterObjectNV / wglDXLockObjectsNV can deadlock inside the
+// driver's GL<->D3D11 sync — observed as an FX-thread hang severe enough
+// to stall the desktop compositor during 4K zero-copy playback. The
+// resize paths call openjfx_skia_d3d11_interop_quiesce(ms); until the
+// window expires, register/lock fail fast and the media texture simply
+// keeps showing its previous frame (the consumer treats a register/lock
+// failure as "skip this frame", never as an error).
+std::atomic<int64_t> g_quiesceUntilMs{0};
+
+int64_t monotonicMs() {
+    LARGE_INTEGER f, c;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&c);
+    return (int64_t)(c.QuadPart / (f.QuadPart / 1000));
+}
+
+bool interopQuiesced() {
+    return monotonicMs() < g_quiesceUntilMs.load(std::memory_order_relaxed);
+}
+
 // Each registered texture keeps its WGL handle + GL texture name +
 // (optionally) the source D3D11 texture for the smoke-test path which
 // also owns the texture. mfwrapper-supplied textures keep ownerTex=nullptr.
@@ -212,6 +234,21 @@ extern "C" OPENJFX_INTEROP_API int32_t openjfx_skia_d3d11_interop_ready(void) {
     return g_state.ready.load() ? 1 : 0;
 }
 
+// skia-fx: block new interop register/lock calls for the next `millis` ms
+// (extends, never shortens, an active window). Called by the surface
+// resize / swap-chain rebuild paths; see g_quiesceUntilMs above.
+extern "C" OPENJFX_INTEROP_API void openjfx_skia_d3d11_interop_quiesce(int32_t millis) {
+    if (millis <= 0) return;
+    int64_t until = monotonicMs() + millis;
+    int64_t cur = g_quiesceUntilMs.load(std::memory_order_relaxed);
+    while (until > cur &&
+           !g_quiesceUntilMs.compare_exchange_weak(cur, until,
+                                                   std::memory_order_relaxed)) {
+        // cur reloaded by compare_exchange_weak; loop until stored or
+        // an even later deadline is already in place.
+    }
+}
+
 extern "C" OPENJFX_INTEROP_API void openjfx_skia_d3d11_interop_shutdown(void) {
     if (!g_state.ready.exchange(false)) return;
     if (g_state.wglInteropDevice && g_state.fns.closeDevice) {
@@ -229,6 +266,7 @@ extern "C" OPENJFX_INTEROP_API void*
 openjfx_skia_d3d11_interop_register_texture(void* d3d11Texture,
                                              uint32_t* glTextureOut) {
     if (!g_state.ready.load() || !d3d11Texture) return nullptr;
+    if (interopQuiesced()) return nullptr; // resize in flight — skip frame
 
     // No dedup: each register creates a fresh entry + WGL handle, even
     // when the same D3D11 texture pointer reappears (producer's pool
@@ -281,6 +319,7 @@ openjfx_skia_d3d11_interop_lock(void* handle) {
     auto* entry = static_cast<TextureEntry*>(handle);
     if (!entry || !g_state.ready.load()) return 0;
     if (entry->locked) return 1; // idempotent
+    if (interopQuiesced()) return 0; // resize in flight — skip frame
     BOOL ok = g_state.fns.lockObjects(g_state.wglInteropDevice, 1, &entry->wglHandle);
     entry->locked = (ok == TRUE);
     return entry->locked ? 1 : 0;
@@ -378,6 +417,7 @@ openjfx_skia_d3d11_interop_smoke_test_release(void* handle) {
 extern "C" OPENJFX_INTEROP_API int32_t openjfx_skia_d3d11_interop_init(void) { return 0; }
 extern "C" OPENJFX_INTEROP_API void*   openjfx_skia_d3d11_interop_get_device(void) { return nullptr; }
 extern "C" OPENJFX_INTEROP_API int32_t openjfx_skia_d3d11_interop_ready(void) { return 0; }
+extern "C" OPENJFX_INTEROP_API void    openjfx_skia_d3d11_interop_quiesce(int32_t) {}
 extern "C" OPENJFX_INTEROP_API void    openjfx_skia_d3d11_interop_shutdown(void) {}
 extern "C" OPENJFX_INTEROP_API void* openjfx_skia_d3d11_interop_register_texture(void*, uint32_t*) { return nullptr; }
 extern "C" OPENJFX_INTEROP_API int32_t openjfx_skia_d3d11_interop_lock(void*) { return 0; }

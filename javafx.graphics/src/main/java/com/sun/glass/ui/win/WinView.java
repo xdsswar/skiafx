@@ -87,6 +87,8 @@ final class WinView extends View {
     @Override native protected void _begin(long ptr);
     @Override native protected void _end(long ptr);
     @Override native protected void _uploadPixels(long ptr, Pixels pixels);
+    @Override native protected void _uploadPixelsRect(long ptr, Pixels pixels,
+                                                      int x, int y, int w, int h);
     @Override native protected boolean _enterFullscreen(long ptr, boolean animate, boolean keepRatio, boolean hideCursor);
     @Override native protected void _exitFullscreen(long ptr, boolean animate);
 

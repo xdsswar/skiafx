@@ -30,6 +30,7 @@
 #include <gst/app/gstappsink.h>
 #include <PipelineManagement/VideoTrack.h>
 #include <MediaManagement/Media.h>
+#include <MediaManagement/MediaTypes.h>
 #include <jni/Logger.h>
 #include <Common/VSMemory.h>
 #include <Utils/LowLevelPerf.h>
@@ -39,6 +40,14 @@
 
 #define MAX_SIZE_BUFFERS_LIMIT 25
 #define MAX_SIZE_BUFFERS_INC   5
+// skia-fx: absolute ceiling for the cross-queue growth in
+// CheckQueueSize. The PLAYING branch grows the full queue by
+// MAX_SIZE_BUFFERS_INC whenever the OTHER queue is empty — with a
+// starved dual-source companion that condition holds for minutes,
+// and the video queue was observed at ~3984 buffers (~167 MB of
+// compressed 4K in RAM). 240 buffers (~10 s at 24 fps) is far above
+// anything legitimate preroll interleaving needs.
+#define MAX_SIZE_BUFFERS_HARD_LIMIT 240
 
 //*************************************************************************************************
 //********** class CGstAVPlaybackPipeline
@@ -107,6 +116,134 @@ static GstPadProbeReturn _skiafx_audio_decoder_src_probe(GstPad* pad,
     return GST_PAD_PROBE_OK;
 }
 
+// skia-fx: probe on the companion audio DEMUXER's src pad. Logs the
+// first buffers + every 100th + all serialized events. Distinguishes
+// "the demux stopped delivering" (no more lines) from "downstream
+// stopped pulling" (sink probe stops but demux lines continue).
+static GstPadProbeReturn _skiafx_audio_demux_src_probe(GstPad* pad,
+                                                       GstPadProbeInfo* info,
+                                                       gpointer user_data)
+{
+    static guint64 _demuxCount = 0;
+    if (info->type & GST_PAD_PROBE_TYPE_BUFFER) {
+        GstBuffer* buf = GST_PAD_PROBE_INFO_BUFFER(info);
+        if (buf && (_demuxCount < 30 || (_demuxCount % 100) == 0)) {
+            GstClockTime pts = GST_BUFFER_PTS(buf);
+            g_print("[audio-demux-probe] buf#%llu pts=%.4fs size=%zu\n",
+                    (unsigned long long)_demuxCount,
+                    GST_CLOCK_TIME_IS_VALID(pts) ? pts / 1e9 : -1.0,
+                    (size_t)gst_buffer_get_size(buf));
+        }
+        _demuxCount++;
+    } else if (info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+        GstEvent* ev = GST_PAD_PROBE_INFO_EVENT(info);
+        if (ev) {
+            // gst_event_type_get_name isn't exported by gstreamer-lite.
+            const char* tag = "OTHER";
+            switch (GST_EVENT_TYPE(ev)) {
+            case GST_EVENT_SEGMENT:      tag = "SEGMENT"; break;
+            case GST_EVENT_CAPS:         tag = "CAPS"; break;
+            case GST_EVENT_FLUSH_START:  tag = "FLUSH_START"; break;
+            case GST_EVENT_FLUSH_STOP:   tag = "FLUSH_STOP"; break;
+            case GST_EVENT_EOS:          tag = "EOS"; break;
+            case GST_EVENT_STREAM_START: tag = "STREAM_START"; break;
+            case GST_EVENT_GAP:          tag = "GAP"; break;
+            case GST_EVENT_TAG:          tag = "TAG"; break;
+            default: break;
+            }
+            if (GST_EVENT_TYPE(ev) == GST_EVENT_SEGMENT) {
+                const GstSegment* seg = NULL;
+                gst_event_parse_segment(ev, &seg);
+                if (seg != NULL) {
+                    g_print("[audio-demux-probe] EVENT SEGMENT fmt=%d rate=%.2f "
+                            "start=%.4fs stop=%.4fs base=%.4fs time=%.4fs pos=%.4fs\n",
+                            (int)seg->format, seg->rate,
+                            seg->start / 1e9,
+                            (seg->stop == (guint64)-1) ? -1.0 : seg->stop / 1e9,
+                            seg->base / 1e9, seg->time / 1e9,
+                            seg->position / 1e9);
+                } else {
+                    g_print("[audio-demux-probe] EVENT SEGMENT (unparsed)\n");
+                }
+            } else {
+                g_print("[audio-demux-probe] EVENT %s (%d)\n",
+                        tag, (int)GST_EVENT_TYPE(ev));
+            }
+        }
+    }
+    (void)pad;
+    (void)user_data;
+    return GST_PAD_PROBE_OK;
+}
+
+// skia-fx: segment probe for the VIDEO demuxer SINK pad — shows what
+// format (BYTES vs TIME) qtdemux actually receives upstream. qtdemux only
+// uses the moof tfdt for timing when its upstream is NOT in TIME format
+// (upstream_format_is_time == FALSE); a stray TIME segment here is what
+// makes a fragmented-mp4 byte-seek land at time 0.
+static GstPadProbeReturn _skiafx_video_demux_sink_probe(GstPad* pad,
+                                                        GstPadProbeInfo* info,
+                                                        gpointer user_data)
+{
+    if (info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+        GstEvent* ev = GST_PAD_PROBE_INFO_EVENT(info);
+        if (ev && GST_EVENT_TYPE(ev) == GST_EVENT_SEGMENT) {
+            const GstSegment* seg = NULL;
+            gst_event_parse_segment(ev, &seg);
+            if (seg != NULL) {
+                g_print("[video-demux-SINK] EVENT SEGMENT fmt=%d (%s) "
+                        "start=%lld stop=%lld\n",
+                        (int)seg->format,
+                        seg->format == GST_FORMAT_TIME ? "TIME" :
+                        seg->format == GST_FORMAT_BYTES ? "BYTES" : "?",
+                        (long long)seg->start,
+                        (long long)((seg->stop == (guint64)-1) ? -1 : (long long)seg->stop));
+            }
+        }
+    }
+    (void)pad;
+    (void)user_data;
+    return GST_PAD_PROBE_OK;
+}
+
+// skia-fx: segment/event probe for the VIDEO demux pad — the video-side
+// twin of the audio demux probe above. Events only (4K buffer logging
+// would be noise). Lets a rate-change/seek divergence between the two
+// chains' segments be read directly off the log.
+static GstPadProbeReturn _skiafx_video_demux_src_probe(GstPad* pad,
+                                                       GstPadProbeInfo* info,
+                                                       gpointer user_data)
+{
+    if (info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
+        GstEvent* ev = GST_PAD_PROBE_INFO_EVENT(info);
+        if (ev && GST_EVENT_TYPE(ev) == GST_EVENT_SEGMENT) {
+            const GstSegment* seg = NULL;
+            gst_event_parse_segment(ev, &seg);
+            if (seg != NULL) {
+                g_print("[video-demux-probe] EVENT SEGMENT fmt=%d rate=%.2f "
+                        "start=%.4fs stop=%.4fs base=%.4fs time=%.4fs pos=%.4fs\n",
+                        (int)seg->format, seg->rate,
+                        seg->start / 1e9,
+                        (seg->stop == (guint64)-1) ? -1.0 : seg->stop / 1e9,
+                        seg->base / 1e9, seg->time / 1e9,
+                        seg->position / 1e9);
+            }
+        } else if (ev) {
+            const char* tag = NULL;
+            switch (GST_EVENT_TYPE(ev)) {
+            case GST_EVENT_FLUSH_START:  tag = "FLUSH_START"; break;
+            case GST_EVENT_FLUSH_STOP:   tag = "FLUSH_STOP"; break;
+            case GST_EVENT_EOS:          tag = "EOS"; break;
+            default: break;
+            }
+            if (tag) g_print("[video-demux-probe] EVENT %s\n", tag);
+        }
+    }
+    (void)pad;
+    (void)user_data;
+    return GST_PAD_PROBE_OK;
+}
+
 // skia-fx: dual-source diagnostic probe. Logs the first few audio
 // buffers reaching the sink + every segment/flush/EOS event. Used to
 // pinpoint whether "audio faster + loops" is a sample-rate problem,
@@ -122,12 +259,14 @@ static GstPadProbeReturn _skiafx_audio_sink_probe(GstPad* pad,
         if (buf && (_bufCount < 20 || (_bufCount % 200) == 0)) {
             GstClockTime pts = GST_BUFFER_PTS(buf);
             GstClockTime dur = GST_BUFFER_DURATION(buf);
-            g_print("[audio-sink-probe] buf#%llu pts=%.4fs dur=%.4fs size=%zu off=%llu\n",
+            // wall lets pts-delta vs wall-delta show whether the sink is
+            // FED continuously (feed cadence) across the modulo samples.
+            g_print("[audio-sink-probe] buf#%llu wall=%.2f pts=%.4fs dur=%.4fs size=%zu\n",
                     (unsigned long long)_bufCount,
+                    g_get_monotonic_time() / 1e6,
                     GST_CLOCK_TIME_IS_VALID(pts) ? pts / 1e9 : -1.0,
                     GST_CLOCK_TIME_IS_VALID(dur) ? dur / 1e9 : -1.0,
-                    (size_t)gst_buffer_get_size(buf),
-                    (unsigned long long)GST_BUFFER_OFFSET(buf));
+                    (size_t)gst_buffer_get_size(buf));
         }
         _bufCount++;
     } else if (info->type & GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM) {
@@ -204,6 +343,14 @@ CGstAVPlaybackPipeline::CGstAVPlaybackPipeline(const GstElementContainer& elemen
     m_videoCodecErrorCode = ERROR_NONE;
     m_bStaticPipeline = false; // For now all video pipelines are dynamic
     m_FirstPTS = GST_CLOCK_TIME_NONE;
+    m_bSeekVideoPrime = false;
+    m_SeekPrimeTargetNs = -1;
+    m_lastVideoFrameMonoUs = g_get_monotonic_time();
+    m_lastVideoFramePtsNs = -1;
+    m_seekIssuedMonoUs = 0;
+    m_watchPrevAudioNs = -1;
+    m_videoRecoverAttempts = 0;
+    m_consecPlayingTicks = 0;
 }
 
 /**
@@ -492,11 +639,31 @@ bool CGstAVPlaybackPipeline::LoadDecoder(GstCaps *pCaps)
                 gint codecId = JFX_CODEC_ID_UNKNOWN;
                 if (strstr(mimetype, "video/x-h264") != NULL) // H.264
                 {
+                    // skia-fx: AVI carries H.264 as a raw annex-B byte
+                    // stream WITHOUT the avcC codec_data dshowwrapper
+                    // requires — route those to ffmpeg (whose H.264
+                    // decoder parses annex-B natively). MP4/FLV keep
+                    // the proven dshowwrapper path. The ffmpegdemux
+                    // catch-all can deliver either avc or byte-stream
+                    // (e.g. H.264-in-MPEG-TS), so it must always use the
+                    // libavcodec path too — never the platform decoder.
+                    const bool annexBContainer =
+                        (m_pOptions != NULL &&
+                         (m_pOptions->GetContentType() == CONTENT_TYPE_AVI ||
+                          m_pOptions->GetContentType() == CONTENT_TYPE_FFMPEG));
+                    if (annexBContainer && ffmpegwrapper_supports_mimetype(mimetype))
+                    {
+                        strVideoDecoderName = "ffmpegwrapper";
+                        codecId = JFX_CODEC_ID_UNKNOWN; // resolved from caps
+                    }
+                    else
+                    {
                     codecId = JFX_CODEC_ID_H264;
                     strVideoDecoderName = (forceFfmpeg && ffmpegwrapper_supports(codecId))
                         ? "ffmpegwrapper"
                         : (ffmpegwrapper_supports(codecId)
                             ? "ffmpegwrapper" : "dshowwrapper");
+                    }
                 }
                 else if (strstr(mimetype, "video/x-h265") != NULL) // H.265
                 {
@@ -603,6 +770,51 @@ GstFlowReturn CGstAVPlaybackPipeline::OnAppSinkHaveFrame(GstElement* pElem, CGst
     {
         gst_sample_unref(pSample);
         return GST_FLOW_OK;
+    }
+
+    // skia-fx: verbose-gated video frame arrival trace — confirms frames keep
+    // reaching the sink after a seek (vs. the decoder/demux stalling).
+    if (_skiafx_media_verbose()) {
+        static guint64 s_vframe = 0;
+        guint64 n = ++s_vframe;
+        if (n <= 5 || (n % 60) == 0 || GST_BUFFER_IS_DISCONT(pBuffer)) {
+            g_print("[video-sink-frame] #%llu pts=%.4fs%s\n",
+                    (unsigned long long) n,
+                    GST_BUFFER_TIMESTAMP_IS_VALID(pBuffer) ?
+                        GST_BUFFER_TIMESTAMP(pBuffer) / 1e9 : -1.0,
+                    GST_BUFFER_IS_DISCONT(pBuffer) ? " DISCONT" : "");
+        }
+    }
+
+    // skia-fx: video liveness for the stall-recovery watchdog — record when
+    // and at what stream PTS the last frame reached the sink. The recovery
+    // budget is reset by the watchdog once video is in sync again (not here),
+    // so a frame that is merely flowing-but-far-behind still counts as a lag.
+    pPipeline->m_lastVideoFrameMonoUs = g_get_monotonic_time();
+    if (GST_BUFFER_TIMESTAMP_IS_VALID(pBuffer))
+        pPipeline->m_lastVideoFramePtsNs = (gint64) GST_BUFFER_TIMESTAMP(pBuffer);
+
+    // skia-fx: post-seek video catch-up. While priming, the video sink renders
+    // the late catch-up frames (sync OFF) instead of dropping them. Once the
+    // video PTS reaches the audio master position the two are aligned, so
+    // re-lock the sink to the clock for steady-state A/V sync. Uses the raw
+    // (pre-m_FirstPTS-adjustment) buffer PTS, which is in stream time like
+    // the value GetStreamTime() reports.
+    if (pPipeline->m_bSeekVideoPrime && GST_BUFFER_TIMESTAMP_IS_VALID(pBuffer))
+    {
+        double videoSec = GST_BUFFER_TIMESTAMP(pBuffer) / 1e9;
+        double audioSec = 0.0;
+        pPipeline->GetStreamTime(&audioSec);
+        if (videoSec + 0.05 >= audioSec)
+        {
+            pPipeline->m_bSeekVideoPrime = false;
+            pPipeline->m_SeekPrimeTargetNs = -1;
+            if (pPipeline->m_Elements[VIDEO_SINK] != NULL)
+                g_object_set(G_OBJECT(pPipeline->m_Elements[VIDEO_SINK]), "sync", TRUE, NULL);
+            if (_skiafx_media_verbose())
+                g_print("[seek-prime] caught up: video=%.3fs audio=%.3fs -> sync ON\n",
+                        videoSec, audioSec);
+        }
     }
 
     if (pPipeline->m_SendFrameSizeEvent || GST_BUFFER_IS_DISCONT(pBuffer))
@@ -862,6 +1074,16 @@ void CGstAVPlaybackPipeline::on_pad_added(GstElement *element, GstPad *pad, CGst
             return;
         }
 
+        // skia-fx: the audio decoder is PRESET at pipeline construction
+        // by container (mp4 → dshowwrapper for AAC). Containers can
+        // carry codecs that preset can't decode — Opus/Vorbis/FLAC in
+        // MP4 (e.g. files produced by MediaMixer from webm sources)
+        // played video-only. Mirror what the video side does with
+        // LoadDecoder: now that the real caps are known, swap the
+        // decoder inside the (still-unlinked, NULL-state) audio bin
+        // when the preset can't handle them.
+        pPipeline->SwapAudioDecoderIfNeeded(pCaps);
+
         if (pPipeline->IsCodecSupported(pCaps))
         {
             pPad = gst_element_get_static_pad(pPipeline->m_Elements[AUDIO_BIN], "sink");
@@ -904,6 +1126,14 @@ void CGstAVPlaybackPipeline::on_pad_added(GstElement *element, GstPad *pad, CGst
             // and the decoder-src probe shows what the decoder emits
             // before downstream elements touch it.
             if (_skiafx_media_verbose()) {
+                // Companion demux output probe — distinguishes "demux
+                // stopped delivering" from "downstream stopped pulling".
+                gst_pad_add_probe(pad,
+                    (GstPadProbeType)(GST_PAD_PROBE_TYPE_BUFFER |
+                                      GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM),
+                    _skiafx_audio_demux_src_probe, NULL, NULL);
+                g_print("[audio-demux-probe] installed on %s audio pad\n",
+                        GST_ELEMENT_NAME(element));
                 if (pPipeline->m_Elements[AUDIO_SINK] != NULL) {
                     GstPad* sinkPad = gst_element_get_static_pad(
                         pPipeline->m_Elements[AUDIO_SINK], "sink");
@@ -966,6 +1196,28 @@ void CGstAVPlaybackPipeline::on_pad_added(GstElement *element, GstPad *pad, CGst
             pPipeline->m_bHasVideo = true;
             pPipeline->PostBuildInit();
             gst_element_sync_state_with_parent(pPipeline->m_Elements[VIDEO_BIN]);
+
+            // skia-fx: verbose-gated probe on the video demux pad —
+            // mirrors the audio one so segment rate/base divergence
+            // between the two chains is visible after seeks and rate
+            // changes (dual-source "video racing" diagnosis).
+            if (_skiafx_media_verbose()) {
+                gst_pad_add_probe(pad,
+                    (GstPadProbeType)GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                    _skiafx_video_demux_src_probe, NULL, NULL);
+                g_print("[video-demux-probe] installed on %s video pad\n",
+                        GST_ELEMENT_NAME(element));
+                // Also probe qtdemux's SINK to see incoming segment format.
+                GstPad* demuxSink = gst_element_get_static_pad(element, "sink");
+                if (demuxSink != NULL) {
+                    gst_pad_add_probe(demuxSink,
+                        (GstPadProbeType)GST_PAD_PROBE_TYPE_EVENT_DOWNSTREAM,
+                        _skiafx_video_demux_sink_probe, NULL, NULL);
+                    gst_object_unref(demuxSink);
+                    g_print("[video-demux-SINK] installed on %s sink pad\n",
+                            GST_ELEMENT_NAME(element));
+                }
+            }
         }
     }
 
@@ -1061,6 +1313,155 @@ void CGstAVPlaybackPipeline::no_more_pads(GstElement *element, CGstAVPlaybackPip
     pPipeline->m_pBusCallbackContent->m_DisposeLock->Exit();
 }
 
+// skia-fx: arm post-seek video catch-up. The HD video fragment has to be
+// fetched and decoded from its keyframe up to the seek target while the
+// audio master clock is already running, so the first displayable frames
+// are "late" and the clock-synced sink would QoS-drop them (frozen picture).
+// Turn the video sink's clock sync OFF so those frames render; the next
+// frames callback re-locks sync once the video PTS has caught up to the
+// audio position. Only meaningful when there is a separate video sink
+// (single-source/audio-only have no companion-clock catch-up problem).
+// Arm post-seek video catch-up priming (sync OFF + grace). Shared by user
+// seeks and the watchdog's recovery re-seek. Does NOT touch the recovery
+// budget — see OnSeekIssued vs WatchdogTick.
+void CGstAVPlaybackPipeline::ArmVideoPrime(gint64 seekTimeNs)
+{
+    if (!m_bHasVideo || m_Elements[VIDEO_SINK] == NULL)
+        return;
+
+    m_SeekPrimeTargetNs = seekTimeNs;
+    m_bSeekVideoPrime = true;
+    gint64 nowUs = g_get_monotonic_time();
+    m_lastVideoFrameMonoUs = nowUs; // grace: no recovery while this fetches
+    m_seekIssuedMonoUs = nowUs;
+    g_object_set(G_OBJECT(m_Elements[VIDEO_SINK]), "sync", FALSE, NULL);
+
+    if (_skiafx_media_verbose())
+        g_print("[seek-prime] arm: video sync OFF, target=%.3fs\n",
+                seekTimeNs / 1e9);
+}
+
+void CGstAVPlaybackPipeline::OnSeekRequested(gint64 seekTimeNs)
+{
+    if (!m_bHasVideo)
+        return;
+    // Arm the recovery grace and move the lag baseline to the target the
+    // instant a seek is requested. Otherwise, in the window between the seek
+    // applying the new audio segment and the post-seek prime, the watchdog
+    // would compare the stale pre-seek video PTS against the new audio
+    // position, see a huge false "lag", and fire a spurious recovery re-seek
+    // that races the user seek and briefly wedges the pipeline.
+    gint64 nowUs = g_get_monotonic_time();
+    m_seekIssuedMonoUs = nowUs;
+    m_lastVideoFrameMonoUs = nowUs;
+    m_lastVideoFramePtsNs = seekTimeNs; // pretend video is at the target
+    m_videoRecoverAttempts = 0;         // fresh budget for this user seek
+}
+
+void CGstAVPlaybackPipeline::OnSeekIssued(gint64 seekTimeNs)
+{
+    // Post-seek: prime the video catch-up (the budget/grace were already armed
+    // in OnSeekRequested at request time).
+    ArmVideoPrime(seekTimeNs);
+}
+
+// skia-fx: video-stall recovery (called from the watchdog ~every 2 s). If the
+// video chain has produced no frame for a while but the audio master clock is
+// still advancing, it is a video-only stall (a post-seek fragment that never
+// arrived/decoded, or a transient decoder wedge) rather than a pause or a
+// whole-pipeline buffering stall. Re-seek ONLY the video chain onto the live
+// audio position: this re-fetches the fragment and re-primes catch-up without
+// touching the audio. Attempts are bounded and reset as soon as a video frame
+// arrives, so a genuinely dead stream can't spin forever.
+void CGstAVPlaybackPipeline::WatchdogTick()
+{
+    if (!m_bHasVideo || m_Elements[VIDEO_SINK] == NULL)
+        return;
+
+    // Only consider recovery during sustained, continuous PLAYING. While the
+    // player is buffering/stall-flapping (startup, source starvation) the
+    // proper whole-pipeline stall handling owns the situation; intervening
+    // there would flush the video mid-buffer and make the flapping worse.
+    if (!IsPlayerState(Playing))
+    {
+        m_consecPlayingTicks = 0;
+        return;
+    }
+    if (m_consecPlayingTicks < 1000000)
+        m_consecPlayingTicks++;
+    if (m_consecPlayingTicks < 3)
+        return; // not been smoothly playing long enough to trust a stall
+
+    gint64 nowUs = g_get_monotonic_time();
+    gint64 frameAgeUs = nowUs - m_lastVideoFrameMonoUs;
+
+    double audioSec = 0.0;
+    GetStreamTime(&audioSec);
+    gint64 audioNs = (gint64)(audioSec * GST_SECOND);
+    bool audioAdvancing = (m_watchPrevAudioNs >= 0) &&
+                          (audioNs > m_watchPrevAudioNs + (gint64)(GST_SECOND / 5));
+    m_watchPrevAudioNs = audioNs;
+
+    // How far the most recent displayed video frame trails the audio master.
+    gint64 videoLagNs = (m_lastVideoFramePtsNs >= 0)
+                        ? (audioNs - m_lastVideoFramePtsNs) : G_MAXINT64;
+
+    // Healthy: video is current. Clear the recovery budget so a later glitch
+    // gets a fresh set of attempts, and we're done.
+    if (frameAgeUs < G_USEC_PER_SEC && videoLagNs < (gint64)(GST_SECOND / 2))
+    {
+        m_videoRecoverAttempts = 0;
+        return;
+    }
+
+    // The audio master must actually be moving (otherwise this is a pause or a
+    // whole-pipeline buffering stall, not a video-only problem).
+    if (!audioAdvancing)
+        return;
+
+    // Give a just-issued seek time to fetch + catch up before intervening.
+    // Exponential backoff per recovery attempt: a 4K/13 Mbps fragment can
+    // legitimately take longer than the base grace to fetch + decode, and
+    // re-seeking mid-fetch restarts the download — attempts 2/4/8/16 s
+    // apart give a slow network room to finish instead of thrashing it.
+    gint64 graceUs = (gint64)(2 * G_USEC_PER_SEC) << m_videoRecoverAttempts;
+    if (nowUs - m_seekIssuedMonoUs < graceUs)
+        return;
+
+    // Recover when the video is frozen (no frame for ~2 s) OR is playing but
+    // has fallen badly behind the audio (out of sync "by a bunch", ~3 s+):
+    // re-seek ONLY the video onto the live audio position so it snaps forward
+    // into sync instead of freezing or trailing.
+    bool frozen  = frameAgeUs > 2 * G_USEC_PER_SEC;
+    bool lagging = videoLagNs > 3 * (gint64) GST_SECOND;
+    if (!frozen && !lagging)
+        return;
+
+    if (m_videoRecoverAttempts >= 4)
+        return; // give up rather than loop on a dead/too-slow stream
+
+    m_videoRecoverAttempts++;
+
+    if (_skiafx_media_verbose())
+        g_print("[seek-recover] %s (frameAge=%.1fs lag=%.1fs) audio=%.3fs -> "
+                "re-seek video (attempt %d)\n",
+                frozen ? "frozen" : "lagging",
+                frameAgeUs / 1e6,
+                (videoLagNs == G_MAXINT64) ? -1.0 : videoLagNs / 1e9,
+                audioSec, m_videoRecoverAttempts);
+
+    // Video-only flushing seek onto the live audio position, serialised with
+    // the user seek path (m_SeekLock) and skipped if a user seek is queued, so
+    // it can never race a coalesced SeekPipeline and wedge the video chain.
+    // Audio is untouched, so there is no audible blip.
+    if (RecoverVideoSeekLocked(audioNs))
+    {
+        // Re-arm catch-up WITHOUT refilling the recovery budget (only a real
+        // user seek does that), so this can't loop on a dead/too-slow stream.
+        ArmVideoPrime(audioNs);
+    }
+}
+
 void CGstAVPlaybackPipeline::CheckQueueSize(GstElement *element)
 {
     guint current_level_buffers = 0;
@@ -1127,9 +1528,118 @@ void CGstAVPlaybackPipeline::CheckQueueSize(GstElement *element)
     if (inc_size_time)
     {
         g_object_get(element, "max-size-buffers", &max_size_buffers, NULL);
-        max_size_buffers += MAX_SIZE_BUFFERS_INC;
-        g_object_set(element, "max-size-buffers", max_size_buffers, NULL);
+        // skia-fx: max-size-buffers == 0 = unlimited-by-count (the
+        // dual-source audio queue is TIME-limited instead); "growing"
+        // it to a small count would silently destroy that config. The
+        // hard ceiling stops the starved-companion runaway (see define).
+        if (max_size_buffers > 0 && max_size_buffers < MAX_SIZE_BUFFERS_HARD_LIMIT)
+        {
+            max_size_buffers += MAX_SIZE_BUFFERS_INC;
+            g_object_set(element, "max-size-buffers", max_size_buffers, NULL);
+        }
     }
+}
+
+// skia-fx: replace the preset audio decoder inside AUDIO_BIN with
+// ffmpegwrapper when the demuxer's announced caps are a codec the
+// preset can't decode (Opus/Vorbis/FLAC — dshowwrapper handles only
+// AAC/MP3-family). Runs from on_pad_added BEFORE the bin is added to
+// the pipeline, so all elements are in NULL state and relinking is
+// safe. Best effort: on any failure the bin is left as it was and the
+// old behaviour (silent audio for these codecs) applies.
+void CGstAVPlaybackPipeline::SwapAudioDecoderIfNeeded(GstCaps* pCaps)
+{
+    GstElement* oldDec = m_Elements[AUDIO_DECODER];
+    if (oldDec == NULL || pCaps == NULL)
+        return;
+
+    const GstStructure* s = gst_caps_get_structure(pCaps, 0);
+    const gchar* name = s ? gst_structure_get_name(s) : NULL;
+    if (name == NULL)
+        return;
+
+    bool needsFfmpeg = g_str_has_prefix(name, "audio/x-opus") ||
+                       g_str_has_prefix(name, "audio/x-vorbis") ||
+                       g_str_has_prefix(name, "audio/x-flac");
+    if (!needsFfmpeg)
+        return;
+
+    // Already routed to ffmpeg? The preset name in the options is the
+    // source of truth for what was built into the bin.
+    const char* preset = (m_pOptions != NULL) ? m_pOptions->GetAudioDecoder() : NULL;
+    if (preset != NULL && strcmp(preset, "ffmpegwrapper") == 0)
+        return;
+
+    GstElement* newDec = gst_element_factory_make("ffmpegwrapper", NULL);
+    if (newDec == NULL)
+        return; // no ffmpeg in this build — keep the old (degraded) path
+
+    // Capture the old decoder's neighbours via its pad peers.
+    GstPad* decSink = gst_element_get_static_pad(oldDec, "sink");
+    GstPad* decSrc  = gst_element_get_static_pad(oldDec, "src");
+    GstPad* upSrc   = decSink ? gst_pad_get_peer(decSink) : NULL; // queue.src
+    GstPad* downSink = decSrc ? gst_pad_get_peer(decSrc)  : NULL; // next.sink
+
+    bool swapped = false;
+    if (upSrc != NULL && downSink != NULL)
+    {
+        gst_pad_unlink(upSrc, decSink);
+        gst_pad_unlink(decSrc, downSink);
+
+        GstElement* bin = m_Elements[AUDIO_BIN];
+        gst_element_set_state(oldDec, GST_STATE_NULL);
+        gst_object_ref(oldDec); // keep alive across gst_bin_remove so we can roll back
+        gst_bin_remove(GST_BIN(bin), oldDec);
+
+        if (gst_bin_add(GST_BIN(bin), newDec))
+        {
+            GstPad* newSink = gst_element_get_static_pad(newDec, "sink");
+            GstPad* newSrc  = gst_element_get_static_pad(newDec, "src");
+            if (newSink != NULL && newSrc != NULL &&
+                gst_pad_link(upSrc, newSink) == GST_PAD_LINK_OK &&
+                gst_pad_link(newSrc, downSink) == GST_PAD_LINK_OK)
+            {
+                m_Elements.add(AUDIO_DECODER, newDec);
+                swapped = true;
+                if (_skiafx_media_verbose())
+                    g_print("[audio-decoder-swap] %s -> ffmpegwrapper for caps %s\n",
+                            preset ? preset : "(preset)", name);
+            }
+            if (!swapped)
+            {
+                // Undo any partial links before evicting the new decoder
+                // (only upSrc->newSink can have linked if we got here).
+                GstPad* partialPeer = newSink ? gst_pad_get_peer(newSink) : NULL;
+                if (partialPeer != NULL)
+                {
+                    gst_pad_unlink(partialPeer, newSink);
+                    gst_object_unref(partialPeer);
+                }
+                gst_bin_remove(GST_BIN(bin), newDec);
+                newDec = NULL; // bin removal dropped the last ref
+            }
+            if (newSink) gst_object_unref(newSink);
+            if (newSrc)  gst_object_unref(newSrc);
+        }
+
+        if (!swapped)
+        {
+            // Roll back: restore the original decoder and its links so the
+            // bin really is "left as it was" — m_Elements[AUDIO_DECODER]
+            // still points at oldDec, which must stay alive and wired.
+            gst_bin_add(GST_BIN(bin), oldDec);
+            gst_pad_link(upSrc, decSink);
+            gst_pad_link(decSrc, downSink);
+        }
+        gst_object_unref(oldDec); // our temp ref (on success this finalizes it)
+    }
+    if (!swapped && newDec != NULL && GST_OBJECT_PARENT(newDec) == NULL)
+        gst_object_unref(newDec);
+
+    if (upSrc)    gst_object_unref(upSrc);
+    if (downSink) gst_object_unref(downSink);
+    if (decSink)  gst_object_unref(decSink);
+    if (decSrc)   gst_object_unref(decSrc);
 }
 
 void CGstAVPlaybackPipeline::queue_overrun(GstElement *element, CGstAVPlaybackPipeline *pPipeline)
@@ -1185,8 +1695,20 @@ void CGstAVPlaybackPipeline::queue_underrun(GstElement *element, CGstAVPlaybackP
         if (inc_size_time)
         {
             g_object_get(inc_element, "max-size-buffers", &max_size_buffers, NULL);
-            max_size_buffers += MAX_SIZE_BUFFERS_INC;
-            g_object_set(inc_element, "max-size-buffers", max_size_buffers, NULL);
+            // skia-fx: cap the growth. This path had no limit check —
+            // with a dual-source pipeline whose audio chain starved, the
+            // permanently-empty audio queue grew the video queue by
+            // MAX_SIZE_BUFFERS_INC per underrun without bound (observed:
+            // 3984 buffers ≈ 167 MB of compressed 4K in RAM). Same limit
+            // CheckQueueSize enforces. max-size-buffers == 0 means the
+            // queue is UNLIMITED-by-count (the dual-source audio queue is
+            // time-limited instead) — growing it to a small count would
+            // silently destroy that configuration.
+            if (max_size_buffers > 0 && max_size_buffers < MAX_SIZE_BUFFERS_LIMIT)
+            {
+                max_size_buffers += MAX_SIZE_BUFFERS_INC;
+                g_object_set(inc_element, "max-size-buffers", max_size_buffers, NULL);
+            }
         }
     }
 }

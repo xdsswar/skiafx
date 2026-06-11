@@ -32,6 +32,7 @@ import com.sun.media.jfxmedia.MediaPlayer;
 import com.sun.media.jfxmedia.events.PlayerStateEvent.PlayerState;
 import com.sun.media.jfxmedia.locator.Locator;
 import com.sun.media.jfxmedia.logging.Logger;
+import com.sun.media.jfxmediaimpl.MediaFfmpegConfig;
 import com.sun.media.jfxmediaimpl.MediaUtils;
 import com.sun.media.jfxmediaimpl.platform.Platform;
 import java.util.Arrays;
@@ -57,7 +58,16 @@ public final class GSTPlatform extends Platform {
         // is built into gstreamer-lite on Windows + Linux (see
         // skiafx.matroska-conventions). macOS keeps its own list below.
         "video/x-matroska",
-        "video/webm"
+        "video/webm",
+        // skia-fx: raw ADTS AAC (signature-detected). aacparse + the
+        // platform audio decoder on the native side.
+        "audio/aac",
+        // skia-fx format expansion: raw FLAC (flacparse + ffmpeg),
+        // AVI (avidemux) and FLV (flvdemux) — demuxers from the same
+        // pinned gst-plugins-good sources as matroska.
+        "audio/flac",
+        "video/x-msvideo",
+        "video/x-flv"
     };
 
     /**
@@ -114,8 +124,31 @@ public final class GSTPlatform extends Platform {
     public String[] getSupportedContentTypes() {
         if (PlatformUtil.isMac()) {
             return Arrays.copyOf(CONTENT_TYPES_MACOS, CONTENT_TYPES_MACOS.length);
-        } else {
-            return Arrays.copyOf(CONTENT_TYPES, CONTENT_TYPES.length);
+        }
+        // skia-fx catch-all: when the ffmpeg runtime is loaded, accept the
+        // generic content type that MediaUtils assigns to unrecognized
+        // containers — the native pipeline factory routes it to the
+        // ffmpegdemux (libavformat) element. The dedicated demuxers above
+        // stay preferred for the formats they handle (hybrid). The probe
+        // is cached, so this is a cheap volatile read after the first call.
+        if (isFfmpegAvailable()) {
+            String[] base = CONTENT_TYPES;
+            String[] all = Arrays.copyOf(base, base.length + 1);
+            all[base.length] = MediaUtils.CONTENT_TYPE_FFMPEG;
+            return all;
+        }
+        return Arrays.copyOf(CONTENT_TYPES, CONTENT_TYPES.length);
+    }
+
+    /**
+     * True when the ffmpeg runtime is loaded (so the libavformat catch-all
+     * demuxer is usable). Cached by {@code MediaFfmpegConfig}; never throws.
+     */
+    private static boolean isFfmpegAvailable() {
+        try {
+            return MediaFfmpegConfig.initialize(null);
+        } catch (Throwable t) {
+            return false;
         }
     }
 

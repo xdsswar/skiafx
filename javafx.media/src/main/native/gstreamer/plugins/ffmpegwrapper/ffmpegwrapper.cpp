@@ -100,11 +100,29 @@ struct _GstFfmpegWrapper {
     gboolean        is_audio;
     int             aud_rate;       // sample rate from caps (Hz)
     int             aud_channels;   // channel count from caps
+    int             aud_out_channels; // resolved count the pushed src caps
+                                      // describe (frame-first); the packer
+                                      // must match it
+    // [ffw-audio-diag] counters (OPENJFX_MEDIA_VERBOSE only). PER
+    // INSTANCE — two simultaneous audio decoders (e.g. dual players)
+    // would interleave shared statics into one meaningless ratio and
+    // mask each other's droughts.
+    guint64         diag_pkts_in;
+    guint64         diag_frames_out;
+    guint64         diag_last_out_pkt;
     // Codec-private bytes from caps `codec_data` (or vorbis streamheaders
     // packed Xiph-style). Owned by the element; freed in close_decoder
     // via the avctx (ffmpeg copies these on open).
     guint8*         aud_extradata;
     int             aud_extradata_size;
+    // skia-fx: VIDEO codec-private bytes from caps `codec_data` — the avcC
+    // (H.264) / hvcC (H.265) box for stream-format=avc/hvc1 containers
+    // (mp4 via qtdemux, mkv via matroskademux). Without it libavcodec
+    // expects annex-B and dies with "Error splitting the input into NAL
+    // units" on length-prefixed samples. Annex-B containers (AVI, TS)
+    // simply have no codec_data, so this stays NULL there.
+    guint8*         vid_extradata;
+    int             vid_extradata_size;
 
     // Container-level color metadata, lifted from the INPUT caps event
     // (e.g. qtdemux parses MP4's colr atom, matroskademux parses MKV's
@@ -1184,12 +1202,16 @@ static enum AVCodecID jfx_to_av_codec_id(gint codec_id) {
     switch (codec_id) {
         case JFX_CODEC_ID_AV1:  return AV_CODEC_ID_AV1;
         case JFX_CODEC_ID_H265: return AV_CODEC_ID_HEVC;
-#ifdef JFX_CODEC_ID_H264
+        // skia-fx: these were wrapped in `#ifdef JFX_CODEC_ID_H264` /
+        // `#ifdef JFX_CODEC_ID_AVC1` — but the JFX codec ids are ENUM
+        // constants (fxplugins_common.h), not macros, so the #ifdefs were
+        // always false and the cases never compiled. That silently defeated
+        // LoadDecoder's ffmpeg-preferred routing: is-supported came back
+        // FALSE for H.264 and every MP4 fell back to dshowwrapper, whose
+        // Microsoft decoder collapses (~2 fps) on streams above its level
+        // 5.2 ceiling (e.g. YouTube avc1.64003e = level 6.2).
         case JFX_CODEC_ID_H264: return AV_CODEC_ID_H264;
-#endif
-#ifdef JFX_CODEC_ID_AVC1
         case JFX_CODEC_ID_AVC1: return AV_CODEC_ID_H264;
-#endif
         // skia-fx: audio mappings so the AAC-in-MKV codec probe in
         // CGstAudioPlaybackPipeline::IsCodecSupported (which sets
         // codec-id=JFX_CODEC_ID_AAC and reads is-supported) returns
@@ -1388,6 +1410,21 @@ static bool open_decoder(GstFfmpegWrapper* self) {
             self->avctx->ch_layout.nb_channels = self->aud_channels;
         }
     } else {
+        // Video codec-private data (avcC / hvcC) from the caps. Must be in
+        // place before avcodec_open2 or the decoder assumes annex-B and
+        // fails to split length-prefixed (mp4/mkv) samples into NAL units.
+        if (self->vid_extradata && self->vid_extradata_size > 0) {
+            self->avctx->extradata =
+                (uint8_t*)ff->av_malloc(self->vid_extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+            if (self->avctx->extradata) {
+                memcpy(self->avctx->extradata,
+                       self->vid_extradata, self->vid_extradata_size);
+                memset(self->avctx->extradata + self->vid_extradata_size, 0,
+                       AV_INPUT_BUFFER_PADDING_SIZE);
+                self->avctx->extradata_size = self->vid_extradata_size;
+            }
+        }
+
         // Video: hwaccel — best effort, fall back to SW if it fails.
         //
         // Hard kill switch: when OPENJFX_MEDIA_USE_HWACCEL=0/false/F,
@@ -1454,6 +1491,11 @@ static void close_decoder(GstFfmpegWrapper* self) {
         g_free(self->aud_extradata);
         self->aud_extradata = nullptr;
         self->aud_extradata_size = 0;
+    }
+    if (self->vid_extradata) {
+        g_free(self->vid_extradata);
+        self->vid_extradata = nullptr;
+        self->vid_extradata_size = 0;
     }
 }
 
@@ -1588,14 +1630,32 @@ static inline int16_t clamp_to_s16(float v) {
     return (int16_t)v;
 }
 
+// skia-fx: `channels` is passed by the CALLER from the caps-harvested
+// value — NOT read from f->ch_layout. The ffmpeg runtime DLLs are
+// fetched independently of the compiled headers, and AVFrame's
+// rate/ch_layout fields live deep enough in the struct that a version
+// drift returns garbage there (observed: ch=0 → mono fallback → every
+// decoded buffer at HALF size → audio playing double-speed in chunks).
+// nb_samples / format / extended_data are early, ABI-stable fields.
 static GstBuffer* pack_audio_frame_to_s16le(const OpenJfxFfmpegFns* ff,
-                                            AVFrame* f,
+                                            AVFrame* f, int channels,
                                             GstClockTime ts, GstClockTime dur) {
     (void)ff;
-    int channels = f->ch_layout.nb_channels;
-    if (channels <= 0) channels = 1;
+    if (channels <= 0) channels = 2;
     int nb = f->nb_samples;
     if (nb <= 0) return nullptr;
+
+    // Guard against caps-vs-frame channel mismatch (caps can claim
+    // stereo for a stream the decoder emits as mono, or carry no count
+    // at all → fallback 2). Never index a plane the frame doesn't have:
+    // clamp planar reads to the planes actually present (the last real
+    // plane is duplicated — mono comes out doubled, not crashed), and
+    // clamp interleaved copies to linesize[0]. extended_data/linesize
+    // are early, ABI-stable AVFrame fields.
+    int planes = 0;
+    while (planes < channels && f->extended_data[planes] != NULL) planes++;
+    if (planes == 0) return nullptr;
+    gsize avail = (f->linesize[0] > 0) ? (gsize)f->linesize[0] : 0;
 
     gsize sz = (gsize)nb * channels * sizeof(int16_t);
     GstBuffer* buf = gst_buffer_new_allocate(NULL, sz, NULL);
@@ -1610,61 +1670,77 @@ static GstBuffer* pack_audio_frame_to_s16le(const OpenJfxFfmpegFns* ff,
     int fmt = f->format;
     switch (fmt) {
     case AV_SAMPLE_FMT_S16: {
-        // Already interleaved S16 — straight copy.
-        memcpy(out, f->extended_data[0], sz);
+        // Already interleaved S16 — straight copy, clamped to the
+        // frame's real payload; zero-fill if caps over-claimed.
+        gsize n = (avail > 0 && avail < sz) ? avail : sz;
+        memcpy(out, f->extended_data[0], n);
+        if (n < sz) memset((guint8*)out + n, 0, sz - n);
         break;
     }
     case AV_SAMPLE_FMT_S16P: {
-        for (int s = 0; s < nb; ++s) {
-            for (int c = 0; c < channels; ++c) {
-                out[s * channels + c] = ((const int16_t*)f->extended_data[c])[s];
-            }
+        for (int c = 0; c < channels; ++c) {
+            const int16_t* src =
+                (const int16_t*)f->extended_data[c < planes ? c : planes - 1];
+            for (int s = 0; s < nb; ++s)
+                out[s * channels + c] = src[s];
         }
         break;
     }
     case AV_SAMPLE_FMT_FLT: {
         const float* src = (const float*)f->extended_data[0];
         gsize total = (gsize)nb * channels;
+        if (avail > 0 && avail / sizeof(float) < total) {
+            total = avail / sizeof(float);
+            memset(out, 0, sz);
+        }
         for (gsize i = 0; i < total; ++i) out[i] = clamp_to_s16(src[i]);
         break;
     }
     case AV_SAMPLE_FMT_FLTP: {
-        for (int s = 0; s < nb; ++s) {
-            for (int c = 0; c < channels; ++c) {
-                out[s * channels + c] =
-                    clamp_to_s16(((const float*)f->extended_data[c])[s]);
-            }
+        for (int c = 0; c < channels; ++c) {
+            const float* src =
+                (const float*)f->extended_data[c < planes ? c : planes - 1];
+            for (int s = 0; s < nb; ++s)
+                out[s * channels + c] = clamp_to_s16(src[s]);
         }
         break;
     }
     case AV_SAMPLE_FMT_S32: {
         const int32_t* src = (const int32_t*)f->extended_data[0];
         gsize total = (gsize)nb * channels;
+        if (avail > 0 && avail / sizeof(int32_t) < total) {
+            total = avail / sizeof(int32_t);
+            memset(out, 0, sz);
+        }
         for (gsize i = 0; i < total; ++i) out[i] = (int16_t)(src[i] >> 16);
         break;
     }
     case AV_SAMPLE_FMT_S32P: {
-        for (int s = 0; s < nb; ++s) {
-            for (int c = 0; c < channels; ++c) {
-                out[s * channels + c] =
-                    (int16_t)(((const int32_t*)f->extended_data[c])[s] >> 16);
-            }
+        for (int c = 0; c < channels; ++c) {
+            const int32_t* src =
+                (const int32_t*)f->extended_data[c < planes ? c : planes - 1];
+            for (int s = 0; s < nb; ++s)
+                out[s * channels + c] = (int16_t)(src[s] >> 16);
         }
         break;
     }
     case AV_SAMPLE_FMT_U8: {
         const uint8_t* src = (const uint8_t*)f->extended_data[0];
         gsize total = (gsize)nb * channels;
+        if (avail > 0 && avail < total) {
+            total = avail;
+            memset(out, 0, sz);
+        }
         for (gsize i = 0; i < total; ++i)
             out[i] = (int16_t)((int)src[i] - 128) << 8;
         break;
     }
     case AV_SAMPLE_FMT_U8P: {
-        for (int s = 0; s < nb; ++s) {
-            for (int c = 0; c < channels; ++c) {
-                out[s * channels + c] = (int16_t)
-                    ((int)((const uint8_t*)f->extended_data[c])[s] - 128) << 8;
-            }
+        for (int c = 0; c < channels; ++c) {
+            const uint8_t* src =
+                (const uint8_t*)f->extended_data[c < planes ? c : planes - 1];
+            for (int s = 0; s < nb; ++s)
+                out[s * channels + c] = (int16_t)((int)src[s] - 128) << 8;
         }
         break;
     }
@@ -1691,8 +1767,32 @@ static GstFlowReturn gst_ffmpegwrapper_chain(GstPad* pad, GstObject* parent,
     GstFfmpegWrapper* self = GST_FFMPEGWRAPPER(parent);
     const OpenJfxFfmpegFns* ff = openjfx_ffmpeg_loader_fns();
     if (!ff || !self->is_supported || !open_decoder(self)) {
+        // One-shot reason print: a silent GST_FLOW_ERROR here surfaces
+        // upstream as a generic "Internal data stream error", which is
+        // undiagnosable without this line.
+        if (getenv("SKIA_MEDIA_DEBUG")) {
+            static int once = 0;
+            if (!once) {
+                once = 1;
+                g_print("[ffmpegwrapper] chain refused: ff=%d is_supported=%d "
+                        "av_codec_id=%d (open_decoder=%d)\n",
+                        ff != NULL, (int)self->is_supported,
+                        (int)self->av_codec_id,
+                        (ff && self->is_supported) ? 0 : -1);
+            }
+        }
         gst_buffer_unref(in);
         return GST_FLOW_ERROR;
+    }
+
+    // Parsers (flacparse et al.) push the stream's header blocks as
+    // ordinary buffers flagged HEADER. The decoder is already primed
+    // with the same data via extradata — feeding the headers again as
+    // packets makes libavcodec reject them (AVERROR_INVALIDDATA).
+    if (self->is_audio && self->aud_extradata != NULL &&
+        GST_BUFFER_FLAG_IS_SET(in, GST_BUFFER_FLAG_HEADER)) {
+        gst_buffer_unref(in);
+        return GST_FLOW_OK;
     }
 
     GstMapInfo info = {};
@@ -1719,9 +1819,60 @@ static GstFlowReturn gst_ffmpegwrapper_chain(GstPad* pad, GstObject* parent,
     gst_buffer_unref(in);
 
     int rc = ff->avcodec_send_packet(self->avctx, self->pkt);
+    if (rc == AVERROR_EOF) {
+        // skia-fx: AVERROR_EOF from send_packet means the codec is in
+        // DRAIN mode (a NULL packet was sent on EOS). In drain mode it
+        // rejects every input packet until flushed — silently eating
+        // the stream (audio goes dead after a seek that follows EOS).
+        // Recover: flush (exits drain) and resend this packet.
+        ff->avcodec_flush_buffers(self->avctx);
+        rc = ff->avcodec_send_packet(self->avctx, self->pkt);
+    }
+    if (rc == AVERROR_INVALIDDATA) {
+        // A single undecodable packet (corruption, stray header bytes)
+        // must not kill the whole stream — drop it and keep going.
+        // libavcodec resynchronizes on the next valid frame.
+        if (getenv("SKIA_MEDIA_DEBUG")) {
+            g_print("[ffmpegwrapper] dropping invalid packet (send_packet "
+                    "AVERROR_INVALIDDATA)\n");
+        }
+        return GST_FLOW_OK;
+    }
     if (rc < 0 && rc != AVERROR(EAGAIN) && rc != AVERROR_EOF) {
         g_print("[ffmpegwrapper] send_packet error %d\n", rc);
         return GST_FLOW_ERROR;
+    }
+
+    // skia-fx: audio decode in/out accounting (OPENJFX_MEDIA_VERBOSE
+    // only). One line per 100 packets; immediately reports send errors
+    // and long emit droughts. Counters are per instance (see struct).
+    gboolean diagOn = FALSE;
+    {
+        static int diagCached = -1;
+        if (diagCached < 0) {
+            const char* v = g_getenv("OPENJFX_MEDIA_VERBOSE");
+            diagCached = (v != NULL && v[0] != '\0' && v[0] != '0') ? 1 : 0;
+        }
+        diagOn = (diagCached == 1) ? TRUE : FALSE;
+    }
+    if (diagOn && self->is_audio) {
+        self->diag_pkts_in++;
+        if (rc != 0) {
+            g_print("[ffw-audio-diag] %p pkt#%llu send rc=%d (EAGAIN=%d EOF=%d)\n",
+                    (void*)self, (unsigned long long)self->diag_pkts_in, rc,
+                    rc == AVERROR(EAGAIN), rc == AVERROR_EOF);
+        }
+        if ((self->diag_pkts_in % 100) == 0) {
+            g_print("[ffw-audio-diag] %p pkts_in=%llu frames_out=%llu\n",
+                    (void*)self, (unsigned long long)self->diag_pkts_in,
+                    (unsigned long long)self->diag_frames_out);
+        }
+        if (self->diag_pkts_in - self->diag_last_out_pkt == 50) {
+            g_print("[ffw-audio-diag] %p DROUGHT: 50 packets consumed with no "
+                    "frame emitted (pkts_in=%llu frames_out=%llu)\n",
+                    (void*)self, (unsigned long long)self->diag_pkts_in,
+                    (unsigned long long)self->diag_frames_out);
+        }
     }
 
     AVFrame* frame = ff->av_frame_alloc();
@@ -1756,12 +1907,24 @@ static GstFlowReturn gst_ffmpegwrapper_chain(GstPad* pad, GstObject* parent,
              || frame->height != self->negotiated_height);
         if (!self->caps_negotiated || videoSizeChanged) {
             if (self->is_audio) {
-                int rate = self->avctx->sample_rate;
-                int channels = self->avctx->ch_layout.nb_channels;
-                if (channels <= 0) channels = self->aud_channels;
-                if (rate <= 0)     rate = self->aud_rate;
-                if (channels <= 0) channels = 2;
-                if (rate <= 0)     rate = 48000;
+                // The decoded FRAME's fields describe the actual data
+                // and win when sane (the loader's ABI guard refuses a
+                // drifted runtime, so they can't be struct-layout
+                // garbage). Container caps can legitimately differ —
+                // HE-AAC SBR signals the core rate (e.g. 24000) while
+                // the decoder emits twice that; mono streams can ship
+                // caps claiming stereo. Fallback order: frame →
+                // demux-caps harvest → avctx → safe defaults.
+                int rate = frame->sample_rate;
+                int channels = frame->ch_layout.nb_channels;
+                if (rate < 8000 || rate > 192000)  rate = self->aud_rate;
+                if (channels <= 0 || channels > 8) channels = self->aud_channels;
+                if (rate <= 0)     rate = self->avctx->sample_rate;
+                if (channels <= 0) channels = self->avctx->ch_layout.nb_channels;
+                if (channels <= 0 || channels > 8) channels = 2;
+                if (rate < 8000 || rate > 192000)  rate = 48000;
+                // The packer must produce buffers matching these caps.
+                self->aud_out_channels = channels;
                 GstCaps* caps = gst_caps_new_simple("audio/x-raw",
                     "format",   G_TYPE_STRING, "S16LE",
                     "layout",   G_TYPE_STRING, "interleaved",
@@ -1884,8 +2047,14 @@ static GstFlowReturn gst_ffmpegwrapper_chain(GstPad* pad, GstObject* parent,
 
         GstBuffer* out = nullptr;
         if (self->is_audio) {
-            // Audio path. PCM S16LE buffer.
-            out = pack_audio_frame_to_s16le(ff, frame, in_ts, in_dur);
+            // Audio path. PCM S16LE buffer. The channel count is the one
+            // the caps push above resolved (frame-first) — buffers and
+            // caps MUST agree or downstream reads the stream at the
+            // wrong stride.
+            int outChannels = self->aud_out_channels;
+            if (outChannels <= 0) outChannels = self->aud_channels;
+            if (outChannels <= 0) outChannels = 2;
+            out = pack_audio_frame_to_s16le(ff, frame, outChannels, in_ts, in_dur);
         } else if (frame->format == AV_PIX_FMT_D3D11 && self->hw_ready) {
             // HW path. data[0] = ID3D11Texture2D*, data[1] = subres
             // (the ffmpeg convention is uint8_t* set to (intptr_t)idx).
@@ -1999,6 +2168,15 @@ static GstFlowReturn gst_ffmpegwrapper_chain(GstPad* pad, GstObject* parent,
 
         if (!out) { ret = GST_FLOW_ERROR; break; }
         GstFlowReturn pushed = gst_pad_push(self->srcpad, out);
+        if (diagOn && self->is_audio) {
+            self->diag_frames_out++;
+            self->diag_last_out_pkt = self->diag_pkts_in;
+            if (pushed != GST_FLOW_OK) {
+                g_print("[ffw-audio-diag] %p push rc=%d at frame#%llu\n",
+                        (void*)self, (int)pushed,
+                        (unsigned long long)self->diag_frames_out);
+            }
+        }
         if (pushed != GST_FLOW_OK) { ret = pushed; break; }
     }
     ff->av_frame_free(&frame);
@@ -2088,6 +2266,30 @@ static gboolean gst_ffmpegwrapper_sink_event(GstPad* pad, GstObject* parent,
                 } else if (getenv("SKIA_MEDIA_DEBUG")) {
                     g_print("[ffmpegwrapper.color] no container colorimetry in input caps\n");
                 }
+                if (!self->is_audio && s) {
+                    // Video codec-private data (avcC / hvcC). Required for
+                    // stream-format=avc/hvc1 input (length-prefixed NALs);
+                    // absent for annex-B containers. Re-captured on every
+                    // caps event (a seek/renegotiation may resend caps).
+                    if (self->vid_extradata) {
+                        g_free(self->vid_extradata);
+                        self->vid_extradata = nullptr;
+                        self->vid_extradata_size = 0;
+                    }
+                    const GValue* vcdv = gst_structure_get_value(s, "codec_data");
+                    if (vcdv && G_VALUE_HOLDS(vcdv, GST_TYPE_BUFFER)) {
+                        GstBuffer* cb = gst_value_get_buffer(vcdv);
+                        GstMapInfo m = {};
+                        if (cb && gst_buffer_map(cb, &m, GST_MAP_READ)) {
+                            self->vid_extradata = (guint8*)g_malloc(m.size);
+                            if (self->vid_extradata) {
+                                memcpy(self->vid_extradata, m.data, m.size);
+                                self->vid_extradata_size = (int)m.size;
+                            }
+                            gst_buffer_unmap(cb, &m);
+                        }
+                    }
+                }
                 if (self->is_audio && s) {
                     gint rate = 0, channels = 0;
                     gst_structure_get_int(s, "rate", &rate);
@@ -2129,7 +2331,42 @@ static gboolean gst_ffmpegwrapper_sink_event(GstPad* pad, GstObject* parent,
                         }
                     } else {
                         const GValue* shv = gst_structure_get_value(s, "streamheader");
-                        if (shv && GST_VALUE_HOLDS_ARRAY(shv)) {
+                        if (getenv("SKIA_MEDIA_DEBUG")) {
+                            g_print("[ffmpegwrapper] caps streamheader=%p GST_TYPE_ARRAY=%" G_GSIZE_FORMAT
+                                    " value-type=%" G_GSIZE_FORMAT "\n",
+                                    (void*)shv, (gsize)GST_TYPE_ARRAY,
+                                    shv ? (gsize)G_VALUE_TYPE(shv) : 0);
+                        }
+                        const gchar* capsName = gst_structure_get_name(s);
+                        if (shv && GST_VALUE_HOLDS_ARRAY(shv) && capsName
+                                && strstr(capsName, "audio/x-flac")) {
+                            // flacparse streamheaders: buffer 0 is the
+                            // ogg-FLAC mapping (13 bytes: 0x7f"FLAC"…)
+                            // + 4-byte metadata block header + the
+                            // 34-byte STREAMINFO. libavcodec's FLAC
+                            // decoder wants exactly the bare STREAMINFO
+                            // as extradata — Xiph lacing would make
+                            // avcodec_open2 reject the stream.
+                            guint n = gst_value_array_get_size(shv);
+                            const GValue* hv0 = (n >= 1)
+                                ? gst_value_array_get_value(shv, 0) : NULL;
+                            if (hv0 && G_VALUE_HOLDS(hv0, GST_TYPE_BUFFER)) {
+                                GstBuffer* b = gst_value_get_buffer(hv0);
+                                GstMapInfo m = {};
+                                if (b && gst_buffer_map(b, &m, GST_MAP_READ)) {
+                                    if (m.size >= 13 + 4 + 34 &&
+                                        m.data[0] == 0x7f &&
+                                        memcmp(m.data + 1, "FLAC", 4) == 0) {
+                                        self->aud_extradata = (guint8*)g_malloc(34);
+                                        if (self->aud_extradata) {
+                                            memcpy(self->aud_extradata, m.data + 17, 34);
+                                            self->aud_extradata_size = 34;
+                                        }
+                                    }
+                                    gst_buffer_unmap(b, &m);
+                                }
+                            }
+                        } else if (shv && GST_VALUE_HOLDS_ARRAY(shv)) {
                             guint n = gst_value_array_get_size(shv);
                             if (n == 1) {
                                 const GValue* hv0 = gst_value_array_get_value(shv, 0);
@@ -2211,7 +2448,23 @@ static gboolean gst_ffmpegwrapper_sink_event(GstPad* pad, GstObject* parent,
         case GST_EVENT_FLUSH_START:
             return gst_pad_event_default(pad, parent, event);
         case GST_EVENT_FLUSH_STOP:
-            if (ff && self->avctx) ff->avcodec_flush_buffers(self->avctx);
+            // skia-fx: FLUSH events are OUT-OF-BAND — they arrive on the
+            // seeking thread and do NOT take the pad's stream lock, so
+            // without explicit locking avcodec_flush_buffers() here RACES
+            // the streaming thread that may be inside
+            // avcodec_send_packet()/avcodec_receive_frame() on the SAME
+            // AVCodecContext (the chain function runs under the stream
+            // lock). A mid-decode flush corrupts the codec's internal
+            // state — the decoder then consumes every packet and emits
+            // nothing, silently and permanently (the dual-source "plays
+            // two notes then freezes" wedge; a per-run race coin flip).
+            // GStreamer's own decoder base classes take the stream lock
+            // in their flush_stop path for exactly this reason.
+            if (ff && self->avctx) {
+                GST_PAD_STREAM_LOCK(pad);
+                ff->avcodec_flush_buffers(self->avctx);
+                GST_PAD_STREAM_UNLOCK(pad);
+            }
             return gst_pad_event_default(pad, parent, event);
         case GST_EVENT_EOS:
             if (ff && self->avctx) {
@@ -2282,8 +2535,14 @@ static void gst_ffmpegwrapper_init(GstFfmpegWrapper* self) {
     self->is_audio     = FALSE;
     self->aud_rate     = 0;
     self->aud_channels = 0;
+    self->aud_out_channels = 0;
+    self->diag_pkts_in      = 0;
+    self->diag_frames_out   = 0;
+    self->diag_last_out_pkt = 0;
     self->aud_extradata = nullptr;
     self->aud_extradata_size = 0;
+    self->vid_extradata = nullptr;
+    self->vid_extradata_size = 0;
     self->container_yuv_matrix = -1;
     self->container_yuv_range  = -1;
     self->negotiated_width  = 0;

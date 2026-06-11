@@ -96,6 +96,22 @@ abstract class ViewPainter implements Runnable {
      */
     private NGNode root, overlayRoot;
 
+    // skia-fx: union of the back-buffer area painted by this pass, in DEVICE
+    // pixels, for dirty-rect-limited presents on the readback tier. Reused
+    // across pulses (no per-frame allocation). paintedPartial == false means
+    // "the whole surface was (or may have been) painted".
+    private final Rectangle paintedRegion = new Rectangle();
+    private boolean paintedPartial;
+
+    /**
+     * The device-pixel union of the area painted by the most recent
+     * {@link #paintImpl}, or {@code null} when the whole surface was (or may
+     * have been) painted. Valid until the next paint; do not retain.
+     */
+    final Rectangle getPaintedRegion() {
+        return paintedPartial ? paintedRegion : null;
+    }
+
     // These variables are all used as part of the dirty region optimizations,
     // and if dirty opts are turned off via a runtime flag, then these fields
     // are never initialized or used.
@@ -164,6 +180,9 @@ abstract class ViewPainter implements Runnable {
     }
 
     protected void paintImpl(final Graphics backBufferGraphics) {
+        // Default to "whole surface" — only the dirty-region path below
+        // narrows it. Covers renderEverything, debug overlays and bails.
+        paintedPartial = false;
         // We should not be painting anything with a width / height
         // that is <= 0, so we might as well bail right off.
         if (width <= 0 || height <= 0 || backBufferGraphics == null) {
@@ -314,11 +333,24 @@ abstract class ViewPainter implements Runnable {
             }
 
             // Paint each dirty region
+            int unionX0 = Integer.MAX_VALUE, unionY0 = Integer.MAX_VALUE;
+            int unionX1 = Integer.MIN_VALUE, unionY1 = Integer.MIN_VALUE;
             for (int i = 0; i < dirtyRegionSize; ++i) {
                 final RectBounds dirtyRegion = dirtyRegionContainer.getDirtyRegion(i);
                 // TODO it should be impossible to have ever created a dirty region that was empty...
                 // Make sure we are not trying to render in some invalid region
                 if (dirtyRegion.getWidth() > 0 && dirtyRegion.getHeight() > 0) {
+                    // skia-fx: accumulate the painted union in DEVICE pixels
+                    // for the partial-present path (independent of the clip
+                    // convention below, which is logical for SkiaGraphics).
+                    int ux0 = (int) Math.floor(dirtyRegion.getMinX() * pixelScaleX);
+                    int uy0 = (int) Math.floor(dirtyRegion.getMinY() * pixelScaleY);
+                    int ux1 = (int) Math.ceil (dirtyRegion.getMaxX() * pixelScaleX);
+                    int uy1 = (int) Math.ceil (dirtyRegion.getMaxY() * pixelScaleY);
+                    if (ux0 < unionX0) unionX0 = ux0;
+                    if (uy0 < unionY0) unionY0 = uy0;
+                    if (ux1 > unionX1) unionX1 = ux1;
+                    if (uy1 > unionY1) unionY1 = uy1;
                     // Set the clip rectangle using integer bounds since a fractional bounding box will
                     // still require a complete repaint on pixel boundaries.
                     //
@@ -343,6 +375,14 @@ abstract class ViewPainter implements Runnable {
                     doPaint(g, getRootPath(i));
                     getRootPath(i).clear();
                 }
+            }
+            // Publish the painted union for the partial-present path. The
+            // debug overlays (dirty boxes / overdraw) scribble outside the
+            // dirty regions, so they keep the full-surface default.
+            if (!showDirtyOpts && unionX1 > unionX0 && unionY1 > unionY0) {
+                paintedRegion.setBounds(unionX0, unionY0,
+                    unionX1 - unionX0, unionY1 - unionY0);
+                paintedPartial = true;
             }
         } else {
             // There are no dirty regions, so just paint everything

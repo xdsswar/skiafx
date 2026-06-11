@@ -186,6 +186,34 @@ jstring CLocator::GetCompanionAudioContentType(JNIEnv *env, jobject locator)
     return result;
 }
 
+// Skia-fx: companion stream's own content length in bytes (-1 unknown).
+// Captured Java-side when the companion connection is established; used
+// to stamp the correct "size" onto the companion's javasource instead
+// of the primary's size hint.
+jlong CLocator::GetCompanionAudioSize(JNIEnv *env, jobject locator)
+{
+    if (env == NULL || locator == NULL)
+        return -1;
+
+    CJavaEnvironment javaEnv(env);
+
+    static jmethodID mid_GetCompanionAudioContentLength = NULL;
+    if (mid_GetCompanionAudioContentLength == NULL)
+    {
+        jclass klass = env->GetObjectClass(locator);
+        mid_GetCompanionAudioContentLength = env->GetMethodID(klass,
+            "getCompanionAudioContentLength", "()J");
+        env->DeleteLocalRef(klass);
+        if (javaEnv.clearException() || mid_GetCompanionAudioContentLength == NULL)
+            return -1;
+    }
+
+    jlong result = env->CallLongMethod(locator, mid_GetCompanionAudioContentLength);
+    if (javaEnv.clearException())
+        return -1;
+    return result;
+}
+
 jobject CLocator::GetAudioStreamConnectionHolder(JNIEnv *env, jobject locator, jobject connectionHolder)
 {
     if (env == NULL || locator == NULL || connectionHolder == NULL)

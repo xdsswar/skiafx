@@ -25,7 +25,9 @@ import com.sun.prism.paint.Stop;
 import com.sun.prism.skia.impl.FrameArena;
 import com.sun.prism.skia.impl.NativeBridge;
 import com.sun.prism.skia.impl.PathEncoder;
+import com.sun.prism.skia.impl.SkiaGpu;
 import com.sun.prism.skia.impl.SkiaShaders;
+import com.sun.prism.skia.impl.SoftwareGradientCache;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
@@ -230,6 +232,17 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     (int) Math.ceil(width), (int) Math.ceil(height),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
+                // Software tier: large gradient fills run Skia's scalar
+                // pipeline (~120 ns/px under MSVC) — serve repeated ones
+                // from the cached-image blit instead. Falls through to the
+                // direct fill whenever ineligible; GPU tiers skip entirely.
+                if (p instanceof Gradient grad && SkiaGpu.isResolvedSoftware()
+                        && SoftwareGradientCache.tryFill(surface,
+                            getTransformNoClone(),
+                            getPixelScaleFactorX(), getPixelScaleFactorY(),
+                            grad, x, y, width, height, 0, 0)) {
+                    return;
+                }
                 try (SkiaShaders.Handle s = shaderFor(p)) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillRectShader(handle(), x, y, width, height,
@@ -254,6 +267,15 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 NativeBridge.surfaceFillRoundRect(handle(), x, y, w, h, arcw, arch,
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
+                // Software tier: see fillRect — cached blit for repeated
+                // large gradient fills (CSS rounded backgrounds).
+                if (p instanceof Gradient grad && SkiaGpu.isResolvedSoftware()
+                        && SoftwareGradientCache.tryFill(surface,
+                            getTransformNoClone(),
+                            getPixelScaleFactorX(), getPixelScaleFactorY(),
+                            grad, x, y, w, h, arcw, arch)) {
+                    return;
+                }
                 try (SkiaShaders.Handle s = shaderFor(p)) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillRoundRectShader(

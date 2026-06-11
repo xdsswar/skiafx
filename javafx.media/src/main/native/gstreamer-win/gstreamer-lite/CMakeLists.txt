@@ -323,6 +323,29 @@ add_library(gstreamer-lite-plugins OBJECT
     $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/lzo.c>
     $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${NATIVE_ROOT}/gstreamer/plugins/matroska-lite-plugin.c>
     $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${NATIVE_ROOT}/gstreamer/plugins/matroska-compat.c>
+
+    # scaletempo — time-stretched (pitch-preserved) audio for
+    # MediaPlayer.setRate(rate != 1.0). Fetched from the same
+    # gst-plugins-good tarball into <matroska-dir>/audiofx by
+    # skiafx.matroska-conventions; registered by our thin lite-style
+    # plugin entry (the upstream audiofx plugin entry isn't compiled).
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/audiofx/gstscaletempo.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${NATIVE_ROOT}/gstreamer/plugins/scaletempo-lite-plugin.c>
+
+    # avi + flv demuxers and the flac parser — format expansion. Same
+    # fetch as matroska; upstream plugin-entry and mux-side files are
+    # NOT compiled (our thin *-lite-plugin.c wrappers register the
+    # demux/parse elements only). gstflvdemux.c #includes its private
+    # gstindex.c/gstmemindex.c copies directly — do not list them.
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/avi/gstavielement.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/avi/gstavidemux.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/avi/gstavisubtitle.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${NATIVE_ROOT}/gstreamer/plugins/avi-lite-plugin.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/flv/gstflvelement.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/flv/gstflvdemux.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${NATIVE_ROOT}/gstreamer/plugins/flv-lite-plugin.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${OPENJFX_GST_MATROSKA_DIR}/audioparsers/gstflacparse.c>
+    $<$<BOOL:${OPENJFX_GST_MATROSKA_DIR}>:${NATIVE_ROOT}/gstreamer/plugins/flacparse-lite-plugin.c>
 )
 if(OPENJFX_GST_MATROSKA_DIR)
     target_compile_definitions(gstreamer-lite-plugins PRIVATE OPENJFX_HAVE_MATROSKA)
@@ -330,6 +353,13 @@ endif()
 target_compile_definitions(gstreamer-lite-plugins PRIVATE
     ${GST_COMMON_DEFINES}
     LIBGSTELEMENTS_EXPORTS
+    # skia-fx: same GST_EXPORTS story as gstreamer-lite-core above —
+    # without it the value-type data globals (_gst_value_array_type …)
+    # compile as dllimport in plugin TUs and read back 0 ("type id '0'
+    # is invalid" + SIGSEGV when flacparse builds its streamheader
+    # caps). Both object libs land in the same DLL, so declaring the
+    # globals dllexport here just makes the references direct.
+    GST_EXPORTS
     _WIN32_DCOM
     COBJMACROS
     $<$<CONFIG:Release>:${GST_RELEASE_DEFINES}>
@@ -358,6 +388,14 @@ target_include_directories(gstreamer-lite-plugins PRIVATE
 if(OPENJFX_GST_MATROSKA_DIR)
     target_include_directories(gstreamer-lite-plugins PRIVATE
         ${OPENJFX_GST_MATROSKA_DIR}
+        ${OPENJFX_GST_MATROSKA_DIR}/audiofx
+        # avi/flv element headers for the *-lite-plugin.c wrappers. The
+        # fetched audioparsers dir is deliberately NOT added: it would
+        # shadow the in-tree (older) gstaudioparserselements.h that
+        # parsersplugin.c relies on; gstflacparse.c finds its own
+        # headers via quoted includes.
+        ${OPENJFX_GST_MATROSKA_DIR}/avi
+        ${OPENJFX_GST_MATROSKA_DIR}/flv
     )
 endif()
 
@@ -368,6 +406,8 @@ add_library(gstreamer-lite SHARED
     $<TARGET_OBJECTS:gstreamer-lite-core>
     $<TARGET_OBJECTS:gstreamer-lite-plugins>
 )
+# Linker map for release-crash symbolication (module+offset -> function).
+target_link_options(gstreamer-lite PRIVATE /MAP)
 set_target_properties(gstreamer-lite PROPERTIES
     OUTPUT_NAME gstreamer-lite
     PREFIX ""

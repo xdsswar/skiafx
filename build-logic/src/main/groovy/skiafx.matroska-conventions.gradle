@@ -61,7 +61,11 @@ def fetchTask = tasks.register('fetchGstMatroska') {
     inputs.property('gpgSha256', gpgSha256)
     outputs.dir(autoMatroskaDir)
     outputs.upToDateWhen {
-        new File(autoMatroskaDir.get().asFile, 'matroska-demux.c').exists()
+        new File(autoMatroskaDir.get().asFile, 'matroska-demux.c').exists() &&
+        new File(autoMatroskaDir.get().asFile, 'audiofx/gstscaletempo.c').exists() &&
+        new File(autoMatroskaDir.get().asFile, 'avi/gstavidemux.c').exists() &&
+        new File(autoMatroskaDir.get().asFile, 'flv/gstflvdemux.c').exists() &&
+        new File(autoMatroskaDir.get().asFile, 'audioparsers/gstflacparse.c').exists()
     }
 
     doLast {
@@ -118,6 +122,71 @@ def fetchTask = tasks.register('fetchGstMatroska') {
                 new File(outDir, f.name).bytes = f.bytes
             }
         }
+
+        // Also extract the scaletempo element (same tarball, gst/audiofx).
+        // It provides proper time-stretched audio for MediaPlayer.setRate
+        // (rate != 1.0) — without it the audio sink writes 1x samples at
+        // scaled ring positions, producing bursts + gaps. The element is
+        // a single source pair registered by our scaletempo-lite-plugin.c
+        // (the upstream audiofx plugin entry is not compiled).
+        def srcScaletempo = new File(tmpExtract,
+            "gst-plugins-good-${gpgVersion}/gst/audiofx")
+        def outAudiofx = new File(outDir, 'audiofx')
+        outAudiofx.mkdirs()
+        ['gstscaletempo.c', 'gstscaletempo.h'].each { name ->
+            def f = new File(srcScaletempo, name)
+            if (!f.exists()) {
+                throw new GradleException(
+                    "[matroska] expected ${f} after extraction")
+            }
+            new File(outAudiofx, name).bytes = f.bytes
+        }
+
+        // Also extract the avi + flv demuxers (same tarball). Like
+        // matroska, their upstream plugin-entry files are not compiled;
+        // our own *-lite-plugin.c shims register just the demuxers.
+        ['avi', 'flv'].each { sub ->
+            def srcDir = new File(tmpExtract,
+                "gst-plugins-good-${gpgVersion}/gst/${sub}")
+            if (!srcDir.exists()) {
+                throw new GradleException(
+                    "[matroska] expected ${srcDir} after extraction")
+            }
+            def dstDir = new File(outDir, sub)
+            dstDir.mkdirs()
+            srcDir.eachFile { f ->
+                if (f.isFile()) {
+                    new File(dstDir, f.name).bytes = f.bytes
+                }
+            }
+        }
+
+        // Patch: gstflvdemux.c includes gstflvmux.h (which needs the
+        // 1.26-only gst/base/gstaggregator.h) but uses NOTHING from it
+        // — we don't compile the muxer. Strip the dead include so the
+        // demuxer builds against the older gstreamer-lite core.
+        def flvDemuxSrc = new File(outDir, 'flv/gstflvdemux.c')
+        flvDemuxSrc.text = flvDemuxSrc.text.replace(
+            '#include "gstflvmux.h"',
+            '/* skia-fx: gstflvmux.h include removed - mux not compiled */')
+
+        // And flacparse (gst/audioparsers): frames raw .flac for the
+        // ffmpegwrapper FLAC decoder. The in-tree audioparsers plugin
+        // (aacparse/mpegaudioparse) is older; flacparse rides the same
+        // pinned 1.26 sources as matroska to stay self-consistent.
+        def srcParsers = new File(tmpExtract,
+            "gst-plugins-good-${gpgVersion}/gst/audioparsers")
+        def outParsers = new File(outDir, 'audioparsers')
+        outParsers.mkdirs()
+        ['gstflacparse.c', 'gstflacparse.h', 'gstaudioparserselements.h'].each { name ->
+            def f = new File(srcParsers, name)
+            if (!f.exists()) {
+                throw new GradleException(
+                    "[matroska] expected ${f} after extraction")
+            }
+            new File(outParsers, name).bytes = f.bytes
+        }
+
         tmpExtract.deleteDir()
         logger.lifecycle "[matroska] sources ready: ${outDir}"
     }

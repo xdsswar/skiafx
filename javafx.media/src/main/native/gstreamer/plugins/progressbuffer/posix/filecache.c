@@ -190,6 +190,11 @@ gboolean cache_set_read_position(Cache* cache, gint64 position)
     return result;
 }
 
+gint64 cache_get_read_position(Cache* cache)
+{
+    return cache->read_position;
+}
+
 gboolean cache_has_enough_data(Cache* cache)
 {
     return cache->read_position < cache->write_position;

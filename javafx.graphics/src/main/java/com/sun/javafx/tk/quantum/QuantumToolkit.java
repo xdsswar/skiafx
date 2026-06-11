@@ -84,6 +84,7 @@ import com.sun.glass.ui.EventLoop;
 import com.sun.glass.ui.GlassRobot;
 import com.sun.glass.ui.Screen;
 import com.sun.glass.ui.Timer;
+import com.sun.prism.skia.impl.SkiaGpu;
 import com.sun.glass.ui.View;
 import com.sun.javafx.PlatformUtil;
 import com.sun.javafx.application.PlatformImpl;
@@ -215,6 +216,20 @@ public final class QuantumToolkit extends Toolkit {
     final int                       PULSE_INTERVAL = (int)(TimeUnit.SECONDS.toMillis(1L) / getRefreshRate());
     final int                       FULLSPEED_INTERVAL = 1;     // ms
     boolean                         nativeSystemVsync = false;
+
+    // skia-fx: automatic <=60fps cap on the software-raster fallback path.
+    // The CPU path's per-pulse cost (full scene render + full-surface
+    // readback + Glass upload) is throttled to protect weak hardware and to
+    // match stock JavaFX's 60Hz cadence. The GPU path is never affected:
+    // this engages only when the Skia pipeline has resolved to software
+    // raster (see com.sun.prism.skia.impl.SkiaGpu). All access to
+    // softwareCapApplied is on the FX thread (runToolkit + pulseFromQueue),
+    // so a plain boolean is sufficient.
+    private static final int        SOFTWARE_CAP_HZ = 60;
+    private static final System.Logger LOG_QT =
+            System.getLogger(QuantumToolkit.class.getName());
+    private static final boolean    SKIA_VERBOSE = Boolean.getBoolean("skia.verbose");
+    private boolean                 softwareCapApplied = false;
     private long                    firstPauseRequestTime = 0;
     private boolean                 pauseRequested = false;
     private static final long       PAUSE_THRESHOLD_DURATION = 250;
@@ -383,7 +398,23 @@ public final class QuantumToolkit extends Toolkit {
             Application.invokeAndWait(this.userRunnable);
             this.userRunnable = null;
 
-            if (getPrimaryTimer().isFullspeed()) {
+            if (isSoftwareRasterPath()) {
+                // skia-fx: software fallback already known at startup
+                // (typically -Dprism.skia.gpu=false). Cap the render pulse to
+                // <=60fps from the very first frame, overriding both fullspeed
+                // (1ms) and high-refresh native vsync. Still compute
+                // nativeSystemVsync so vsync-dependent logic elsewhere is
+                // unchanged. The GPU path never reaches this branch.
+                nativeSystemVsync = Screen.getVideoRefreshPeriod() != 0.0;
+                int capMs = softwareCapIntervalMs();
+                pulseTimer.start(capMs);
+                softwareCapApplied = true;
+                if (SKIA_VERBOSE) {
+                    LOG_QT.log(System.Logger.Level.INFO,
+                        "skia-fx: software-raster pulse cap engaged at startup: "
+                        + capMs + " ms (~" + (1000 / capMs) + " fps)");
+                }
+            } else if (getPrimaryTimer().isFullspeed()) {
                 /*
                  * FULLSPEED_INTVERVAL workaround
                  *
@@ -649,9 +680,69 @@ public final class QuantumToolkit extends Toolkit {
 
     void pulseFromQueue() {
         try {
+            maybeApplySoftwareCap();
             pulse();
         } finally {
             endPulseRunning();
+        }
+    }
+
+    /**
+     * skia-fx: capped render-pulse interval (ms) for the software-raster
+     * path — never faster than {@link #SOFTWARE_CAP_HZ}, but honours a
+     * lower-than-60Hz panel. Clamped to >=1ms.
+     */
+    private int softwareCapIntervalMs() {
+        // Guard against a 0/negative refresh rate (e.g. -Djavafx.animation.pulse=0)
+        // before dividing.
+        int hz = Math.min(Math.max(1, getRefreshRate()), SOFTWARE_CAP_HZ);
+        return Math.max(1, (int) (TimeUnit.SECONDS.toMillis(1L) / hz));
+    }
+
+    /**
+     * skia-fx: true if the Skia pipeline has resolved to the
+     * software-raster fallback. Combines the explicit startup flag
+     * ({@code -Dprism.skia.gpu=false}, known immediately) with the lazily
+     * resolved probe-failure result. Never forces the GPU probe (which is a
+     * render-thread operation), so it is safe on the FX thread.
+     */
+    private boolean isSoftwareRasterPath() {
+        if ("false".equalsIgnoreCase(System.getProperty("prism.skia.gpu"))) {
+            return true;
+        }
+        return SkiaGpu.isResolvedSoftware();
+    }
+
+    /**
+     * skia-fx: one-shot pulse-rate reconfigure for the probe-failure
+     * software-fallback case. That decision is resolved lazily on the render
+     * thread during the first surface allocation; by the time it flips we are
+     * already pulsing at the GPU cadence (fullspeed or high-refresh vsync).
+     * The first pulse that observes the software state restarts pulseTimer at
+     * the capped interval, then never runs again (guarded by
+     * softwareCapApplied). Runs on the FX thread; Glass Timer stop()/start()
+     * are synchronized and safe to call here. The GPU steady state exits on a
+     * single volatile read (isResolvedGpu), adding no per-frame work and no
+     * behavior change to the GPU path.
+     */
+    private void maybeApplySoftwareCap() {
+        if (softwareCapApplied || SkiaGpu.isResolvedGpu()) {
+            return;
+        }
+        if (!isSoftwareRasterPath()) {
+            return;
+        }
+        softwareCapApplied = true;
+        final int capMs = softwareCapIntervalMs();
+        final Timer t = pulseTimer;
+        if (t != null) {
+            t.stop();
+            t.start(capMs);
+        }
+        if (SKIA_VERBOSE) {
+            LOG_QT.log(System.Logger.Level.INFO,
+                "skia-fx: software-raster fallback detected; pulse cap "
+                + "engaged: " + capMs + " ms (~" + (1000 / capMs) + " fps)");
         }
     }
 

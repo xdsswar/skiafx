@@ -30,6 +30,7 @@
 #include <PipelineManagement/PlayerEventDispatcher.h>
 #include <MediaManagement/Media.h>
 #include <Common/VSMemory.h>
+#include <Common/LeakCounter.h>
 #include <Utils/LowLevelPerf.h>
 #include <jni/Logger.h>
 #include <fxplugins_common.h>
@@ -39,6 +40,21 @@
 #define AUDIO_RESUME_DELTA_TIME   10.0 // seconds
 #define VIDEO_RESUME_DELTA_TIME   10.0 // seconds
 #define STALL_DELTA_TIME           1.0 // seconds
+
+// skia-fx: cached OPENJFX_MEDIA_VERBOSE gate — GetStreamTime and the
+// bus callback are hot paths; never call g_getenv there per call.
+static gboolean _media_verbose(void)
+{
+    static gsize once = 0;
+    static gboolean on = FALSE;
+    if (g_once_init_enter(&once))
+    {
+        const char* v = g_getenv("OPENJFX_MEDIA_VERBOSE");
+        on = (v != NULL && v[0] != '\0' && v[0] != '0');
+        g_once_init_leave(&once, 1);
+    }
+    return on;
+}
 
 //*************************************************************************************************
 //********** class CGstAudioPlaybackPipeline
@@ -80,6 +96,8 @@ CGstAudioPlaybackPipeline::CGstAudioPlaybackPipeline(const GstElementContainer& 
     m_bSetClock = false;
     m_bIsClockSet = false;
     m_bDualSourceInitialResyncDone = false;
+    m_DualResyncZeroPosPolls = 0;
+    m_DualResyncFirstZeroPosTime = 0;
 
     m_StateLock = CJfxCriticalSection::Create();
 
@@ -88,11 +106,31 @@ CGstAudioPlaybackPipeline::CGstAudioPlaybackPipeline(const GstElementContainer& 
     m_llLastProgressValuePosition = 0;
     m_llLastProgressValueStop = 0;
     m_bLastProgressValueEOS = 0;
+    m_llAudioProgressValuePosition = -1;
+    m_llAudioProgressValueStop = -1;
+    m_bAudioProgressEOS = FALSE;
 #endif // ENABLE_PROGRESS_BUFFER
 
     m_audioCodecErrorCode = ERROR_NONE;
 
     m_pBusCallbackContent = NULL;
+
+    m_WatchdogThread = NULL;
+    m_bWatchdogStop = false;
+    m_WatchdogTimeoutSec = 0;
+    g_mutex_init(&m_WatchdogMutex);
+    g_cond_init(&m_WatchdogCond);
+
+    m_SeekCoalesceThread = NULL;
+    m_bSeekCoalesceStop = false;
+    m_bSeekCoalescePending = false;
+    m_SeekCoalesceTargetSec = 0.0;
+    m_SeekCoalesceLastReqUs = 0;
+    m_SeekDebounceMs = 180;
+    g_mutex_init(&m_SeekCoalesceMutex);
+    g_cond_init(&m_SeekCoalesceCond);
+
+    SKIAFX_LEAK_CREATED("CGstAudioPlaybackPipeline");
 }
 
 /**
@@ -105,9 +143,19 @@ CGstAudioPlaybackPipeline::~CGstAudioPlaybackPipeline()
 #if JFXMEDIA_DEBUG
     g_print ("CGstAudioPlaybackPipeline::~CGstAudioPlaybackPipeline()\n");
 #endif
+    StopWatchdog(); // no-op if Dispose already stopped it
+    g_mutex_clear(&m_WatchdogMutex);
+    g_cond_clear(&m_WatchdogCond);
+
+    StopSeekCoalescer(); // no-op if Dispose already stopped it
+    g_mutex_clear(&m_SeekCoalesceMutex);
+    g_cond_clear(&m_SeekCoalesceCond);
+
     delete m_SeekLock;
     delete m_StateLock;
     delete m_StallLock;
+
+    SKIAFX_LEAK_DESTROYED("CGstAudioPlaybackPipeline");
 }
 
 /**
@@ -211,7 +259,203 @@ uint32_t CGstAudioPlaybackPipeline::Init()
     if (GST_STATE_CHANGE_FAILURE == gst_element_set_state (m_Elements[PIPELINE], GST_STATE_PAUSED))
         return ERROR_GSTREAMER_PIPELINE_STATE_CHANGE;
 
+    StartWatchdog();
+    StartSeekCoalescer();
+
     return ERROR_NONE;
+}
+
+/**
+ * skia-fx: stall/preroll watchdog. See the header comment. The thread
+ * wakes every 2 s and samples a "progress signature" — download
+ * progress (primary + companion) and the last observed stream time.
+ * While the player is Stalled or stuck pre-Ready AND the signature is
+ * frozen, a countdown runs; when it crosses the timeout, a standard
+ * GST_MESSAGE_ERROR is posted on the bus (delivered to the app as a
+ * MediaException by the existing BusCallback path) and the watchdog
+ * exits. Any progress, or any non-monitored state, resets the clock.
+ */
+void CGstAudioPlaybackPipeline::StartWatchdog()
+{
+    int timeoutSec = 45;
+    const gchar* env = g_getenv("OPENJFX_MEDIA_STALL_TIMEOUT");
+    if (env != NULL && *env != '\0')
+    {
+        gint64 v = g_ascii_strtoll(env, NULL, 10);
+        timeoutSec = (v > 0 && v <= 3600) ? (int)v : 0;
+    }
+    if (timeoutSec <= 0 || m_WatchdogThread != NULL)
+        return;
+
+    m_WatchdogTimeoutSec = timeoutSec;
+    m_bWatchdogStop = false;
+    m_WatchdogThread = g_thread_new("media-watchdog", WatchdogLoop, this);
+}
+
+void CGstAudioPlaybackPipeline::StopWatchdog()
+{
+    if (m_WatchdogThread == NULL)
+        return;
+
+    g_mutex_lock(&m_WatchdogMutex);
+    m_bWatchdogStop = true;
+    g_cond_broadcast(&m_WatchdogCond);
+    g_mutex_unlock(&m_WatchdogMutex);
+
+    g_thread_join(m_WatchdogThread);
+    m_WatchdogThread = NULL;
+}
+
+// skia-fx: seek coalescing is enabled for dual-source A/V (the expensive,
+// fragment-refetching path that a drag-storm hurts most). Single-source and
+// audio-only keep the immediate synchronous seek. OPENJFX_MEDIA_SEEK_DEBOUNCE_MS
+// overrides the window (0 disables coalescing entirely).
+bool CGstAudioPlaybackPipeline::SeekCoalescingEnabled()
+{
+    return m_SeekCoalesceThread != NULL && m_SeekDebounceMs > 0;
+}
+
+void CGstAudioPlaybackPipeline::StartSeekCoalescer()
+{
+    if (m_SeekCoalesceThread != NULL)
+        return;
+    // Only dual-source A/V benefits; leave other pipelines on the immediate path.
+    if (m_pOptions == NULL ||
+        m_pOptions->GetPipelineType() != CPipelineOptions::kAudioSourcePipeline)
+        return;
+
+    int debounceMs = 180;
+    const gchar* env = g_getenv("OPENJFX_MEDIA_SEEK_DEBOUNCE_MS");
+    if (env != NULL && *env != '\0')
+    {
+        gint64 v = g_ascii_strtoll(env, NULL, 10);
+        debounceMs = (v >= 0 && v <= 5000) ? (int)v : 180;
+    }
+    m_SeekDebounceMs = debounceMs;
+    if (debounceMs <= 0)
+        return; // explicitly disabled
+
+    m_bSeekCoalesceStop = false;
+    m_bSeekCoalescePending = false;
+    m_SeekCoalesceThread = g_thread_new("media-seek-coalesce", SeekCoalesceLoop, this);
+}
+
+void CGstAudioPlaybackPipeline::StopSeekCoalescer()
+{
+    if (m_SeekCoalesceThread == NULL)
+        return;
+
+    g_mutex_lock(&m_SeekCoalesceMutex);
+    m_bSeekCoalesceStop = true;
+    g_cond_broadcast(&m_SeekCoalesceCond);
+    g_mutex_unlock(&m_SeekCoalesceMutex);
+
+    g_thread_join(m_SeekCoalesceThread);
+    m_SeekCoalesceThread = NULL;
+}
+
+gpointer CGstAudioPlaybackPipeline::SeekCoalesceLoop(gpointer data)
+{
+    CGstAudioPlaybackPipeline* p = (CGstAudioPlaybackPipeline*)data;
+
+    g_mutex_lock(&p->m_SeekCoalesceMutex);
+    while (!p->m_bSeekCoalesceStop)
+    {
+        if (!p->m_bSeekCoalescePending)
+        {
+            g_cond_wait(&p->m_SeekCoalesceCond, &p->m_SeekCoalesceMutex);
+            continue;
+        }
+
+        gint64 nowUs = g_get_monotonic_time();
+        gint64 dueUs = p->m_SeekCoalesceLastReqUs +
+                       (gint64)p->m_SeekDebounceMs * 1000;
+        if (nowUs >= dueUs)
+        {
+            // The drag has gone quiet for the debounce window — execute the
+            // latest target only.
+            double target = p->m_SeekCoalesceTargetSec;
+            p->m_bSeekCoalescePending = false;
+            g_mutex_unlock(&p->m_SeekCoalesceMutex);
+
+            if (_media_verbose())
+                g_print("[seek-coalesce] firing target=%.3fs\n", target);
+            p->DoSeekNow(target);
+
+            g_mutex_lock(&p->m_SeekCoalesceMutex);
+        }
+        else
+        {
+            // A newer request reset the timer; wait until it's due (or a
+            // newer one bumps it again / stop is requested).
+            g_cond_wait_until(&p->m_SeekCoalesceCond, &p->m_SeekCoalesceMutex, dueUs);
+        }
+    }
+    g_mutex_unlock(&p->m_SeekCoalesceMutex);
+    return NULL;
+}
+
+gpointer CGstAudioPlaybackPipeline::WatchdogLoop(gpointer data)
+{
+    CGstAudioPlaybackPipeline* p = (CGstAudioPlaybackPipeline*)data;
+    const gint64 timeoutUs = (gint64)p->m_WatchdogTimeoutSec * G_USEC_PER_SEC;
+    gint64 lastChange = g_get_monotonic_time();
+    gint64 lastSig = G_MININT64;
+
+    g_mutex_lock(&p->m_WatchdogMutex);
+    while (!p->m_bWatchdogStop)
+    {
+        // skia-fx: 1 s tick so the soft video-recovery WatchdogTick reacts
+        // quickly to a frozen video chain. The hard-stall timeout below is
+        // wall-clock based (now - lastChange), so a faster tick does not
+        // change its semantics.
+        g_cond_wait_until(&p->m_WatchdogCond, &p->m_WatchdogMutex,
+                          g_get_monotonic_time() + 1 * G_USEC_PER_SEC);
+        if (p->m_bWatchdogStop)
+            break;
+        g_mutex_unlock(&p->m_WatchdogMutex);
+
+        // skia-fx: soft per-subclass recovery (e.g. re-seek a stalled video
+        // chain onto the playing audio) before the hard stall logic below.
+        p->WatchdogTick();
+
+        // Liveness signature. Unsynchronized reads are fine here: a torn
+        // or stale value at worst delays detection by one 2 s tick.
+        gint64 sig = (gint64)p->m_ulLastStreamTime;
+#if ENABLE_PROGRESS_BUFFER
+        sig = sig * 31 + p->m_llLastProgressValuePosition;
+        sig = sig * 31 + p->m_llAudioProgressValuePosition;
+#endif
+        // Monitored states: Stalled (buffering starvation) and the
+        // pre-Ready window (preroll). Everything else — Playing, Paused,
+        // Ready, Finished, Error — is the app's business, not a hang.
+        bool monitored = p->IsPlayerState(Stalled) || p->IsPlayerState(Unknown);
+
+        gint64 now = g_get_monotonic_time();
+        if (!monitored || sig != lastSig)
+        {
+            lastSig = sig;
+            lastChange = now;
+        }
+        else if (now - lastChange >= timeoutUs)
+        {
+            bool preroll = p->IsPlayerState(Unknown);
+            gst_element_message_full(GST_ELEMENT(p->m_Elements[PIPELINE]),
+                GST_MESSAGE_ERROR, GST_STREAM_ERROR, GST_STREAM_ERROR_FAILED,
+                g_strdup_printf("Media pipeline made no progress for %d seconds (%s)",
+                    p->m_WatchdogTimeoutSec,
+                    preroll ? "stuck in preroll" : "stalled - source starved"),
+                NULL,
+                ("GstAudioPlaybackPipeline.cpp"), ("WatchdogLoop"), 0);
+            // One-shot: the pipeline transitions to Error; nothing left
+            // to watch.
+            return NULL;
+        }
+
+        g_mutex_lock(&p->m_WatchdogMutex);
+    }
+    g_mutex_unlock(&p->m_WatchdogMutex);
+    return NULL;
 }
 
 uint32_t CGstAudioPlaybackPipeline::PostBuildInit()
@@ -389,6 +633,12 @@ void CGstAudioPlaybackPipeline::Dispose()
 #if JFXMEDIA_DEBUG
     g_print ("CGstAudioPlaybackPipeline::Dispose()\n");
 #endif
+
+    // The watchdog posts on the pipeline's bus — join it before any
+    // pipeline teardown.
+    StopWatchdog();
+    // The coalescer can call SeekPipeline — join it before teardown too.
+    StopSeekCoalescer();
 
     if (m_pBusCallbackContent != NULL)
     {
@@ -605,7 +855,18 @@ uint32_t CGstAudioPlaybackPipeline::SeekPipeline(gint64 seek_time)
 {
     GstSeekFlags seekFlags;
 
+    // skia-fx: seek trace (OPENJFX_MEDIA_VERBOSE only) — distinguishes
+    // the dual-source initial resync from app seeks / stop-rewinds when
+    // reading the audio-sink probe's SEGMENT events.
+    if (_media_verbose())
+        g_print("[seek-trace] SeekPipeline t=%.3fs rate=%.2f state=%d\n",
+                seek_time / 1e9, m_fRate, (int)m_PlayerState);
+
     m_SeekLock->Enter();
+
+    // Any flushing seek re-segments both dual-source chains — the
+    // deferred initial resync (GetStreamTime) is no longer needed.
+    m_bDualSourceInitialResyncDone = true;
 
     m_LastSeekTime = seek_time;
 
@@ -625,6 +886,7 @@ uint32_t CGstAudioPlaybackPipeline::SeekPipeline(gint64 seek_time)
         {
             m_SeekLock->Exit();
             CheckQueueSize(NULL);
+            OnSeekIssued(seek_time);
             return ERROR_NONE;
         }
     }
@@ -636,6 +898,7 @@ uint32_t CGstAudioPlaybackPipeline::SeekPipeline(gint64 seek_time)
         {
             m_SeekLock->Exit();
             CheckQueueSize(NULL);
+            OnSeekIssued(seek_time);
             return ERROR_NONE;
         }
         else if (m_Elements[VIDEO_SINK] != NULL && m_bHasVideo && gst_element_seek(m_Elements[VIDEO_SINK], m_fRate, GST_FORMAT_TIME, seekFlags,
@@ -644,6 +907,7 @@ uint32_t CGstAudioPlaybackPipeline::SeekPipeline(gint64 seek_time)
         {
             m_SeekLock->Exit();
             CheckQueueSize(NULL);
+            OnSeekIssued(seek_time);
             return ERROR_NONE;
         }
     }
@@ -659,6 +923,39 @@ uint32_t CGstAudioPlaybackPipeline::SeekPipeline(gint64 seek_time)
  * Seek to a presentation time.
  */
 uint32_t CGstAudioPlaybackPipeline::Seek(double dSeekTime)
+{
+    // skia-fx: arm the subclass recovery grace + lag baseline at REQUEST time
+    // (before coalescing/execution) so the recovery watchdog can't fire a
+    // spurious "lagging" recovery in the window between the seek applying the
+    // new audio segment and the post-seek prime running.
+    OnSeekRequested((gint64)(GST_SECOND * dSeekTime));
+
+    // skia-fx: when coalescing is active (dual-source A/V), debounce rapid
+    // seeks at the player level — record the latest target and let the
+    // coalescer thread execute only the final one after a short quiet window,
+    // so a slider drag-storm can't thrash the fragment-refetching seek path.
+    // The Finished->seek-invoked latch is still set synchronously so a seek
+    // out of the Finished state is recognised immediately.
+    if (SeekCoalescingEnabled())
+    {
+        m_StateLock->Enter();
+        if (m_PlayerState == Finished)
+            m_bSeekInvoked = true;
+        m_StateLock->Exit();
+
+        g_mutex_lock(&m_SeekCoalesceMutex);
+        m_SeekCoalesceTargetSec = dSeekTime;
+        m_SeekCoalesceLastReqUs = g_get_monotonic_time();
+        m_bSeekCoalescePending = true;
+        g_cond_broadcast(&m_SeekCoalesceCond);
+        g_mutex_unlock(&m_SeekCoalesceMutex);
+        return ERROR_NONE;
+    }
+
+    return DoSeekNow(dSeekTime);
+}
+
+uint32_t CGstAudioPlaybackPipeline::DoSeekNow(double dSeekTime)
 {
     uint32_t ret = ERROR_NONE;
 
@@ -692,6 +989,32 @@ uint32_t CGstAudioPlaybackPipeline::Seek(double dSeekTime)
     }
 
     return ret;
+}
+
+bool CGstAudioPlaybackPipeline::RecoverVideoSeekLocked(gint64 seekTimeNs)
+{
+    if (m_Elements[VIDEO_SINK] == NULL)
+        return false;
+
+    // If a real user seek is already queued in the coalescer, let it win — a
+    // recovery seek now would just be superseded and could race it on the
+    // shared video chain.
+    g_mutex_lock(&m_SeekCoalesceMutex);
+    bool userSeekPending = m_bSeekCoalescePending;
+    g_mutex_unlock(&m_SeekCoalesceMutex);
+    if (userSeekPending)
+        return false;
+
+    // Serialise with SeekPipeline() so two flushing seeks can't interleave on
+    // the shared video chain (qtdemux/decoder/sink) and wedge it.
+    m_SeekLock->Enter();
+    gboolean ok = gst_element_seek(
+        m_Elements[VIDEO_SINK], 1.0, GST_FORMAT_TIME,
+        (GstSeekFlags)GST_SEEK_FLAG_FLUSH,
+        GST_SEEK_TYPE_SET, seekTimeNs, GST_SEEK_TYPE_NONE, GST_CLOCK_TIME_NONE);
+    m_SeekLock->Exit();
+
+    return ok ? true : false;
 }
 
 /**
@@ -762,6 +1085,89 @@ uint32_t CGstAudioPlaybackPipeline::GetStreamTime(double* streamTime)
     }
 
     *streamTime = (double)position/(double)GST_SECOND;
+
+    // skia-fx: dual-source diagnostic heartbeat (OPENJFX_MEDIA_VERBOSE
+    // only). One line per ~10 polls (~1 Hz): pipeline position, player
+    // state, encoded queue fill levels. Tells which element starves
+    // first when playback freezes.
+    {
+        static int _hb = 0;
+        if (_media_verbose() && (++_hb % 10) == 0)
+        {
+            guint aqBufs = 0; guint64 aqTime = 0;
+            guint vqBufs = 0; guint64 vqTime = 0;
+            GstState gs = GST_STATE_NULL, gp = GST_STATE_NULL;
+            if (m_Elements[AUDIO_QUEUE] != NULL)
+                g_object_get(m_Elements[AUDIO_QUEUE],
+                             "current-level-buffers", &aqBufs,
+                             "current-level-time", &aqTime, NULL);
+            if (m_Elements[VIDEO_QUEUE] != NULL)
+                g_object_get(m_Elements[VIDEO_QUEUE],
+                             "current-level-buffers", &vqBufs,
+                             "current-level-time", &vqTime, NULL);
+            gst_element_get_state(m_Elements[PIPELINE], &gs, &gp, 0);
+            // wall = monotonic seconds — position-delta vs wall-delta IS
+            // the playback duty cycle (1.00 = smooth, <1 = wavy/underrun).
+            g_print("[dual-diag] wall=%.2f pos=%.2fs ps=%d gst=%d/%d aq=%u(%ums) vq=%u(%ums)\n",
+                    g_get_monotonic_time() / 1e6,
+                    *streamTime, (int)m_PlayerState, (int)gs, (int)gp,
+                    aqBufs, (unsigned)(aqTime / 1000000),
+                    vqBufs, (unsigned)(vqTime / 1000000));
+        }
+    }
+
+    // skia-fx: deferred dual-source initial resync. With two INDEPENDENT
+    // remote sources (Media(audio,video)) the pipeline can reach PLAYING
+    // with the two sources' segments/running-times misaligned: the
+    // audio-master clock never advances, video freezes on its first
+    // frame — historically until the user seeked. One flushing seek
+    // re-segments BOTH sources and unfreezes the clock. This is polled
+    // here (the Java side queries position every ~100 ms) instead of
+    // fired from the bus callback at the PLAYING transition, so it only
+    // runs (a) when the freeze is real — clock pinned at 0 for several
+    // consecutive polls while PLAYING — and (b) after the pipeline has
+    // settled, from an app thread, never mid-preroll. Any earlier
+    // SeekPipeline call (user seek) disarms it.
+    if (!m_bDualSourceInitialResyncDone &&
+        m_pOptions != NULL &&
+        m_pOptions->GetPipelineType() == CPipelineOptions::kAudioSourcePipeline &&
+        !m_pOptions->GetHLSModeEnabled())
+    {
+        if (position > 0)
+        {
+            // Clock advanced on its own — sources are aligned.
+            m_bDualSourceInitialResyncDone = true;
+        }
+        else if (!IsPlayerState(Playing))
+        {
+            // Stalled / paused / buffering — not evidence of the freeze.
+            // Require CONSECUTIVE zero-position polls in stable PLAYING
+            // so the resync never fires mid-stall-transition.
+            m_DualResyncZeroPosPolls = 0;
+        }
+        else
+        {
+            gint64 now = g_get_monotonic_time();
+            if (m_DualResyncZeroPosPolls == 0)
+                m_DualResyncFirstZeroPosTime = now;
+            // ~3 s of PLAYING with the clock pinned at 0 — by BOTH poll
+            // count and real elapsed time (bus-thread callers can burst
+            // GetStreamTime far faster than the ~100ms Java poll). The
+            // threshold is deliberately high: with the source-level fixes
+            // (chunked HTTP defeating the CDN's audio drip) the historical
+            // freeze should no longer occur at all, and firing this flush
+            // during normal startup latency MISALIGNS the video chain —
+            // frames render late forever, which shows as video racing in
+            // catch-up waves while audio plays normally. The done-flag is
+            // set BEFORE seeking so a concurrent caller can't double-fire.
+            if (++m_DualResyncZeroPosPolls >= 30 &&
+                now - m_DualResyncFirstZeroPosTime >= 3 * G_USEC_PER_SEC)
+            {
+                m_bDualSourceInitialResyncDone = true;
+                SeekPipeline(0);
+            }
+        }
+    }
 
     // GStreamer may report position which is slightly bigger then duration.
     // This is fine due to different rounding errors, but we should not report position which is bigger then duration.
@@ -1199,6 +1605,16 @@ gboolean CGstAudioPlaybackPipeline::BusCallback(GstBus* bus, GstMessage* msg, sB
             if (debug)
                 LOGGER_LOGMSG(LOGGER_DEBUG, debug);
 
+            // skia-fx: the mapped Java error code loses the real reason
+            // (element, domain, message) — surface it when debugging.
+            if (_media_verbose() || g_getenv("SKIA_MEDIA_DEBUG") != NULL)
+                g_print("[gst-error] from=%s domain=%d code=%d msg='%s' debug='%s'\n",
+                        GST_MESSAGE_SRC(msg) ? GST_OBJECT_NAME(GST_MESSAGE_SRC(msg)) : "?",
+                        error ? (int)error->domain : -1,
+                        error ? error->code : -1,
+                        (error && error->message) ? error->message : "",
+                        debug ? debug : "");
+
             // Handle connection lost error
             if (error)
             {
@@ -1410,8 +1826,42 @@ gboolean CGstAudioPlaybackPipeline::BusCallback(GstBus* bus, GstMessage* msg, sB
             // Audio sink will provide clock when it in paused or playing state.
             // Our pipeline will not find audio sink clock, because we use audio sink inside bin and bin hides clock distribution.
             // When pipeline cannot find clock it will use GstSystemClock, so we need to set correct clock to pipeline.
-            if (pPipeline->m_bSetClock && ((pPipeline->m_bStaticPipeline && pPipeline->m_Elements[AUDIO_SINK] != NULL && pPipeline->m_bHasAudio && GST_MESSAGE_SRC(msg) == GST_OBJECT(pPipeline->m_Elements[AUDIO_SINK]) && pendingState == GST_STATE_VOID_PENDING && newState == GST_STATE_PAUSED) || pPipeline->m_bDynamicElementsReady))
+            //
+            // skia-fx: for a dual-source pipeline the audio sink (the clock
+            // provider) is ready long before the dynamically-built video
+            // chain, so also accept the audio-sink-reached-PAUSED arm for
+            // non-static pipelines — waiting for m_bDynamicElementsReady
+            // could push the swap past the PLAYING transition.
+            if (pPipeline->m_bSetClock && ((pPipeline->m_Elements[AUDIO_SINK] != NULL && pPipeline->m_bHasAudio && GST_MESSAGE_SRC(msg) == GST_OBJECT(pPipeline->m_Elements[AUDIO_SINK]) && pendingState == GST_STATE_VOID_PENDING && newState == GST_STATE_PAUSED) || pPipeline->m_bDynamicElementsReady))
             {
+                // skia-fx: NEVER swap the clock once the pipeline is
+                // PLAYING. gst_pipeline_set_clock does not redistribute
+                // base_time; base_time was computed against the previous
+                // (system) clock's epoch, so after a mid-PLAYING swap every
+                // video frame's running time is permanently in the past —
+                // the video sink stops waiting and renders at decode speed
+                // ("video racing in waves" while the audio sink, master of
+                // its own clock, stays smooth). Staying on the system clock
+                // is harmless by comparison (correct pacing, only long-term
+                // drift risk).
+                GstState curState = GST_STATE_NULL, curPending = GST_STATE_VOID_PENDING;
+                gst_element_get_state(pPipeline->m_Elements[PIPELINE], &curState, &curPending, 0);
+                if (curState == GST_STATE_PLAYING || curPending == GST_STATE_PLAYING)
+                {
+                    // Not now — but KEEP m_bSetClock armed: the next safe
+                    // window (e.g. a user pause: state PAUSED, pending
+                    // VOID) installs the clock, and the following
+                    // PAUSED->PLAYING transition recomputes base_time
+                    // against it. Clearing the flag here would pin
+                    // autoplaying pipelines (pending PLAYING before the
+                    // sink's PAUSED message is processed) to the system
+                    // clock for their whole life — long-term A/V drift.
+                    if (_media_verbose())
+                        g_print("[clock] pipeline PLAYING/pending-PLAYING - deferring "
+                                "audio-clock install to the next safe state window\n");
+                }
+                else
+                {
                 pPipeline->m_bSetClock = false;
 
                 // Get clock from audio sink
@@ -1424,6 +1874,10 @@ gboolean CGstAudioPlaybackPipeline::BusCallback(GstBus* bus, GstMessage* msg, sB
                 {
                     gst_pipeline_set_clock(GST_PIPELINE(pPipeline->m_Elements[PIPELINE]), clock);
                     gst_object_unref(clock);
+                    if (_media_verbose())
+                        g_print("[clock] audio sink clock installed (pipeline state=%d)\n",
+                                (int)curState);
+                }
                 }
             }
 
@@ -1451,29 +1905,15 @@ gboolean CGstAudioPlaybackPipeline::BusCallback(GstBus* bus, GstMessage* msg, sB
                 // Update the player state.
                 pPipeline->UpdatePlayerState(newState, oldState);
 
-                // skia-fx: dual-source initial resync. With two INDEPENDENT
-                // remote sources (Media(audio,video)), each its own
-                // javasource+progressbuffer+demuxer, the pipeline reaches
-                // PLAYING with the two sources' segments/running-times
-                // misaligned. The audio sink is the clock master; its clock
-                // never advances, so the video sink waits and playback is
-                // frozen at the start — until the user seeks. A flushing
-                // seek flushes + re-segments BOTH sources from one position,
-                // realigning them and unblocking the clock (which is exactly
-                // why a manual seek "fixes" it). Do that seek once,
-                // automatically, the first time a non-HLS dual-source
-                // pipeline reaches PLAYING. The one-shot flag guarantees it
-                // runs exactly once (no seek->preroll->play loop). HLS
-                // audio-ext shares one connection/timeline and is excluded.
-                if (newState == GST_STATE_PLAYING &&
-                    pPipeline->m_pOptions != NULL &&
-                    pPipeline->m_pOptions->GetPipelineType() == CPipelineOptions::kAudioSourcePipeline &&
-                    !pPipeline->m_pOptions->GetHLSModeEnabled() &&
-                    !pPipeline->m_bDualSourceInitialResyncDone)
-                {
-                    pPipeline->m_bDualSourceInitialResyncDone = true;
-                    pPipeline->SeekPipeline(0);
-                }
+                // skia-fx: the dual-source initial resync used to fire HERE,
+                // eagerly, on the first PLAYING transition. That raced the
+                // dynamic video-chain build: the flushing seek could land
+                // while the 4K video bin was still completing its first
+                // preroll, wedging the pipeline in async limbo (audio ring
+                // buffer never restarted, master clock pinned at 0, even
+                // user seeks couldn't recover). The resync now fires from
+                // GetStreamTime — deferred until the clock is actually
+                // observed frozen in PLAYING. See m_DualResyncZeroPosPolls.
             }
         }
             break;
@@ -1518,7 +1958,41 @@ gboolean CGstAudioPlaybackPipeline::BusCallback(GstBus* bus, GstMessage* msg, sB
                     }
                 }
                 if (fromCompanionAudio)
+                {
+                    // skia-fx: the companion's BUFFERING reports must not
+                    // feed the SHARED stall/resume math (the tiny audio
+                    // stream reports "far ahead" and causes premature
+                    // resumes) — but they ARE recorded into the audio-side
+                    // fields so the resume condition can require an audio
+                    // cushion. The companion's UNDERRUN passes through:
+                    // ignoring it meant a starving companion froze
+                    // playback silently (frozen clock) instead of
+                    // stalling cleanly.
+                    if (gst_structure_has_name(pStr, PB_MESSAGE_BUFFERING))
+                    {
+                        const GValue *position_v = gst_structure_get_value(pStr, "position");
+                        const GValue *stop_v     = gst_structure_get_value(pStr, "stop");
+                        const GValue *eos_v      = gst_structure_get_value(pStr, "eos");
+                        pPipeline->m_StallLock->Enter();
+                        pPipeline->m_llAudioProgressValuePosition = g_value_get_int64(position_v);
+                        pPipeline->m_llAudioProgressValueStop     = g_value_get_int64(stop_v);
+                        pPipeline->m_bAudioProgressEOS            = g_value_get_boolean(eos_v);
+                        pPipeline->m_StallLock->Exit();
+                        // Re-evaluate the resume condition — the audio
+                        // cushion may have just become sufficient. Only
+                        // meaningful while stalled; calling it otherwise
+                        // would just re-send the (unchanged) VIDEO
+                        // progress event to Java once per ~1% of the
+                        // audio download.
+                        if (pPipeline->IsPlayerState(Stalled))
+                            pPipeline->UpdateBufferPosition();
+                    }
+                    else if (gst_structure_has_name(pStr, PB_MESSAGE_UNDERRUN))
+                    {
+                        pPipeline->BufferUnderrun();
+                    }
                     break;
+                }
             }
 
             if (gst_structure_has_name(pStr, PB_MESSAGE_BUFFERING))
@@ -2141,6 +2615,38 @@ void CGstAudioPlaybackPipeline::BufferUnderrun()
 
 // We do not need to protect this function with mutex, because we
 // call it from only one thread (BusCallback).
+// skia-fx: dual-source companion audio cushion check, used by the
+// stall-resume condition. TRUE when the companion has buffered at least
+// m_dResumeDeltaTime past the playhead, has fully downloaded (EOS), or
+// when there is nothing to check (single-source / HLS / no progress
+// report yet — the legacy behaviour, so startup can't deadlock on a
+// companion that hasn't reported).
+bool CGstAudioPlaybackPipeline::IsCompanionAudioCushionOk(double streamTime, double duration)
+{
+    if (m_pOptions == NULL ||
+        m_pOptions->GetPipelineType() != CPipelineOptions::kAudioSourcePipeline ||
+        m_pOptions->GetHLSModeEnabled())
+        return true;
+
+    m_StallLock->Enter();
+    gint64 pos = m_llAudioProgressValuePosition;
+    gint64 stop = m_llAudioProgressValueStop;
+    gboolean eos = m_bAudioProgressEOS;
+    m_StallLock->Exit();
+
+    if (eos || stop <= 0 || pos < 0)
+        return true;
+
+    // duration comes from the caller (UpdateBufferPosition already
+    // queried it) — a second pipeline-wide duration query per call
+    // would be pure waste on the bus thread.
+    if (duration <= 0)
+        return true;
+
+    double audioBufferPosition = duration * (double)pos / (double)stop;
+    return (audioBufferPosition - streamTime) > m_dResumeDeltaTime;
+}
+
 void CGstAudioPlaybackPipeline::UpdateBufferPosition()
 {
     if (NULL != m_pEventDispatcher && m_llLastProgressValueStop > 0)
@@ -2168,7 +2674,11 @@ void CGstAudioPlaybackPipeline::UpdateBufferPosition()
 
         // We need to unblock when we have atleast data for duration of m_dResumeDeltaTime or
         // if progress buffer got eos, since buffer position will not be updated anymore and no more data will be available.
-        bool resume = IsPlayerState(Stalled) && ((bufferPosition - streamTime > m_dResumeDeltaTime) || m_bLastProgressValueEOS) && !IsPlayerPendingState(Paused) && !IsPlayerPendingState(Stopped);
+        // skia-fx: for dual-source pipelines the AUDIO cushion must also
+        // be sufficient (or the companion fully downloaded) — resuming on
+        // the video cushion alone replays the starvation freeze.
+        bool resume = IsPlayerState(Stalled) && ((bufferPosition - streamTime > m_dResumeDeltaTime) || m_bLastProgressValueEOS) && !IsPlayerPendingState(Paused) && !IsPlayerPendingState(Stopped)
+            && IsCompanionAudioCushionOk(streamTime, duration);
 
         if (resume)
         {

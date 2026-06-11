@@ -30,6 +30,8 @@ import com.sun.glass.ui.Pixels;
 import com.sun.glass.ui.Screen;
 import com.sun.glass.ui.View;
 import com.sun.glass.ui.Window;
+import com.sun.javafx.geom.Rectangle;
+import com.sun.prism.impl.RectQueuedPixelSource;
 
 /**
  * PresentableState is intended to provide for a shadow copy of View/Window
@@ -306,6 +308,29 @@ public abstract class PresentableState {
         if (pixels != null) {
             try {
                 view.uploadPixels(pixels);
+            } finally {
+                source.doneWithPixels(pixels);
+            }
+        }
+    }
+
+    /**
+     * Puts the pixels on the screen, uploading only the source's dirty
+     * rectangle when one is available (readback-tier partial present).
+     * Falls back to a full upload when the source owes a whole frame.
+     *
+     * @param source the rect-carrying source for the Pixels to upload
+     */
+    public void uploadPixelsRect(RectQueuedPixelSource source) {
+        Pixels pixels = source.getLatestPixels();
+        if (pixels != null) {
+            try {
+                Rectangle r = source.getConsumedRect();
+                if (r == null || r.isEmpty()) {
+                    view.uploadPixels(pixels);
+                } else {
+                    view.uploadPixelsRect(pixels, r.x, r.y, r.width, r.height);
+                }
             } finally {
                 source.doneWithPixels(pixels);
             }

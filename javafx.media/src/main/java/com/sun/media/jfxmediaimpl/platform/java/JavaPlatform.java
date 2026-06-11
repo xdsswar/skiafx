@@ -58,8 +58,28 @@ public final class JavaPlatform extends Platform {
     public MetadataParser createMetadataParser(Locator source) {
         String contentType = source.getContentType();
         if (contentType.equals(MediaUtils.CONTENT_TYPE_MPA) ||
-                contentType.equals(MediaUtils.CONTENT_TYPE_MP3)) {
+                contentType.equals(MediaUtils.CONTENT_TYPE_MP3) ||
+                // skia-fx: ADTS AAC files carry ID3v2 tags exactly like
+                // MP3s do — the ID3 parser is container-agnostic.
+                contentType.equals(MediaUtils.CONTENT_TYPE_AAC)) {
             return new ID3MetadataParser(source);
+        }
+
+        // skia-fx: parsers for the format-expansion containers. Each
+        // reads only the head of the file (they stop at the media data)
+        // and delivers the standard MetadataParser tag names.
+        if (contentType.equals(MediaUtils.CONTENT_TYPE_FLAC)) {
+            return new FlacMetadataParser(source);
+        }
+        if (contentType.equals(MediaUtils.CONTENT_TYPE_MATROSKA) ||
+                contentType.equals(MediaUtils.CONTENT_TYPE_WEBM)) {
+            return new MatroskaMetadataParser(source);
+        }
+        if (contentType.equals(MediaUtils.CONTENT_TYPE_FLV)) {
+            return new FlvMetadataParser(source);
+        }
+        if (contentType.equals(MediaUtils.CONTENT_TYPE_AVI)) {
+            return new AviMetadataParser(source);
         }
 
         return null;

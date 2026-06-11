@@ -389,6 +389,27 @@ inline void applyState(SkPaint& paint, const OpenJfxSurface& st) {
     }
 }
 
+// True when an image blit is pixel-aligned and unscaled: source and
+// destination rects are the same size with integer coordinates, and the
+// canvas CTM is at most an integer translation. In that case kNearest
+// sampling is pixel-for-pixel identical to kLinear but hits Skia's
+// specialized raster blitters instead of the general bilinear pipeline —
+// measured ~25 ms -> sub-ms for a 780x420 cached-node blit on the
+// software path (~73 ns/px down the slow path).
+inline bool isPixelAlignedBlit(SkCanvas* cv,
+                               float sx, float sy, float sw, float sh,
+                               float dx, float dy, float dw, float dh) {
+    if (sw != dw || sh != dh) return false;
+    auto isInt = [](float v) { return v == floorf(v); };
+    if (!isInt(sx) || !isInt(sy) || !isInt(dx) || !isInt(dy)
+        || !isInt(sw) || !isInt(sh)) return false;
+    const SkMatrix& m = cv->getTotalMatrix();
+    if (!m.isTranslate()) return false;
+    SkScalar tx = m.getTranslateX();
+    SkScalar ty = m.getTranslateY();
+    return tx == SkScalarFloorToScalar(tx) && ty == SkScalarFloorToScalar(ty);
+}
+
 // Decode RGBA-packed colors[] (low byte = R) into SkColor4f for
 // gradient construction. Skia's SkColor4f is float per channel.
 inline std::vector<SkColor4f> decodeColors(const uint32_t* colors, int n) {
@@ -747,6 +768,11 @@ static bool allocateOffscreenFbo(OpenJfxSurface* st, int w, int h) {
     if (!loadFboFuncs()) return false;
     releaseOffscreenFbo(st);
 
+    // Drain any GL error state left by earlier callers so (a) the checks
+    // below attribute errors to OUR calls and (b) a pre-existing sticky
+    // error doesn't leak into Skia's GL command stream after we return.
+    while (glGetError() != GL_NO_ERROR) { /* drain */ }
+
     glGenTextures(1, &st->offscreenTex);
     glBindTexture(GL_TEXTURE_2D, st->offscreenTex);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, w, h, 0, GL_RGBA,
@@ -754,11 +780,29 @@ static bool allocateOffscreenFbo(OpenJfxSurface* st, int w, int h) {
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
     glBindTexture(GL_TEXTURE_2D, 0);
+    GLenum texErr = glGetError();
 
     gFboFuncs.genRenderbuffers(1, &st->offscreenRb);
     gFboFuncs.bindRenderbuffer(GL_RENDERBUFFER, st->offscreenRb);
     gFboFuncs.renderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, w, h);
     gFboFuncs.bindRenderbuffer(GL_RENDERBUFFER, 0);
+    GLenum rbErr = glGetError();
+
+    // GL_OUT_OF_MEMORY (or any other error) from the storage calls means
+    // the texture/RB has no backing — the FBO below would either come up
+    // INCOMPLETE (caught) or, on lazy-alloc drivers, complete now and die
+    // at first draw. Fail here, cleanly, instead.
+    if (texErr != GL_NO_ERROR || rbErr != GL_NO_ERROR) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            fprintf(stderr, "[openjfx-skia] offscreen FBO storage alloc failed "
+                "(glGetError tex=0x%x rb=0x%x, %dx%d); using direct FBO 0\n",
+                texErr, rbErr, w, h);
+        }
+        releaseOffscreenFbo(st);
+        return false;
+    }
 
     gFboFuncs.genFramebuffers(1, &st->offscreenFbo);
     gFboFuncs.bindFramebuffer(GL_FRAMEBUFFER, st->offscreenFbo);
@@ -982,8 +1026,38 @@ OPENJFX_API int32_t openjfx_skia_has_skia(void) {
 OPENJFX_API uintptr_t openjfx_skia_surface_create_raster(int32_t width, int32_t height) {
     if (width <= 0 || height <= 0) return 0;
 #ifdef OPENJFX_WITH_SKIA
+    // kN32 — the build's NATIVE 32-bit order (BGRA on Windows, RGBA
+    // elsewhere). Skia's legacy raster fast paths (sprite blitters, AA
+    // fills, glyph blits) are specialized for N32 only; an explicit
+    // kRGBA_8888 surface on Windows forced every image blit down the
+    // general per-pixel pipeline (~75 ns/px — measured 25 ms for a
+    // 780x420 cached-node blit that takes well under 1 ms on N32).
+    // Readers are unaffected: every consumer goes through SkCanvas draws
+    // or readPixels, which convert by color type. On Windows the present
+    // readback (BGRA request) becomes a straight row copy as a bonus.
     SkImageInfo info = SkImageInfo::Make(
-        width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
+        width, height, kN32_SkColorType, kPremul_SkAlphaType);
+    sk_sp<SkSurface> surface = SkSurfaces::Raster(info);
+    if (!surface) return 0;
+    auto* st = new OpenJfxSurface();
+    st->surface = std::move(surface);
+    return reinterpret_cast<uintptr_t>(st);
+#else
+    return 0;
+#endif
+}
+
+OPENJFX_API uintptr_t openjfx_skia_surface_create_raster_bgra(int32_t width, int32_t height) {
+    if (width <= 0 || height <= 0) return 0;
+#ifdef OPENJFX_WITH_SKIA
+    // BGRA variant for the READBACK present tier: its byte order matches
+    // the INT_ARGB_PRE layout Glass uploads on little-endian hosts, so the
+    // per-frame surface_read_pixels_argb degenerates to a straight row
+    // copy instead of a full-frame channel swizzle. Explicit kBGRA_8888
+    // (NOT kN32 — that alias depends on how the Skia binaries were built).
+    // The plain create_raster above stays RGBA for every other caller.
+    SkImageInfo info = SkImageInfo::Make(
+        width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
     sk_sp<SkSurface> surface = SkSurfaces::Raster(info);
     if (!surface) return 0;
     auto* st = new OpenJfxSurface();
@@ -1025,6 +1099,9 @@ OPENJFX_API uintptr_t openjfx_skia_surface_create_window_gpu(
     uintptr_t hwnd, int32_t width, int32_t height) {
     if (!hwnd || width <= 0 || height <= 0) return 0;
 #if defined(OPENJFX_WITH_SKIA) && defined(_WIN32)
+    // Window-surface (re)creation = presentable rebuild in progress — hold
+    // off media interop register/lock until it settles (see resize_gl).
+    openjfx_skia_d3d11_interop_quiesce(250);
     HWND hWnd = reinterpret_cast<HWND>(hwnd);
     // Layered windows (transparent stages) composite via
     // UpdateLayeredWindow, not SwapBuffers — direct-present can't host
@@ -1149,6 +1226,13 @@ OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_
             logWindowDiag("present", st->windowHwnd, st, 0, -1, (long)GetLastError());
         return 2;
     }
+    // Context is current — reclaim any GL objects a failed-bind
+    // surface_destroy had to defer. Without this, a destroyed child
+    // window's orphaned offscreen FBO (w*h*4 + depth RB of VRAM) sits
+    // unreclaimed until the next resize/destroy, which on a static
+    // desktop may be never. Empty-list fast path under an uncontended
+    // mutex — effectively free per frame.
+    drainDeferredGlDeletes();
     const sk_sp<GrDirectContext>& grCtx = gpuDirectContext();
     if (grCtx) {
         // Every GL window shares ONE process-wide GrDirectContext, and
@@ -1178,7 +1262,10 @@ OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_
     // path — the offscreen content survives across frames so that
     // dirty-region painting / scene caching has a valid starting
     // point each pulse.
+    GLenum blitErr = GL_NO_ERROR;
     if (st->offscreenFbo) {
+        // Attribute errors to OUR blit, not whatever Skia's flush left.
+        while (glGetError() != GL_NO_ERROR) { /* drain */ }
         gFboFuncs.bindFramebuffer(GL_READ_FRAMEBUFFER, st->offscreenFbo);
         gFboFuncs.bindFramebuffer(GL_DRAW_FRAMEBUFFER, 0);
         gFboFuncs.blitFramebuffer(
@@ -1186,6 +1273,7 @@ OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_
             0, 0, st->offscreenW, st->offscreenH,
             GL_COLOR_BUFFER_BIT, GL_NEAREST);
         gFboFuncs.bindFramebuffer(GL_FRAMEBUFFER, 0);
+        blitErr = glGetError();
         // Skia's GrDirectContext tracks bound FBO state — let it know
         // every backend bit may have changed under it so the next
         // draw re-binds correctly. (resetContext with no args = reset
@@ -1194,11 +1282,24 @@ OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_
     }
     // Runtime vsync toggle on the GL tier (best-effort; see setGlSwapInterval).
     setGlSwapInterval(vsync ? 1 : 0);
+    // A failed blit means the back buffer holds stale/garbage content, but a
+    // stale frame beats a black one — still SwapBuffers, then report failure
+    // so Java disposes + rebuilds the presentable (and, after repeated
+    // failures, demotes off the GL tier entirely).
     BOOL swapOk = SwapBuffers(st->windowHdc);
     if (presentDiagOn())
         logWindowDiag("present", st->windowHwnd, st, 1, swapOk ? 1 : 0,
                       swapOk ? 0 : (long)GetLastError());
     if (!swapOk) return 3;
+    if (blitErr != GL_NO_ERROR) {
+        static bool warnedBlit = false;
+        if (!warnedBlit) {
+            warnedBlit = true;
+            fprintf(stderr, "[openjfx-skia] present: offscreen->window blit "
+                "failed (glGetError=0x%x); rebuilding presentable\n", blitErr);
+        }
+        return 4;
+    }
     return 0;
 #else
     (void)handle;
@@ -1211,6 +1312,12 @@ OPENJFX_API int32_t openjfx_skia_surface_resize_gl(
     uintptr_t handle, int32_t width, int32_t height) {
 #if defined(OPENJFX_WITH_SKIA) && defined(_WIN32)
     if (width <= 0 || height <= 0) return 1;
+    // Hold off GL<->D3D11 media-texture interop while the backbuffer is
+    // being resized — a concurrent wglDX register/lock can deadlock the
+    // driver during the rebuild (observed: desktop-level freeze leaving
+    // fullscreen during 4K zero-copy playback). Media frames skipped in
+    // this window simply keep showing the previous frame.
+    openjfx_skia_d3d11_interop_quiesce(250);
     OpenJfxSurface* st = asState(handle);
     if (!st || !st->isWindowSurface || !st->windowHdc) return 2;
 
@@ -1260,9 +1367,23 @@ OPENJFX_API int32_t openjfx_skia_surface_resize_gl(
     GLuint chosenFbo = 0;
     if (st->offscreenFbo) {
         if (!allocateOffscreenFbo(st, width, height)) {
-            return 6; // offscreen path was active; failure leaves us inconsistent
+            // Offscreen realloc failed (likely VRAM pressure at the new
+            // size). Degrade IN PLACE to wrapping FBO 0 at the new size —
+            // the long-exercised OPENJFX_SKIA_GL_OFFSCREEN=0 path — instead
+            // of failing the resize and forcing a presentable rebuild that
+            // would just re-attempt the same failing allocation. Buffer
+            // preservation is lost, but the painter forces full repaints
+            // after every GPU-tier present anyway, so correctness holds.
+            static bool warnedResizeFbo = false;
+            if (!warnedResizeFbo) {
+                warnedResizeFbo = true;
+                fprintf(stderr, "[openjfx-skia] resize: offscreen FBO realloc "
+                    "failed at %dx%d; continuing on direct FBO 0\n",
+                    width, height);
+            }
+        } else {
+            chosenFbo = st->offscreenFbo;
         }
-        chosenFbo = st->offscreenFbo;
     }
 
     GrGLFramebufferInfo fbInfo;
@@ -1393,6 +1514,20 @@ OPENJFX_API int32_t openjfx_skia_window_clear(
     glClear(GL_COLOR_BUFFER_BIT);
     ::SwapBuffers(hdc);
 
+    // Drain the aux context's error state (diagnostic only — a failed
+    // clear is cosmetic and must not change the return code). Log once.
+    GLenum clearErr = glGetError();
+    while (glGetError() != GL_NO_ERROR) { /* drain the rest */ }
+    if (clearErr != GL_NO_ERROR) {
+        static bool warnedClear = false;
+        if (!warnedClear) {
+            warnedClear = true;
+            std::fprintf(stderr,
+                "[openjfx-skia] window_clear: glGetError=0x%x after clear "
+                "(cosmetic; reported once)\n", clearErr);
+        }
+    }
+
     // Release the context from this thread so the render thread (or
     // any other) can re-bind without conflict on its next operation.
     ::wglMakeCurrent(nullptr, nullptr);
@@ -1457,6 +1592,22 @@ OPENJFX_API uintptr_t openjfx_skia_surface_create_swap_chain_d3d(
     uintptr_t hwnd, int32_t width, int32_t height) {
     if (!hwnd || width <= 0 || height <= 0) return 0;
 #if defined(OPENJFX_WITH_SKIA) && defined(_WIN32)
+    HWND hWnd = reinterpret_cast<HWND>(hwnd);
+    // Same window bails as the GL tier (create_window_gpu) — see the full
+    // rationale there. Layered windows (transparent stages) composite via
+    // UpdateLayeredWindow, which a DXGI flip-model swap chain can't feed.
+    // Owned windows (dialogs, alerts, menus, tooltips) can land on a
+    // secondary monitor driven by another adapter, where a swap chain
+    // presents successfully but never composites. Returning 0 sends both
+    // down the tier chain to GPU-offscreen + readback, which is
+    // monitor/adapter agnostic; these windows are small and infrequent,
+    // so the readback cost is negligible.
+    if (GetWindowLongPtr(hWnd, GWL_EXSTYLE) & WS_EX_LAYERED) {
+        return 0;
+    }
+    if (GetWindow(hWnd, GW_OWNER) != nullptr) {
+        return 0;
+    }
     // Force GrDirectContext init so we know which backend is active.
     const sk_sp<GrDirectContext>& grCtx = gpuDirectContext();
     if (!grCtx || gGpuBackend != GpuBackend::D3D) {
@@ -1505,6 +1656,8 @@ OPENJFX_API int32_t openjfx_skia_surface_resize_d3d(
 #if defined(OPENJFX_WITH_SKIA) && defined(_WIN32)
     OpenJfxSurface* st = asState(handle);
     if (!st || !st->d3d) return 1;
+    // Same interop hold-off as surface_resize_gl — see the comment there.
+    openjfx_skia_d3d11_interop_quiesce(250);
     const sk_sp<GrDirectContext>& grCtx = gpuDirectContext();
     return openjfxD3DResize(st->d3d, width, height, grCtx.get());
 #else
@@ -1522,6 +1675,13 @@ OPENJFX_API void openjfx_skia_surface_destroy(uintptr_t handle) {
     if (st && st->magic == OpenJfxSurface::kMagic) {
         st->magic = 0; // poison: a later asState() on this handle fails
 #ifdef _WIN32
+        // A window-surface teardown is the start of a presentable rebuild
+        // (fullscreen toggle, monitor move) — hold off media interop
+        // register/lock until the rebuild settles (see surface_resize_gl).
+        // Plain offscreen-texture destroys must NOT quiesce (they happen
+        // constantly and would starve zero-copy playback).
+        if (st->isWindowSurface)
+            openjfx_skia_d3d11_interop_quiesce(250);
         // Tear down the offscreen FBO/texture/RB before releasing the
         // HDC. Requires the GL context current; safe even if the
         // offscreen attachment wasn't allocated (releaseOffscreenFbo
@@ -3711,18 +3871,52 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_surface(
     SkSurface* dst = asSurface(dstSurfaceHandle);
     SkSurface* src = asSurface(srcSurfaceHandle);
     if (!dst || !src) return 1;
+    // Env-gated diag (OPENJFX_SKIA_DS_DIAG=1): splits snapshot vs blit cost
+    // per draw_surface call. This is how the kRGBA-vs-kN32 25 ms blit was
+    // found; kept as a regression hook. Zero cost when unset.
+    static const bool dsDiag = []() {
+        const char* e = std::getenv("OPENJFX_SKIA_DS_DIAG");
+        return e && *e && *e != '0';
+    }();
+    auto t0 = dsDiag ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
     sk_sp<SkImage> img = src->makeImageSnapshot();
     if (!img) return 2;
+    auto t1 = dsDiag ? std::chrono::steady_clock::now()
+                     : std::chrono::steady_clock::time_point{};
     SkRect srcR = SkRect::MakeXYWH(sx, sy, sw, sh);
     SkRect dstR = SkRect::MakeXYWH(dx, dy, dw, dh);
-    SkSamplingOptions sampling(SkFilterMode::kLinear);
+    SkCanvas* cv = dst->getCanvas();
+    // Pixel-aligned unscaled blits take nearest sampling (pixel-identical
+    // to linear here) AND the fast constraint (nearest never samples
+    // neighboring texels, so strict edge clamping buys nothing) — both are
+    // required to reach Skia's specialized raster blitters instead of the
+    // general per-pixel pipeline.
+    const bool aligned = isPixelAlignedBlit(cv, sx, sy, sw, sh, dx, dy, dw, dh);
+    SkSamplingOptions sampling(
+        aligned ? SkFilterMode::kNearest : SkFilterMode::kLinear);
     const OpenJfxSurface* st = asState(dstSurfaceHandle);
     SkPaint p;
     if (st) applyState(p, *st);
     p.setAntiAlias(false);
-    dst->getCanvas()->drawImageRect(
+    cv->drawImageRect(
         img, srcR, dstR, sampling, &p,
-        SkCanvas::kStrict_SrcRectConstraint);
+        aligned ? SkCanvas::kFast_SrcRectConstraint
+                : SkCanvas::kStrict_SrcRectConstraint);
+    if (dsDiag) {
+        auto t2 = std::chrono::steady_clock::now();
+        static std::atomic<int> n { 0 };
+        int v = n.fetch_add(1);
+        if (v < 60) {
+            double snapMs = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            double blitMs = std::chrono::duration<double, std::milli>(t2 - t1).count();
+            fprintf(stderr, "[skia.ds] #%d src=%dx%d rect=(%.0f,%.0f %.0fx%.0f)->"
+                "(%.0f,%.0f %.0fx%.0f) snap=%.2fms blit=%.2fms alpha=%.2f aligned=%d\n",
+                v, src->width(), src->height(), sx, sy, sw, sh,
+                dx, dy, dw, dh, snapMs, blitMs, st ? st->extraAlpha : -1.f,
+                aligned ? 1 : 0);
+        }
+    }
     return 0;
 #else
     (void)dstSurfaceHandle; (void)srcSurfaceHandle;
@@ -4182,6 +4376,31 @@ OPENJFX_API int32_t openjfx_skia_surface_read_pixels_argb(
     return s->readPixels(info, dst, static_cast<size_t>(w) * 4, x, y) ? 0 : 2;
 #else
     (void)handle; (void)dst; (void)x; (void)y; (void)w; (void)h;
+    return -1;
+#endif
+}
+
+// Dirty-rect variant for the partial-present path: reads the (x,y,w,h)
+// sub-rect of the surface into the FULL-FRAME buffer `dst` (stride
+// `dstRowBytes`), landing the rect at its natural offset
+// (dst + y*rowBytes + x*4) so the buffer stays a coherent full frame.
+// Same BGRA/INT_ARGB_PRE conversion as read_pixels_argb.
+OPENJFX_API int32_t openjfx_skia_surface_read_pixels_argb_stride(
+    uintptr_t handle, void* dst, int32_t dstRowBytes,
+    int32_t x, int32_t y, int32_t w, int32_t h) {
+#ifdef OPENJFX_WITH_SKIA
+    SkSurface* s = asSurface(handle);
+    if (!s || !dst || x < 0 || y < 0 || w <= 0 || h <= 0) return 1;
+    if (dstRowBytes < (x + w) * 4) return 1;
+    SkImageInfo info = SkImageInfo::Make(
+        w, h, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
+    uint8_t* at = static_cast<uint8_t*>(dst)
+                + static_cast<size_t>(y) * static_cast<size_t>(dstRowBytes)
+                + static_cast<size_t>(x) * 4;
+    return s->readPixels(info, at, static_cast<size_t>(dstRowBytes), x, y) ? 0 : 2;
+#else
+    (void)handle; (void)dst; (void)dstRowBytes;
+    (void)x; (void)y; (void)w; (void)h;
     return -1;
 #endif
 }

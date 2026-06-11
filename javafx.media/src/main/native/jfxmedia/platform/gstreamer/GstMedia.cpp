@@ -124,14 +124,47 @@ extern "C" {
                 if (pjCompanion[0] != '\0')
                 {
                     string companion(pjCompanion);
-                    // skia-fx: http(s) companions stream through the same
+                    // skia-fx: stamp the companion's signature-sniffed
+                    // container content type for EVERY scheme — the
+                    // pipeline factory dispatches the companion's
+                    // demuxer + decoder from it (extension sniffing is
+                    // only the fallback). The Java probe reads the
+                    // first bytes via URLConnection, which handles
+                    // file:// as well as http(s)://.
+                    {
+                        jstring jCompanionType =
+                            CLocator::GetCompanionAudioContentType(env, jLocator);
+                        if (jCompanionType != NULL)
+                        {
+                            const char* pjType =
+                                env->GetStringUTFChars(jCompanionType, NULL);
+                            if (pjType != NULL)
+                            {
+                                locator->SetCompanionAudioContentType(string(pjType));
+                                env->ReleaseStringUTFChars(jCompanionType, pjType);
+                            }
+                            env->DeleteLocalRef(jCompanionType);
+                        }
+                    }
+                    // http(s) companions stream through the same
                     // javasource Java-I/O bridge the primary source uses
                     // (souphttpsrc isn't in the gstreamer-lite build).
                     // file:// companions keep the lighter native filesrc
                     // path (CreateCompanionAudioSource).
-                    bool isHttp =
-                        (companion.compare(0, 7, "http://") == 0) ||
-                        (companion.compare(0, 8, "https://") == 0);
+                    // URI schemes are case-insensitive (RFC 3986) — match
+                    // the Java side, which compares schemes ignoring case.
+                    auto hasSchemePrefix = [](const string& s, const char* p) {
+                        size_t n = strlen(p);
+                        if (s.size() < n) return false;
+                        for (size_t i = 0; i < n; ++i) {
+                            char a = s[i];
+                            if (a >= 'A' && a <= 'Z') a = (char)(a - 'A' + 'a');
+                            if (a != p[i]) return false;
+                        }
+                        return true;
+                    };
+                    bool isHttp = hasSchemePrefix(companion, "http://") ||
+                                  hasSchemePrefix(companion, "https://");
                     bool routedThroughBridge = false;
                     if (isHttp)
                     {
@@ -149,20 +182,19 @@ extern "C" {
                                 // on pipeline dispose (same as the primary
                                 // and HLS audio-ext callbacks).
                                 locator->SetAudioCallbacks(companionCallbacks);
+                                // (content type already stamped above,
+                                // scheme-independent)
 
-                                jstring jCompanionType =
-                                    CLocator::GetCompanionAudioContentType(env, jLocator);
-                                if (jCompanionType != NULL)
-                                {
-                                    const char* pjType =
-                                        env->GetStringUTFChars(jCompanionType, NULL);
-                                    if (pjType != NULL)
-                                    {
-                                        locator->SetCompanionAudioContentType(string(pjType));
-                                        env->ReleaseStringUTFChars(jCompanionType, pjType);
-                                    }
-                                    env->DeleteLocalRef(jCompanionType);
-                                }
+                                // Stamp the companion's OWN size. The Java
+                                // side captures the content length when the
+                                // connection holder above is created, so
+                                // this must run after it. Without this the
+                                // pipeline factory reuses the PRIMARY's
+                                // size hint for the companion javasource,
+                                // corrupting byte-based progress/EOS math
+                                // (a 2.75 MB audio stream claiming 281 MB).
+                                locator->SetCompanionAudioSizeHint(
+                                    (int64_t)CLocator::GetCompanionAudioSize(env, jLocator));
                                 routedThroughBridge = true;
                             }
                             else

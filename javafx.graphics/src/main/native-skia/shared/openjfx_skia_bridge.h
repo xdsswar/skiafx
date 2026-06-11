@@ -56,6 +56,16 @@ OPENJFX_API int32_t openjfx_skia_has_skia(void);
 OPENJFX_API uintptr_t openjfx_skia_surface_create_raster(int32_t width, int32_t height);
 
 /**
+ * Creates a CPU-backed SkSurface in kBGRA_8888 (premultiplied). Used by
+ * the READBACK present tier: BGRA matches the INT_ARGB_PRE layout Glass
+ * uploads on little-endian hosts, so the per-frame
+ * surface_read_pixels_argb becomes a straight row copy instead of a
+ * full-frame channel swizzle. Returns 0 on failure or when Skia is not
+ * compiled in.
+ */
+OPENJFX_API uintptr_t openjfx_skia_surface_create_raster_bgra(int32_t width, int32_t height);
+
+/**
  * Creates a GPU-backed SkSurface (Ganesh, OpenGL) with the given
  * dimensions. The first call also brings up a per-process
  * GrDirectContext bound to whichever thread calls first (Quantum's
@@ -1051,6 +1061,21 @@ OPENJFX_API int32_t openjfx_skia_surface_replace_backing_argb(
 OPENJFX_API int32_t openjfx_skia_surface_read_pixels_argb(
     uintptr_t handle,
     void*     dst,
+    int32_t   x,
+    int32_t   y,
+    int32_t   w,
+    int32_t   h);
+
+/**
+ * Dirty-rect variant of surface_read_pixels_argb for the partial-present
+ * path: reads the (x,y,w,h) sub-rect into the FULL-FRAME buffer `dst`
+ * (stride `dstRowBytes`), landing it at its natural offset so the buffer
+ * stays a coherent full frame. Returns 0 on success.
+ */
+OPENJFX_API int32_t openjfx_skia_surface_read_pixels_argb_stride(
+    uintptr_t handle,
+    void*     dst,
+    int32_t   dstRowBytes,
     int32_t   x,
     int32_t   y,
     int32_t   w,

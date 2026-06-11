@@ -48,7 +48,21 @@
 #include "base/task/thread_pool.h"
 #include "base/timer/timer.h"
 #include "base/threading/thread_restrictions.h"
+#include "base/memory/shared_memory_mapping.h"
 #include "build/build_config.h"
+// skia-fx: viz-driven main-frame capture (FrameSinkVideoCapturer). The
+// capturer follows the page's surface across resizes/fullscreen and keeps
+// streaming the last-active content while the renderer commits the new
+// size — the polling CopyFromSurface path goes dark for the whole sync
+// window instead (the fullscreen/monitor-move freeze). Built directly on
+// Chromium's viz/content APIs (this engine has no CEF anywhere).
+#include "components/viz/common/surfaces/video_capture_target.h"
+#include "components/viz/host/client_frame_sink_video_capturer.h"
+#include "components/viz/host/host_frame_sink_manager.h"
+#include "content/browser/compositor/surface_utils.h"
+#include "content/public/browser/web_contents_observer.h"
+#include "media/base/video_types.h"
+#include "media/capture/mojom/video_capture_buffer.mojom.h"
 #include "content/public/app/content_main.h"
 #include "content/public/app/content_main_runner.h"
 #include "content/public/browser/browser_task_traits.h"
@@ -220,6 +234,65 @@ jux::SkiaDropdown* g_preview_dropdown = nullptr;
 uint32_t g_preview_dropdown_popup_id = 0;
 #endif
 
+// ---------------------------------------------------------------------------
+// skia-fx: viz-capturer-driven main-frame capture.
+//
+// One JuxVideoConsumer per WebContentsEntry. It owns a
+// viz::ClientFrameSinkVideoCapturer targeted at the page's frame sink and
+// receives BGRA frames (media::PIXEL_FORMAT_ARGB) pushed by viz whenever the
+// content changes — replacing the per-tick CopyFromSurface polling for the
+// MAIN frame (popups / print preview / cursor polling stay on the tick).
+//
+// Why: polling CopyFromSurface targets the CURRENT (pending) surface; after a
+// resize/fullscreen the pending surface doesn't activate until the renderer
+// commits at the new size, so every poll fails and the WebView freezes for
+// the whole relayout (measured 2–4 s on YouTube). The capturer is Chromium's
+// tab-capture mechanism: it follows the surface across transitions and keeps
+// delivering the last-active content, so frames flow continuously — the
+// transition shows the old-size page (undistorted, self-described logical
+// size) until the new size lands. Kill switch: --jux-poll-capture (set from
+// Java via -Dskia.webview.pollCapture=true) restores the legacy polling.
+//
+// UI-thread only (capturer callbacks arrive on the creating sequence). The
+// WebContentsObserver side re-targets the capturer when the page's frame
+// sink changes (cross-process navigation, renderer crash recovery).
+// ---------------------------------------------------------------------------
+class JuxVideoConsumer final : public viz::mojom::FrameSinkVideoConsumer,
+                               public content::WebContentsObserver {
+ public:
+  JuxVideoConsumer(JuxWebContentsHandle handle, content::WebContents* wc);
+  ~JuxVideoConsumer() override;
+
+  JuxVideoConsumer(const JuxVideoConsumer&) = delete;
+  JuxVideoConsumer& operator=(const JuxVideoConsumer&) = delete;
+
+  void StartCapture();
+  void RequestRefreshFrame();
+
+  // viz::mojom::FrameSinkVideoConsumer:
+  void OnFrameCaptured(
+      media::mojom::VideoBufferHandlePtr data,
+      media::mojom::VideoFrameInfoPtr info,
+      const gfx::Rect& content_rect,
+      mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
+          callbacks) override;
+  void OnNewCaptureVersion(const media::CaptureVersion& capture_version) override;
+  void OnFrameWithEmptyRegionCapture() override;
+  void OnStopped() override;
+  void OnLog(const std::string& message) override;
+
+  // content::WebContentsObserver:
+  void PrimaryPageChanged(content::Page& page) override;
+  void RenderViewHostChanged(content::RenderViewHost* old_host,
+                             content::RenderViewHost* new_host) override;
+
+ private:
+  void RetargetToCurrentView();
+
+  const JuxWebContentsHandle handle_;
+  std::unique_ptr<viz::ClientFrameSinkVideoCapturer> capturer_;
+};
+
 // Active WebContents indexed by handle. Only accessed on the UI thread.
 struct WebContentsEntry {
   std::unique_ptr<content::WebContents> web_contents;
@@ -292,6 +365,34 @@ struct WebContentsEntry {
   // than slipping past a DIP-measured guard and getting dropped.
   float capture_scale = 1.0f;
 
+  // viz-capturer main-frame capture (see JuxVideoConsumer above). Null when
+  // the --jux-poll-capture kill switch selects the legacy polling path; the
+  // capture tick skips main-frame CopyFromSurface whenever this is set.
+  std::unique_ptr<JuxVideoConsumer> video_consumer;
+
+  // Last logical (DIP) size commanded via JuxSetOffscreenSize. The widget's
+  // DIP size can drift under it when the hidden window's display DSF changes
+  // over fixed pixel bounds (DIP = pixels / DSF) — observed as the page
+  // shrinking to old_logical/scale after a cross-DPI monitor move. The
+  // capture tick re-asserts SetSize when the view's DIP size diverges.
+  // (--force-device-scale-factor=1 pins the DSF so this should never fire;
+  // kept as a self-healing backstop.) UI-thread only.
+  int last_logical_w = 0;
+  int last_logical_h = 0;
+
+  // The SetScaleOverrideForCapture multiplier currently applied to the view
+  // (0 = never applied). The desired override is capture_scale / host_dsf,
+  // where host_dsf is the HIDDEN capture window's monitor DSF — which updates
+  // ASYNCHRONOUSLY (its WM_DPICHANGED) when Java drags the WebView across a
+  // DPI boundary and the kSetPosition sync moves this window after the
+  // kSetSize that computed the override. ApplyCaptureScaleOverride()
+  // re-derives the desired value every capture tick and re-applies only on a
+  // real change, so a stale-DSF override self-heals within one tick instead
+  // of permanently rasterizing at the wrong density (whose oversized frames
+  // the slot guard then drops forever — the frozen/blank-WebView-after-
+  // monitor-move bug). UI-thread only.
+  float applied_capture_override = 0.0f;
+
   // Resize fast-capture burst. After a size change the page must reflow before a
   // correctly-sized frame can be captured; at the steady 16 ms cadence that
   // reflowed frame can wait up to a full tick, so a small→maximize is slow to
@@ -316,6 +417,65 @@ struct WebContentsEntry {
 // Leaked intentionally — cleaned up by JuxShutdown().
 auto* g_web_contents_map =
     new std::unordered_map<JuxWebContentsHandle, WebContentsEntry>();
+
+// ---------------------------------------------------------------------------
+// (Re-)applies the capture device-scale override so the page rasterizes at
+// the JavaFX render scale (entry.capture_scale) regardless of which monitor
+// the hidden capture window sits on.
+//
+// SetScaleOverrideForCapture is a MULTIPLIER on the view's FRESH display DSF
+// (UpdateScreenInfo multiplies GetNewScreenInfosForUpdate().current()
+// .device_scale_factor — the RAW monitor DSF, NOT the already-overridden
+// value GetDeviceScaleFactor() returns). The aura host window's
+// device_scale_factor IS that raw monitor DSF, so it is the correct divisor
+// to land effective == capture_scale.
+//
+// The divisor is a moving target: when Java drags the WebView across a DPI
+// boundary, kSetPosition moves the hidden window and its host DSF updates
+// asynchronously (own WM_DPICHANGED on this UI thread) — typically AFTER the
+// kSetSize that recomputed the override. A one-shot computation therefore
+// goes stale: effective density lands at scale × (new_dsf / old_dsf), the
+// captured frames overflow their SHM slot, and the slot guard drops every
+// frame → the WebView freezes blank until the next resize. So this helper is
+// called BOTH from JuxSetOffscreenSize AND every JuxCaptureTick: it
+// recomputes the desired override from the CURRENT host DSF and re-applies
+// only on a real change (epsilon-compared — SetScaleOverrideForCapture
+// triggers a renderer UpdateScreenInfo, so don't thrash it). On re-apply it
+// also grants the resize fast-capture burst so the re-rastered frame lands
+// within a few ms. UI thread only. Returns the effective override in force.
+float ApplyCaptureScaleOverride(WebContentsEntry& entry,
+                                content::RenderWidgetHostView* view) {
+  if (!view) {
+    return entry.applied_capture_override;
+  }
+  float scale = entry.capture_scale > 0.0f ? entry.capture_scale : 1.0f;
+  float host_dsf = 1.0f;
+  if (entry.widget && entry.widget->GetNativeWindow() &&
+      entry.widget->GetNativeWindow()->GetHost()) {
+    host_dsf = entry.widget->GetNativeWindow()->GetHost()->device_scale_factor();
+    if (host_dsf <= 0.0f) host_dsf = 1.0f;
+  }
+  const float desired = scale / host_dsf;
+  if (std::fabs(desired - entry.applied_capture_override) <= 0.001f) {
+    return entry.applied_capture_override;
+  }
+  if (::getenv("OPENJFX_SKIA_WEBDPI_DIAG")) {
+    float view_dsf = static_cast<content::RenderWidgetHostViewBase*>(view)
+                         ->GetDeviceScaleFactor();
+    VLOG(1) << "[webdpi] ApplyCaptureScaleOverride jfxScale=" << scale
+            << " hostDSF=" << host_dsf
+            << " viewDSF(screenInfo,maybe-overridden)=" << view_dsf
+            << " override " << entry.applied_capture_override << " -> "
+            << desired << "  (want captured effectiveDSF == jfxScale)";
+  }
+  static_cast<content::RenderWidgetHostViewBase*>(view)
+      ->SetScaleOverrideForCapture(desired);
+  entry.applied_capture_override = desired;
+  // The renderer re-rasterizes at the new density after an UpdateScreenInfo
+  // round-trip; burst-capture so the corrected frame lands fast.
+  entry.fast_capture_frames = kResizeFastFrames;
+  return desired;
+}
 
 // ---------------------------------------------------------------------------
 // Off-screen frame capture (software). A self-scheduling CopyFromSurface loop
@@ -500,25 +660,23 @@ void PublishPreviewOverlay(float logical_w, float logical_h,
 }
 #endif  // BUILDFLAG(ENABLE_PRINT_PREVIEW)
 
-void JuxOnFrameCaptured(JuxWebContentsHandle handle,
-                        float logical_w, float logical_h,
-                        const content::CopyFromSurfaceResult& result) {
-  if (!result.has_value()) {
-    return;
-  }
-#if BUILDFLAG(ENABLE_PRINT_PREVIEW)
-  // Keep the page (initiator) LIVE on the main channel so it reflows on resize;
-  // route the preview's own frame to the popup overlay region instead (drawn
-  // centered over the page by Java). The page (handle != preview) falls through.
-  if (g_print_preview_handle != 0 && handle == g_print_preview_handle) {
-    PublishPreviewOverlay(logical_w, logical_h, result);
-    return;
-  }
-#endif
-  const SkBitmap& bmp = result.value().bitmap;
-  const int w = bmp.width();
-  const int h = bmp.height();
-  if (w <= 0 || h <= 0 || !bmp.getPixels()) {
+// Stall diagnostic (OPENJFX_SKIA_WEBDPI_DIAG=1): consecutive failed copies
+// are the signature of the resize/fullscreen frame gap. UI-thread only.
+static int g_copy_fail_streak = 0;
+
+// Copies a BGRA main frame into the next SHM slot and publishes kFrameReady.
+// Shared by BOTH capture paths: the legacy CopyFromSurface tick
+// (JuxOnFrameCaptured) and the viz FrameSinkVideoCapturer consumer
+// (JuxVideoConsumer::OnFrameCaptured). UI thread only.
+//
+// `src` points at the frame's top-left pixel, rows `src_stride` bytes apart;
+// `logical_w/h` is the DIP size this frame represents (Java stretches the
+// device pixels to it).
+static void PublishMainFrame(JuxWebContentsHandle handle,
+                             const uint8_t* src, size_t src_stride,
+                             int w, int h,
+                             float logical_w, float logical_h) {
+  if (!src || w <= 0 || h <= 0) {
     return;
   }
 
@@ -543,8 +701,6 @@ void JuxOnFrameCaptured(JuxWebContentsHandle handle,
   }
   base::span<uint8_t> data = channel->DataBufferMut();
 
-  // CopyFromSurface yields an N32 bitmap — BGRA8888 premultiplied on
-  // Windows/macOS, which is exactly what the Skia draw helper expects.
   const size_t stride = static_cast<size_t>(w) * 4u;
   const size_t frame_bytes = stride * static_cast<size_t>(h);
   // Main slots occupy the data region MINUS the preview + popup regions carved
@@ -560,6 +716,16 @@ void JuxOnFrameCaptured(JuxWebContentsHandle handle,
       LOG(WARNING) << "[capture] frame " << w << "x" << h << " (" << frame_bytes
                    << " B) exceeds data slot (" << slot_bytes
                    << " B) — frame dropped; raise the frame-buffer cap";
+    }
+    // Recovery: an oversized frame means the rasterized density diverged from
+    // capture_scale (classically a stale scale override after a DPI-boundary
+    // monitor move). Force the next tick to recompute + re-apply the override
+    // and keep the burst alive — a one-frame drop self-heals instead of every
+    // subsequent frame being dropped (frozen/blank WebView).
+    auto rec = g_web_contents_map->find(handle);
+    if (rec != g_web_contents_map->end()) {
+      rec->second.applied_capture_override = 0.0f;
+      rec->second.fast_capture_frames = kResizeFastFrames;
     }
     return;
   }
@@ -587,8 +753,6 @@ void JuxOnFrameCaptured(JuxWebContentsHandle handle,
   next_slot = (slot + 1u) % kFrameBufferCount;
 
   uint8_t* dst = data.data() + static_cast<size_t>(slot) * slot_bytes;
-  const uint8_t* src = static_cast<const uint8_t*>(bmp.getPixels());
-  const size_t src_stride = bmp.rowBytes();
   if (src_stride == stride) {
     memcpy(dst, src, frame_bytes);
   } else {
@@ -613,6 +777,217 @@ void JuxOnFrameCaptured(JuxWebContentsHandle handle,
   memcpy(payload + 20, &logical_h, 4);
   writer->WriteEvent(jux::events::kFrameReady, channel->window_id(),
                      base::span<const uint8_t>(payload, sizeof(payload)));
+}
+
+void JuxOnFrameCaptured(JuxWebContentsHandle handle,
+                        float logical_w, float logical_h,
+                        const content::CopyFromSurfaceResult& result) {
+  if (!result.has_value()) {
+    if (::getenv("OPENJFX_SKIA_WEBDPI_DIAG")) {
+      ++g_copy_fail_streak;
+      if (g_copy_fail_streak == 1 || g_copy_fail_streak % 30 == 0) {
+        VLOG(1) << "[webdpi] CopyFromSurface returned EMPTY (streak="
+                << g_copy_fail_streak << ")";
+      }
+    }
+    return;
+  }
+  if (g_copy_fail_streak > 0) {
+    if (::getenv("OPENJFX_SKIA_WEBDPI_DIAG")) {
+      VLOG(1) << "[webdpi] CopyFromSurface recovered after "
+              << g_copy_fail_streak << " empty results";
+    }
+    g_copy_fail_streak = 0;
+  }
+#if BUILDFLAG(ENABLE_PRINT_PREVIEW)
+  // Keep the page (initiator) LIVE on the main channel so it reflows on resize;
+  // route the preview's own frame to the popup overlay region instead (drawn
+  // centered over the page by Java). The page (handle != preview) falls through.
+  if (g_print_preview_handle != 0 && handle == g_print_preview_handle) {
+    PublishPreviewOverlay(logical_w, logical_h, result);
+    return;
+  }
+#endif
+  // CopyFromSurface yields an N32 bitmap — BGRA8888 premultiplied on
+  // Windows/macOS, which is exactly what the Skia draw helper expects.
+  const SkBitmap& bmp = result.value().bitmap;
+  PublishMainFrame(handle,
+                   static_cast<const uint8_t*>(bmp.getPixels()),
+                   bmp.rowBytes(), bmp.width(), bmp.height(),
+                   logical_w, logical_h);
+}
+
+// ---------------------------------------------------------------------------
+// JuxVideoConsumer — viz FrameSinkVideoCapturer consumer (see declaration).
+// ---------------------------------------------------------------------------
+
+// Largest frame box the capturer may emit, sized so any frame fits a main
+// SHM slot BY CONSTRUCTION (the capturer downscales aspect-preserved into
+// this box): a 16:9 box whose area equals the slot's pixel budget. For the
+// default 2560x1440x4-byte slot this is exactly 2560x1440.
+static gfx::Size MainSlotMaxBox() {
+  size_t slot_px = 0;
+  if (jux::ipc::SharedMemoryChannel* channel = jux::g_callback_channel) {
+    const size_t overlay_bytes = kPreviewRegionBytes + kPopupRegionBytes;
+    const size_t data_size = channel->DataBufferMut().size();
+    const size_t main_region =
+        data_size > overlay_bytes ? data_size - overlay_bytes : 0;
+    slot_px = (main_region / kFrameBufferCount) / 4u;
+  }
+  if (slot_px == 0) {
+    return gfx::Size(2560, 1440);
+  }
+  const double h = std::sqrt(static_cast<double>(slot_px) * 9.0 / 16.0);
+  const int hi = std::max(256, static_cast<int>(h));
+  const int wi = std::max(256, static_cast<int>(slot_px / hi));
+  return gfx::Size(wi, hi);
+}
+
+JuxVideoConsumer::JuxVideoConsumer(JuxWebContentsHandle handle,
+                                   content::WebContents* wc)
+    : content::WebContentsObserver(wc), handle_(handle) {}
+
+JuxVideoConsumer::~JuxVideoConsumer() {
+  if (capturer_) {
+    capturer_->StopAndResetConsumer();
+  }
+}
+
+void JuxVideoConsumer::StartCapture() {
+  capturer_ = content::GetHostFrameSinkManager()->CreateVideoCapturer();
+  // BGRA bytes — identical to the SHM slot layout Java composites.
+  capturer_->SetFormat(media::PIXEL_FORMAT_ARGB);
+  // Damage-driven up to ~125 fps (the JavaFX side presents at the window's
+  // monitor refresh, so high-refresh displays benefit and 60 Hz panels just
+  // skip). Also shaves the wait for the FIRST frame at a new size after a
+  // resize/fullscreen. No auto-throttling and no size-change damping: the
+  // OSR consumer wants frames at the source's natural size, immediately,
+  // including straight through resize transitions.
+  capturer_->SetMinCapturePeriod(base::Milliseconds(8));
+  capturer_->SetMinSizeChangePeriod(base::TimeDelta());
+  capturer_->SetAutoThrottlingEnabled(false);
+  // Aspect-preserving constraint box: frames arrive at the source's own
+  // size (no scaling, no distortion) unless the source exceeds the slot
+  // budget, in which case viz downscales to fit — replacing the old
+  // CopyFromSurface downscale-to-fit logic.
+  capturer_->SetResolutionConstraints(gfx::Size(32, 32), MainSlotMaxBox(),
+                                      /*use_fixed_aspect_ratio=*/false);
+  RetargetToCurrentView();
+  capturer_->Start(this, viz::mojom::BufferFormatPreference::kDefault);
+}
+
+void JuxVideoConsumer::RequestRefreshFrame() {
+  if (capturer_) {
+    capturer_->RequestRefreshFrame();
+  }
+}
+
+void JuxVideoConsumer::RetargetToCurrentView() {
+  if (!capturer_ || !web_contents()) {
+    return;
+  }
+  content::RenderWidgetHostView* view =
+      web_contents()->GetRenderWidgetHostView();
+  if (view) {
+    capturer_->ChangeTarget(viz::VideoCaptureTarget(
+        static_cast<content::RenderWidgetHostViewBase*>(view)
+            ->GetFrameSinkId()));
+  } else {
+    capturer_->ChangeTarget(std::nullopt);
+  }
+}
+
+void JuxVideoConsumer::OnFrameCaptured(
+    media::mojom::VideoBufferHandlePtr data,
+    media::mojom::VideoFrameInfoPtr info,
+    const gfx::Rect& content_rect,
+    mojo::PendingRemote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks>
+        callbacks) {
+  // Bind first so every early-out releases the buffer back to the capturer
+  // pool (an unreleased buffer would stall frame delivery).
+  mojo::Remote<viz::mojom::FrameSinkVideoConsumerFrameCallbacks> done(
+      std::move(callbacks));
+  if (!data || !data->is_read_only_shmem_region() || !info ||
+      info->pixel_format != media::PIXEL_FORMAT_ARGB) {
+    if (done) done->Done();
+    return;
+  }
+  base::ReadOnlySharedMemoryMapping mapping =
+      data->get_read_only_shmem_region().Map();
+  if (!mapping.IsValid()) {
+    if (done) done->Done();
+    return;
+  }
+  const int coded_w = info->coded_size.width();
+  const int coded_h = info->coded_size.height();
+  gfx::Rect rect = content_rect.IsEmpty() ? info->visible_rect : content_rect;
+  rect.Intersect(gfx::Rect(coded_w, coded_h));
+  const size_t src_stride = static_cast<size_t>(coded_w) * 4u;
+  const size_t need = src_stride * static_cast<size_t>(coded_h);
+  if (rect.IsEmpty() || mapping.size() < need) {
+    if (done) done->Done();
+    return;
+  }
+  const uint8_t* base_ptr = static_cast<const uint8_t*>(mapping.memory());
+  const uint8_t* src = base_ptr +
+      static_cast<size_t>(rect.y()) * src_stride +
+      static_cast<size_t>(rect.x()) * 4u;
+
+  // Logical (DIP) size this frame represents. Steady state: the frame is at
+  // the commanded size × capture_scale — report the commanded logical so
+  // rounding never drifts. Mid-transition (old-size frame after a resize):
+  // self-describe from the frame's own device size, so Java draws it at its
+  // true, undistorted logical size until the new size lands.
+  float scale = 1.0f;
+  int cmd_w = 0, cmd_h = 0;
+  auto it = g_web_contents_map->find(handle_);
+  if (it != g_web_contents_map->end()) {
+    scale = it->second.capture_scale > 0.0f ? it->second.capture_scale : 1.0f;
+    cmd_w = it->second.last_logical_w;
+    cmd_h = it->second.last_logical_h;
+  }
+  float logical_w = rect.width() / scale;
+  float logical_h = rect.height() / scale;
+  if (cmd_w > 0 && cmd_h > 0 &&
+      std::fabs(logical_w - cmd_w) <= 2.0f &&
+      std::fabs(logical_h - cmd_h) <= 2.0f) {
+    logical_w = static_cast<float>(cmd_w);
+    logical_h = static_cast<float>(cmd_h);
+  }
+
+  PublishMainFrame(handle_, src, src_stride, rect.width(), rect.height(),
+                   logical_w, logical_h);
+  if (done) done->Done();
+}
+
+void JuxVideoConsumer::OnNewCaptureVersion(
+    const media::CaptureVersion& capture_version) {}
+
+void JuxVideoConsumer::OnFrameWithEmptyRegionCapture() {}
+
+void JuxVideoConsumer::OnStopped() {
+  // End-of-stream from viz (capturer torn down / target gone). The owner
+  // (WebContentsEntry) controls our lifetime; nothing to do here.
+}
+
+void JuxVideoConsumer::OnLog(const std::string& message) {
+  VLOG(1) << "[jux-capture] " << message;
+}
+
+void JuxVideoConsumer::PrimaryPageChanged(content::Page& page) {
+  // Cross-document navigation can swap the RenderWidgetHostView (and its
+  // frame sink). Follow it, and ask for a frame so the new document shows
+  // promptly even if its first damage already happened.
+  RetargetToCurrentView();
+  RequestRefreshFrame();
+}
+
+void JuxVideoConsumer::RenderViewHostChanged(
+    content::RenderViewHost* old_host,
+    content::RenderViewHost* new_host) {
+  // Renderer swap (crash recovery, process change) — re-target.
+  RetargetToCurrentView();
+  RequestRefreshFrame();
 }
 
 // OSR popup capture callback (UI thread). Copies the popup's BGRA pixels into a
@@ -833,7 +1208,59 @@ void JuxCaptureTick(JuxWebContentsHandle handle) {
   content::WebContents* wc = it->second.web_contents.get();
   content::RenderWidgetHostView* view =
       wc ? wc->GetRenderWidgetHostView() : nullptr;
+  // Stall diagnostic (OPENJFX_SKIA_WEBDPI_DIAG=1): distinguish "surface not
+  // available" (no capture even attempted) from failing copies — the two
+  // possible faces of the resize/fullscreen frame gap. UI-thread only.
+  static int g_surface_unavail_streak = 0;
+  if (::getenv("OPENJFX_SKIA_WEBDPI_DIAG")) {
+    const bool avail = view && view->IsSurfaceAvailableForCopy();
+    if (!avail) {
+      ++g_surface_unavail_streak;
+      if (g_surface_unavail_streak == 1 || g_surface_unavail_streak % 60 == 0) {
+        VLOG(1) << "[webdpi] surface UNAVAILABLE for copy (streak="
+                << g_surface_unavail_streak << ")";
+      }
+    } else if (g_surface_unavail_streak > 0) {
+      VLOG(1) << "[webdpi] surface available again after "
+              << g_surface_unavail_streak << " unavailable ticks";
+      g_surface_unavail_streak = 0;
+    }
+  }
+  // With the viz capturer active the main frame is pushed, not polled —
+  // skip the CopyFromSurface block entirely (popups/cursor/preview below
+  // still run on this tick). The scale-override healing stays active for
+  // both paths: the capturer captures whatever density the renderer
+  // rasterizes, so the override must keep tracking the JavaFX scale.
+  const bool poll_main_frame = !it->second.video_consumer;
   if (view && view->IsSurfaceAvailableForCopy()) {
+    // Heal the capture density every tick: the hidden window's monitor DSF
+    // (the override's divisor) updates asynchronously when a DPI-boundary
+    // drag moves it, so the override computed at kSetSize time can be stale.
+    // No-op (one float compare) when nothing changed.
+    ApplyCaptureScaleOverride(it->second, view);
+    // Heal the viewport size too: a display-DSF change over fixed pixel
+    // bounds silently re-derives the widget's DIP size (DIP = px / DSF),
+    // shrinking/growing the page under the last commanded logical size.
+    // Re-assert the commanded size when they diverge. No-op normally.
+    if (it->second.last_logical_w > 0 && it->second.last_logical_h > 0) {
+      gfx::Size dip = view->GetViewBounds().size();
+      if (dip.width() != it->second.last_logical_w ||
+          dip.height() != it->second.last_logical_h) {
+        if (::getenv("OPENJFX_SKIA_WEBDPI_DIAG")) {
+          VLOG(1) << "[webdpi] view DIP drifted to " << dip.width() << "x"
+                  << dip.height() << "; re-asserting "
+                  << it->second.last_logical_w << "x"
+                  << it->second.last_logical_h;
+        }
+        if (it->second.widget) {
+          it->second.widget->SetSize(gfx::Size(it->second.last_logical_w,
+                                               it->second.last_logical_h));
+        }
+        it->second.web_contents->Resize(gfx::Rect(
+            0, 0, it->second.last_logical_w, it->second.last_logical_h));
+        it->second.fast_capture_frames = kResizeFastFrames;
+      }
+    }
     // Capture at NATIVE resolution (empty out_size) in the common case. Passing
     // an explicit out_size forces CopyFromSurface down the GPU rescale path
     // (e.g. the D3D11 VideoProcessor), which FAILS on some GPUs — notably AMD,
@@ -851,6 +1278,18 @@ void JuxCaptureTick(JuxWebContentsHandle handle) {
     gfx::Size view_dip = view->GetViewBounds().size();
     float cap_scale = it->second.capture_scale;
     if (cap_scale <= 0.0f) cap_scale = 1.0f;
+    // Predict with the larger of the intended scale and the view's CURRENT
+    // effective DSF (screen-info value, override included): mid-transition
+    // the renderer can transiently rasterize denser than intended, and a
+    // prediction from capture_scale alone would under-size the guard and let
+    // the oversized frame through to the slot-overflow drop. Conservative
+    // only — out_size stays empty unless the frame truly wouldn't fit.
+    {
+      const float eff_dsf =
+          static_cast<content::RenderWidgetHostViewBase*>(view)
+              ->GetDeviceScaleFactor();
+      if (eff_dsf > cap_scale) cap_scale = eff_dsf;
+    }
     if (channel && !view_dip.IsEmpty()) {
       const double dev_w = std::ceil(view_dip.width() * cap_scale);
       const double dev_h = std::ceil(view_dip.height() * cap_scale);
@@ -875,10 +1314,12 @@ void JuxCaptureTick(JuxWebContentsHandle handle) {
       }
       // else: leave out_size empty → native capture, no rescale.
     }
-    view->CopyFromSurface(gfx::Rect(), out_size, base::Seconds(1),
-                          base::BindOnce(&JuxOnFrameCaptured, handle,
-                                         static_cast<float>(view_dip.width()),
-                                         static_cast<float>(view_dip.height())));
+    if (poll_main_frame) {
+      view->CopyFromSurface(gfx::Rect(), out_size, base::Seconds(1),
+                            base::BindOnce(&JuxOnFrameCaptured, handle,
+                                           static_cast<float>(view_dip.width()),
+                                           static_cast<float>(view_dip.height())));
+    }
   }
 
   // --- OSR popup capture (Blink page-popups: <select>/color/datalist) ---
@@ -1280,8 +1721,17 @@ void CreateWebContentsOnUI(JuxWebContentsHandle handle,
   // hidden, which freezes setInterval/the page lifecycle — JS-driven WebUI like
   // chrome://print then stalls (init chain never advances). The page is still
   // never composited to an OS window (cloaked/off-screen), so OSR is unaffected.
+  //
+  // capture_size MUST stay empty. A non-empty size is latched once as
+  // WebContentsImpl::preferred_size_for_capture_, and the moment the page enters
+  // tab-fullscreen (IsFullscreenForTabOrPending()==true) views::WebView::
+  // OnBoundsChanged switches to its captured-fullscreen letterbox branch, which
+  // pins the renderer viewport to that stale creation-time size — the page then
+  // never resizes to the fullscreen bounds (small frame in the top-left). The
+  // size is only a quality hint for the tab-capture API, which we don't use
+  // (we CopyFromSurface directly); empty is Chromium's "no side effects" mode.
   entry.capture_handle = entry.web_contents->IncrementCapturerCount(
-      viewport_size, /*stay_hidden=*/false, /*stay_awake=*/true,
+      gfx::Size(), /*stay_hidden=*/false, /*stay_awake=*/true,
       /*is_activity=*/true);
   entry.web_contents->WasShown();
 
@@ -1295,7 +1745,31 @@ void CreateWebContentsOnUI(JuxWebContentsHandle handle,
   (*g_web_contents_map)[handle] = std::move(entry);
   VLOG(1) << "CreateWebContentsOnUI: handle=" << handle;
 
-  // Start the self-scheduling off-screen frame-capture loop for this page.
+  // Main-frame capture: viz FrameSinkVideoCapturer (push, follows the
+  // surface across resizes — no frame gap during fullscreen/monitor-move
+  // transitions). Created AFTER the map insertion because the consumer
+  // resolves its entry by handle. --jux-poll-capture (Java:
+  // -Dskia.webview.pollCapture=true) falls back to the legacy polling tick.
+  WebContentsEntry& live = (*g_web_contents_map)[handle];
+  bool use_video_capturer = !base::CommandLine::ForCurrentProcess()->HasSwitch(
+      "jux-poll-capture");
+#if BUILDFLAG(ENABLE_PRINT_PREVIEW)
+  // The print-preview page's frames route to the preview OVERLAY region via
+  // the polling path (PublishPreviewOverlay) — keep it on the tick.
+  if (handle == g_print_preview_handle) {
+    use_video_capturer = false;
+  }
+#endif
+  if (use_video_capturer) {
+    live.video_consumer =
+        std::make_unique<JuxVideoConsumer>(handle, live.web_contents.get());
+    live.video_consumer->StartCapture();
+  }
+
+  // Start the self-scheduling off-screen capture/housekeeping loop. With the
+  // video consumer active it no longer copies the main frame (the capturer
+  // pushes those) but still drives popup capture, cursor polling and the
+  // print-preview frame.
   JuxCaptureTick(handle);
 }
 
@@ -1479,6 +1953,11 @@ content::WebContents* OpenPrintPreviewWebContents(
   // frames as kFrameReady and redirects forwarded input to it (see
   // g_print_preview_handle / JuxOnFrameCaptured / JuxSendMouseEvent).
   g_print_preview_handle = handle;
+  // The preview's frames must flow through the POLLING path — only
+  // JuxOnFrameCaptured routes them to the preview overlay region. Drop the
+  // viz consumer the generic creation path attached (the handle wasn't the
+  // preview yet at creation time); the capture tick resumes polling it.
+  it->second.video_consumer.reset();
 
   // Navigate the preview to the registered WebUI (chrome://print → PrintPreviewUI).
   VLOG(1) << "[print-preview] sized + active; issuing LoadURL(chrome://print)";
@@ -1873,6 +2352,11 @@ extern "C" JUX_EXPORT void JuxDestroyWebContents(
         }
 
         auto& entry = it->second;
+
+        // Stop the viz video capturer FIRST: it observes the WebContents and
+        // its callbacks resolve the entry by handle — both must be dead
+        // before the WebContents/entry teardown below.
+        entry.video_consumer.reset();
 
         // Release the capturer handle and cancel the wheel-end timer BEFORE the
         // WebContents is torn down below. capture_handle's ScopedClosureRunner
@@ -2741,6 +3225,8 @@ extern "C" JUX_EXPORT void JuxSetOffscreenSize(JuxWebContentsHandle handle,
         }
         auto& entry = it->second;
         entry.capture_scale = scale;  // device frame = w*scale × h*scale
+        entry.last_logical_w = w;     // re-asserted by the tick on DIP drift
+        entry.last_logical_h = h;
         // Burst-capture briefly so the post-reflow frame at the new size lands
         // fast (otherwise it waits up to a full steady tick → slow to "fit",
         // most visibly on small→maximize). A continuous drag keeps refreshing
@@ -2761,38 +3247,23 @@ extern "C" JUX_EXPORT void JuxSetOffscreenSize(JuxWebContentsHandle handle,
           // Make the renderer's EFFECTIVE device-scale equal the JavaFX render
           // scale, so the captured frame is w*scale x h*scale device px —
           // HiDPI-crisp and identical no matter which monitor (and DPI) the
-          // hidden capture window lives on.
-          //
-          // SetScaleOverrideForCapture is a MULTIPLIER on the view's FRESH
-          // display DSF (UpdateScreenInfo multiplies
-          // GetNewScreenInfosForUpdate().current().device_scale_factor, i.e. the
-          // RAW monitor DSF — NOT the already-overridden screen_infos_ that
-          // GetDeviceScaleFactor() returns). The aura host window's
-          // device_scale_factor IS that raw monitor DSF, so it is the correct
-          // divisor to land effective == scale. On a multi-monitor / mixed-scale
-          // setup this can still go wrong if the hidden window's host DSF is stale
-          // or on a different monitor than the view's display info — diagnose with
-          // OPENJFX_SKIA_WEBDPI_DIAG (compare hostDSF vs the captured effectiveDSF
-          // in the [webdpi] capture line) before changing the divisor.
-          float host_dsf = 1.0f;
-          if (entry.widget && entry.widget->GetNativeWindow() &&
-              entry.widget->GetNativeWindow()->GetHost()) {
-            host_dsf =
-                entry.widget->GetNativeWindow()->GetHost()->device_scale_factor();
-            if (host_dsf <= 0.0f) host_dsf = 1.0f;
-          }
+          // hidden capture window lives on. The override's divisor (the hidden
+          // window's host DSF) can be STALE right after a DPI-boundary monitor
+          // move, so the same helper is also re-run every JuxCaptureTick and
+          // self-heals once the DSF settles — see ApplyCaptureScaleOverride.
+          // (The helper no-ops when the desired override is unchanged; the
+          // resize fast burst was already granted above regardless.)
+          ApplyCaptureScaleOverride(entry, view);
           if (::getenv("OPENJFX_SKIA_WEBDPI_DIAG")) {
-            float view_dsf =
-                static_cast<content::RenderWidgetHostViewBase*>(view)
-                    ->GetDeviceScaleFactor();
             VLOG(1) << "[webdpi] SetOffscreenSize logical=" << w << "x" << h
-                      << " jfxScale=" << scale << " hostDSF=" << host_dsf
-                      << " viewDSF(screenInfo,maybe-overridden)=" << view_dsf
-                      << " override=" << (scale / host_dsf)
-                      << "  (want captured effectiveDSF == jfxScale)";
+                      << " jfxScale=" << scale
+                      << " override=" << entry.applied_capture_override;
           }
-          static_cast<content::RenderWidgetHostViewBase*>(view)
-              ->SetScaleOverrideForCapture(scale / host_dsf);
+        }
+        // Viz-capturer path: nudge a refresh so a pure scale/size change
+        // delivers a frame promptly even if the page produced no damage yet.
+        if (entry.video_consumer) {
+          entry.video_consumer->RequestRefreshFrame();
         }
       },
       handle, width, height, scale));
@@ -3626,6 +4097,25 @@ extern "C" JUX_EXPORT void JuxSetHitSpotNodes(JuxWebContentsHandle handle,
 // on_dom_tree_ready. The callbacks are set via JuxSetCallbacks and
 // eventually write DOM_ELEMENT / DOM_TEXT / DOM_TREE_READY events to
 // the Java-visible ring buffer.
+extern "C" JUX_EXPORT void JuxBindDomPipe(JuxWebContentsHandle handle) {
+  // Binding-only touch: GetDomHandler establishes the handler remote AND the
+  // renderer->browser client (which arms the renderer's document listeners —
+  // EnsureDocListeners requires a bound client). No tree request, so nothing
+  // is surfaced to Java — safe for callback-detached pages like the
+  // off-screen print preview, whose engine-drawn <select> dropdown depends
+  // on the renderer's capture-phase mousedown interception.
+  VLOG(1) << "[jux-dom] JuxBindDomPipe: handle=" << handle;
+  PostToBrowserThread(base::BindOnce(
+      [](JuxWebContentsHandle h) {
+        auto* remote = GetDomHandler(h);
+        if (!remote || !remote->is_bound()) {
+          LOG(WARNING) << "[jux-dom] JuxBindDomPipe: DOM handler not bound (h="
+                       << h << ")";
+        }
+      },
+      handle));
+}
+
 extern "C" JUX_EXPORT void JuxRequestDomTree(JuxWebContentsHandle handle) {
   VLOG(1) << "[jux-dom] JuxRequestDomTree: handle=" << handle;
   PostToBrowserThread(base::BindOnce(

@@ -798,6 +798,51 @@ public abstract class View {
         }
     }
 
+    /**
+     * Partial-blit hook for {@link #uploadPixelsRect}; the default
+     * delegates to the full upload so only platforms that implement a
+     * real partial blit need to override.
+     */
+    protected void _uploadPixelsRect(long ptr, Pixels pixels,
+                                     int x, int y, int w, int h) {
+        _uploadPixels(ptr, pixels);
+    }
+
+    // Latched when the platform lib predates _uploadPixelsRect (stale
+    // native cache / mixed deployment): degrade permanently to full
+    // uploads instead of throwing on every present.
+    private static volatile boolean rectUploadUnavailable;
+
+    /**
+     * Dumps only the given rectangle of the pixels on to the view
+     * (readback-tier partial present). Platforms without a partial-blit
+     * implementation fall back to a full {@link #uploadPixels} —
+     * correctness everywhere, speed where implemented. The pixels buffer
+     * must be fully coherent (the caller tracks per-buffer staleness);
+     * the rect only limits the OS blit.
+     */
+    public void uploadPixelsRect(Pixels pixels, int x, int y, int w, int h) {
+        Application.checkEventThread();
+        checkNotClosed();
+        lock();
+        try {
+            if (rectUploadUnavailable) {
+                _uploadPixels(this.ptr, pixels);
+            } else {
+                try {
+                    _uploadPixelsRect(this.ptr, pixels, x, y, w, h);
+                } catch (UnsatisfiedLinkError e) {
+                    rectUploadUnavailable = true;
+                    System.err.println("[glass] _uploadPixelsRect missing from "
+                        + "the native lib; falling back to full uploads");
+                    _uploadPixels(this.ptr, pixels);
+                }
+            }
+        } finally {
+            unlock();
+        }
+    }
+
 
     //-------- FULLSCREEN --------//
 

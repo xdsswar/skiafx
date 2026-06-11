@@ -48,6 +48,13 @@ gboolean ffmpegwrapper_init(GstPlugin* ffmpegwrapper);
  * scalar. Returns non-zero when the loader is now usable. */
 int openjfx_ffmpeg_loader_init(const char* user_dir);
 #endif
+/* Optional: ffmpegdemux (libavformat catch-all demuxer) is compiled
+ * together with the wrapper under OPENJFX_FFMPEG_INCLUDE_DIR. It plays
+ * any container ffmpeg can open and is created by name from the JFX
+ * pipeline factory for content types with no dedicated gst demuxer. */
+#ifdef OPENJFX_HAVE_FFMPEGDEMUX
+gboolean ffmpegdemux_init(GstPlugin* ffmpegdemux);
+#endif
 #endif
 
 #ifdef STATIC_BUILD
@@ -74,6 +81,13 @@ static gboolean fxplugins_init (GstPlugin * plugin)
             * API. Process-wide env var read; harmless when unset. */
            (openjfx_ffmpeg_loader_init(getenv("OPENJFX_MEDIA_FFMPEG_DIR")),
             ffmpegwrapper_init(plugin)) &&
+#  endif
+#  ifdef OPENJFX_HAVE_FFMPEGDEMUX
+           /* Registers at GST_RANK_NONE — never auto-plugged; only the
+            * pipeline factory creates it by name. Returns TRUE even with
+            * no ffmpeg at runtime (the element fails the state change with
+            * a catchable error if it's ever reached without the loader). */
+           ffmpegdemux_init(plugin) &&
 #  endif
 #endif // WIN32
            progress_buffer_plugin_init(plugin);

@@ -60,6 +60,17 @@ OPENJFX_INTEROP_API void* openjfx_skia_d3d11_interop_get_device(void);
 OPENJFX_INTEROP_API int32_t openjfx_skia_d3d11_interop_ready(void);
 
 /**
+ * Blocks new register/lock calls for the next `millis` milliseconds
+ * (extends an active window, never shortens it). Called by the surface
+ * resize / swap-chain rebuild paths: a concurrent GL<->D3D11 interop
+ * sync during a rebuild can deadlock in the driver (observed desktop-
+ * level freeze leaving fullscreen during 4K zero-copy playback). While
+ * quiesced the media texture keeps showing its previous frame; unlock /
+ * unregister are never blocked.
+ */
+OPENJFX_INTEROP_API void openjfx_skia_d3d11_interop_quiesce(int32_t millis);
+
+/**
  * Tears down the interop device + D3D11 device. Called once at shutdown
  * (or from a Cleaner action). Safe to call when init never succeeded.
  */

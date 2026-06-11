@@ -36,6 +36,8 @@ import com.sun.prism.impl.Disposer;
 import com.sun.prism.skia.SkiaPresentable;
 import com.sun.prism.skia.impl.NativeBridge;
 import com.sun.prism.skia.impl.NativeHandles;
+import com.sun.prism.skia.impl.PaintStats;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 /**
  * Painter that drives the Skia pipeline's per-pulse render and
@@ -152,7 +154,7 @@ final class PresentingPainter extends ViewPainter {
                 lastObservedRefreshHz = hz;
                 // Refresh-rate detection / change. Silent by default; enable
                 // with -Dskia.present.diag=true to confirm multi-monitor.
-                if (Boolean.getBoolean("skia.present.diag")) {
+                if (PRESENT_DIAG) {
                     if (prev == 0) {
                         System.err.printf("[skia.present] cap %d Hz "
                             + "(detected from window's monitor)%n", hz);
@@ -175,11 +177,20 @@ final class PresentingPainter extends ViewPainter {
     }
 
     // ---- Paint-rate diagnostic --------------------------------------------
-    // -Dskia.paint.diag=true: every ~1 second, print actual paint count
-    // and average paint duration to stderr. Lets us tell at a glance
-    // whether the painter is running cheaply (change detection +
-    // dirty regions effective) or doing full scene work each frame.
-    // Quiet when the flag is unset — zero per-pulse overhead.
+    // Diagnostic flags hoisted to constants: Boolean.getBoolean is a
+    // synchronized Properties lookup and these were evaluated up to four
+    // times per pulse on the hot path.
+    private static final boolean PAINT_DIAG   = Boolean.getBoolean("skia.paint.diag");
+    private static final boolean RESIZE_DIAG  = Boolean.getBoolean("skia.resize.diag");
+    private static final boolean PRESENT_DIAG = Boolean.getBoolean("skia.present.diag");
+
+    // Always-on paint accounting (two nanoTime reads + a few adds per
+    // paint — noise next to the paint itself). Publishes paints/sec and
+    // avg paint ms to PaintStats once a second for benchmark harnesses;
+    // -Dskia.paint.diag=true additionally prints the same numbers to
+    // stderr. Lets us tell at a glance whether the painter is running
+    // cheaply (change detection + dirty regions effective) or doing full
+    // scene work each frame.
     private long diagPaintCount = 0;
     private long diagPaintTimeNs = 0;
     private long diagWindowStart = 0;
@@ -192,8 +203,12 @@ final class PresentingPainter extends ViewPainter {
         if (elapsed >= 1_000_000_000L) {
             double paintsPerSec = diagPaintCount * 1_000_000_000.0 / elapsed;
             double avgMs = diagPaintTimeNs / (double) diagPaintCount / 1_000_000.0;
-            System.err.printf("[skia.paint] %.0f paints/sec  avg=%.2f ms%n",
-                paintsPerSec, avgMs);
+            PaintStats.LAST_PAINTS_PER_SEC = paintsPerSec;
+            PaintStats.LAST_PAINT_AVG_MS   = avgMs;
+            if (PAINT_DIAG) {
+                System.err.printf("[skia.paint] %.0f paints/sec  avg=%.2f ms%n",
+                    paintsPerSec, avgMs);
+            }
             diagPaintCount = 0;
             diagPaintTimeNs = 0;
             diagWindowStart = now;
@@ -231,7 +246,7 @@ final class PresentingPainter extends ViewPainter {
                 if (QuantumToolkit.verbose) {
                     System.err.println("PresentingPainter: validateStageGraphics failed");
                 }
-                if (Boolean.getBoolean("skia.resize.diag")) {
+                if (RESIZE_DIAG) {
                     System.err.println("[skia.present] VALIDATE FAILED -> blank  view="
                         + viewWidth + "x" + viewHeight);
                 }
@@ -323,7 +338,7 @@ final class PresentingPainter extends ViewPainter {
                 boolean canSkip = !fullRepaint
                     && currentDirtyVersion == lastPresentedDirtyVersion;
 
-                if (Boolean.getBoolean("skia.resize.diag")) {
+                if (RESIZE_DIAG) {
                     System.err.println("[skia.present] view=" + viewWidth + "x" + viewHeight
                         + " scene=" + vs.getClass().getSimpleName()
                         + " fresh=" + freshBackBuffer + " entireDirty=" + vs.isEntireSceneDirty()
@@ -343,11 +358,9 @@ final class PresentingPainter extends ViewPainter {
                 if (g != null) {
                     long paintStart = System.nanoTime();
                     paintImpl(g);
-                    if (Boolean.getBoolean("skia.paint.diag")) {
-                        countPaint(System.nanoTime() - paintStart);
-                    }
+                    countPaint(System.nanoTime() - paintStart);
                     freshBackBuffer = false;
-                } else if (Boolean.getBoolean("skia.resize.diag")) {
+                } else if (RESIZE_DIAG) {
                     System.err.println("[skia.present] createGraphics NULL -> no paint  view="
                         + viewWidth + "x" + viewHeight);
                 }
@@ -394,7 +407,10 @@ final class PresentingPainter extends ViewPainter {
                     return;
                 }
 
-                if (!presentable.prepare(null)) {
+                // Hand the painted union (device px; null = whole surface)
+                // to the presentable so the readback tier can limit its
+                // per-frame copy + OS blit to the area that changed.
+                if (!presentable.prepare(getPaintedRegion())) {
                     disposePresentable();
                     sceneState.getScene().entireSceneNeedsRepaint();
                     return;
@@ -428,7 +444,7 @@ final class PresentingPainter extends ViewPainter {
                 if (presented) {
                     lastPresentedDirtyVersion = currentDirtyVersion;
                     lastPresentTimeNs         = nowNs;
-                    // skia-fx: both present paths are flip-style swap
+                    // skia-fx: the GPU present paths are flip-style swap
                     // chains — wglSwapBuffers and DXGI flip-model
                     // ALLOW_TEARING both leave the new back buffer's
                     // contents undefined after present. ViewPainter's
@@ -441,7 +457,19 @@ final class PresentingPainter extends ViewPainter {
                     // renderEverything keeps the entire scene valid
                     // each frame, which is what flip-style swap
                     // chains require.
-                    freshBackBuffer = true;
+                    //
+                    // The software-raster (CPU) tier is NOT a flip chain:
+                    // its SkSurface is a persistent CPU buffer and present()
+                    // reads the WHOLE surface back every frame, so unchanged
+                    // pixels stay valid and the existing dirty-region path
+                    // can repaint just the changed nodes. Re-arming a full
+                    // repaint there is pure waste — it forces all nodes to
+                    // re-rasterize on the CPU every frame (the dominant cost
+                    // of the software path). Skip the re-arm only on the
+                    // software path; every GPU tier is unchanged.
+                    if (!SkiaGpu.isResolvedSoftware()) {
+                        freshBackBuffer = true;
+                    }
 
                     // skia-fx: paint-before-show signal. The FX
                     // thread inside WindowStage.setVisible is

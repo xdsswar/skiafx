@@ -34,6 +34,9 @@
 #include <Locator/LocatorStream.h>
 #include <jfxmedia_errors.h>
 #include <gst/gstelement.h>
+// skia-fx: gst_base_transform_set_passthrough for the scaletempo
+// initial-passthrough workaround in CreateAudioBin.
+#include <gst/base/gstbasetransform.h>
 #include <Utils/LowLevelPerf.h>
 #include <algorithm>
 #if ENABLE_VIDEOCONVERT
@@ -92,7 +95,10 @@ static void PickCompanionAudioDecoder(CPipelineOptions* pOptions, const string& 
     }
     else if (contentType == CONTENT_TYPE_AAC)
     {
-        //   raw adts AAC → dshowwrapper, no demuxer
+        //   raw adts AAC → aacparse frames the stream and stamps proper
+        //   audio/mpeg mpegversion=4 caps (the bare javasource feed has
+        //   none), then dshowwrapper decodes.
+        pOptions->SetAudioStreamParser("aacparse");
         pOptions->SetAudioDecoder("dshowwrapper");
     }
     else if (contentType == CONTENT_TYPE_MPA || contentType == CONTENT_TYPE_MP3)
@@ -100,6 +106,34 @@ static void PickCompanionAudioDecoder(CPipelineOptions* pOptions, const string& 
         //   mp3 → mpegaudioparse + dshowwrapper
         pOptions->SetAudioStreamParser("mpegaudioparse");
         pOptions->SetAudioDecoder("dshowwrapper");
+    }
+    else if (contentType == CONTENT_TYPE_WAV)
+    {
+        //   wav → wavparse emits raw PCM; no decoder needed (the audio
+        //   bin's audioconvert handles layout/format).
+        pOptions->SetAudioStreamParser("wavparse");
+    }
+    else if (contentType == CONTENT_TYPE_AIFF)
+    {
+        //   aiff → aiffparse emits raw PCM (big-endian; audioconvert
+        //   fixes it up). No decoder needed.
+        pOptions->SetAudioStreamParser("aiffparse");
+    }
+    else if (contentType == CONTENT_TYPE_FLAC)
+    {
+        //   raw flac → flacparse frames the stream, ffmpegwrapper
+        //   decodes.
+        pOptions->SetAudioStreamParser("flacparse");
+        pOptions->SetAudioDecoder("ffmpegwrapper");
+    }
+    else if (contentType == CONTENT_TYPE_FFMPEG)
+    {
+        //   skia-fx catch-all: a companion audio in any other container
+        //   ffmpeg can open (e.g. ogg/opus). ffmpegdemux exposes the
+        //   audio pad; ffmpegwrapper decodes. Same hybrid gate as the
+        //   single-source path — only reached when ffmpeg is loaded.
+        pOptions->SetAudioStreamParser("ffmpegdemux");
+        pOptions->SetAudioDecoder("ffmpegwrapper");
     }
     // else: unknown container — leave the audio bin to default
     // negotiation rather than forcing a wrong element.
@@ -206,15 +240,26 @@ uint32_t CGstPipelineFactory::CreatePlayerPipeline(CLocator* locator, CPipelineO
 
         pOptions->SetPipelineType(CPipelineOptions::kAudioSourcePipeline);
 
-        // Pick the right audio demuxer + decoder based on the
-        // companion's container extension. The audio bin downstream
-        // is a [demuxer →] parser → decoder → sink chain — without a
-        // demuxer the audio bin gets raw file bytes and caps
+        // Pick the right audio demuxer + decoder. The audio bin
+        // downstream is a [demuxer →] parser → decoder → sink chain —
+        // without a demuxer the audio bin gets raw file bytes and caps
         // negotiation fails (manifests as the pipeline rapidly
         // transitioning states = video flashing). The decoder
         // selection here MUST survive the later container-factory
         // dispatch — see hasCompanionAudio guard in
         // CreateMatroskaPipeline / CreateMP4Pipeline.
+        //
+        // Primary source of truth: the Java-side file-signature sniff
+        // (GstMedia.cpp stamps it for file:// companions too) — it's
+        // extension-agnostic and covers mp3 (ID3/sync), wav, aiff,
+        // mp4-family, webm/mkv and ADTS AAC. Extension sniffing below
+        // is a fallback for when the signature read failed.
+        PickCompanionAudioDecoder(pOptions,
+                streamLocator->GetCompanionAudioContentTypeStr());
+
+        if (pOptions->GetAudioStreamParser() == NULL &&
+            pOptions->GetAudioDecoder() == NULL)
+        {
         std::string lower = companionUrl;
         for (size_t i = 0; i < lower.size(); ++i) {
             lower[i] = (char)g_ascii_tolower(lower[i]);
@@ -232,24 +277,54 @@ uint32_t CGstPipelineFactory::CreatePlayerPipeline(CLocator* locator, CPipelineO
         // exist on Windows only). When porting to macOS / Linux,
         // remap to osxaudiosink-side decoders / avaudiodecoder here.
 #if TARGET_OS_WIN32
-        if (lower.size() >= 4 && (
-                lower.compare(lower.size() - 4, 4, ".m4a") == 0
-             || lower.compare(lower.size() - 4, 4, ".mp4") == 0
-             || lower.compare(lower.size() - 4, 4, ".aac") == 0))
+        auto hasExt = [&lower](const char* ext) {
+            return g_str_has_suffix(lower.c_str(), ext) != 0;
+        };
+        if (hasExt(".m4a") || hasExt(".mp4") || hasExt(".m4b"))
         {
-            //   .m4a / .mp4 / .aac → qtdemux + dshowwrapper (AAC)
+            //   .m4a / .mp4 / .m4b → qtdemux + dshowwrapper (AAC)
             audioParser  = "qtdemux";
             audioDecoder = "dshowwrapper";
         }
-        else if ((lower.size() >= 5 && lower.compare(lower.size() - 5, 5, ".webm") == 0)
-              || (lower.size() >= 4 && lower.compare(lower.size() - 4, 4, ".mkv") == 0))
+        else if (hasExt(".webm") || hasExt(".weba")
+              || hasExt(".mkv")  || hasExt(".mka"))
         {
-            //   .webm / .mkv → matroskademux + ffmpegwrapper (vorbis/opus)
+            //   matroska family → matroskademux + ffmpegwrapper
+            //   (vorbis/opus)
             audioParser  = "matroskademux";
             audioDecoder = "ffmpegwrapper";
         }
-        // .mp3 / .ogg / .wav: no audioParser — handled by audio bin
-        // defaults.
+        else if (hasExt(".mp3"))
+        {
+            //   .mp3 → mpegaudioparse + dshowwrapper
+            audioParser  = "mpegaudioparse";
+            audioDecoder = "dshowwrapper";
+        }
+        else if (hasExt(".aac"))
+        {
+            //   raw ADTS stream → aacparse + dshowwrapper
+            audioParser  = "aacparse";
+            audioDecoder = "dshowwrapper";
+        }
+        else if (hasExt(".wav"))
+        {
+            //   .wav → wavparse, raw PCM, no decoder
+            audioParser  = "wavparse";
+        }
+        else if (hasExt(".aif") || hasExt(".aiff"))
+        {
+            //   aiff → aiffparse, raw PCM, no decoder
+            audioParser  = "aiffparse";
+        }
+        else if (hasExt(".flac"))
+        {
+            //   .flac → flacparse + ffmpegwrapper
+            audioParser  = "flacparse";
+            audioDecoder = "ffmpegwrapper";
+        }
+        // .ogg: no demuxer in gstreamer-lite (oggdemux lives in
+        // gst-plugins-base + libogg) — left to default negotiation,
+        // which fails with a clear codec error.
 #else
         // TODO(dual-source-mac, dual-source-linux): wire equivalent
         // demuxer + decoder choices for macOS (osxaudio + native AAC)
@@ -265,6 +340,7 @@ uint32_t CGstPipelineFactory::CreatePlayerPipeline(CLocator* locator, CPipelineO
         if (audioDecoder != NULL) {
             pOptions->SetAudioDecoder(audioDecoder);
         }
+        } // signature-sniff fallback
         pOptions->SetAudioStreamMimeType(0);
     }
 
@@ -325,6 +401,14 @@ uint32_t CGstPipelineFactory::CreatePipeline(CPipelineOptions *pOptions, GstElem
         if (ERROR_NONE != uRetCode)
             return uRetCode;
     }
+    else if (CONTENT_TYPE_AAC == pOptions->GetContentType())
+    {
+        // skia-fx: raw ADTS AAC stream (signature-detected on the Java
+        // side). aacparse frames it; platform decoder decodes.
+        uRetCode = CreateAacAudioPipeline(pOptions, pElements, ppPipeline);
+        if (ERROR_NONE != uRetCode)
+            return uRetCode;
+    }
     else if (CONTENT_TYPE_AIFF == pOptions->GetContentType())
     {
         uRetCode = CreateAiffPcmAudioPipeline(pOptions, pElements, ppPipeline);
@@ -360,6 +444,52 @@ uint32_t CGstPipelineFactory::CreatePipeline(CPipelineOptions *pOptions, GstElem
 #endif // !(ENABLE_APP_SINK && !ENABLE_NATIVE_SINK)
 
         uRetCode = CreateMatroskaPipeline(pVideoSink, pOptions, pElements, ppPipeline);
+        if (ERROR_NONE != uRetCode)
+            return uRetCode;
+    }
+    else if (CONTENT_TYPE_FLAC == pOptions->GetContentType())
+    {
+        // skia-fx: raw .flac — flacparse frames the stream,
+        // ffmpegwrapper decodes.
+        uRetCode = CreateFlacAudioPipeline(pOptions, pElements, ppPipeline);
+        if (ERROR_NONE != uRetCode)
+            return uRetCode;
+    }
+    else if (CONTENT_TYPE_AVI == pOptions->GetContentType() ||
+             CONTENT_TYPE_FLV == pOptions->GetContentType())
+    {
+        // skia-fx: .avi / .flv. Same shape as matroska — demuxer from
+        // the fetched gst-plugins-good sources, decoders dynamic.
+        GstElement* pVideoSink = NULL;
+#if ENABLE_APP_SINK && !ENABLE_NATIVE_SINK
+        pVideoSink = CreateElement("appsink");
+        if (NULL == pVideoSink)
+            return ERROR_GSTREAMER_VIDEO_SINK_CREATE;
+#endif // !(ENABLE_APP_SINK && !ENABLE_NATIVE_SINK)
+
+        uRetCode = CreateDemuxAVPipeline(
+            CONTENT_TYPE_AVI == pOptions->GetContentType() ? "avidemux" : "flvdemux",
+            pVideoSink, pOptions, pElements, ppPipeline);
+        if (ERROR_NONE != uRetCode)
+            return uRetCode;
+    }
+    else if (CONTENT_TYPE_FFMPEG == pOptions->GetContentType())
+    {
+        // skia-fx catch-all: any other container ffmpeg can open. The
+        // Java gate only assigns this content type when the ffmpeg
+        // runtime is loaded; if the ffmpegdemux element isn't registered
+        // (built without ffmpeg) CreateElement fails downstream, and if
+        // the runtime DLLs are absent the element fails its state change
+        // with a catchable MediaException — never a crash.
+        GstElement* pVideoSink = NULL;
+#if ENABLE_APP_SINK && !ENABLE_NATIVE_SINK
+        pVideoSink = CreateElement("appsink");
+        if (NULL == pVideoSink)
+            return ERROR_GSTREAMER_VIDEO_SINK_CREATE;
+#endif // !(ENABLE_APP_SINK && !ENABLE_NATIVE_SINK)
+
+        uRetCode = CreateDemuxAVPipeline("ffmpegdemux",
+            pVideoSink, pOptions, pElements, ppPipeline);
         if (ERROR_NONE != uRetCode)
             return uRetCode;
     }
@@ -496,8 +626,25 @@ uint32_t CGstPipelineFactory::CreateSourceElement(CLocator *locator, CStreamCall
     else if (streamMimeType == HLS_VALUE_MIMETYPE_AAC)
         g_object_set(javaSource, "mimetype", CONTENT_TYPE_AAC, NULL);
 
+    // skia-fx: the dual-source COMPANION javasource must carry the
+    // companion's OWN size, not the primary's. CreateSourceElement is
+    // called for both sources with the same locator — distinguish the
+    // companion by its callbacks. (Size hint -1/unknown keeps the
+    // primary's value: better than nothing for byte math, and EOS
+    // clamps it; matches the previous behaviour for that edge.)
+    gint64 sizeHint = (gint64)locator->GetSizeHint();
+    if (locator->GetType() == CLocator::kStreamLocatorType)
+    {
+        CLocatorStream* sl = (CLocatorStream*)locator;
+        if (callbacks != NULL && callbacks == sl->GetAudioCallbacks() &&
+            sl->GetCompanionAudioSizeHint() > 0)
+        {
+            sizeHint = (gint64)sl->GetCompanionAudioSizeHint();
+        }
+    }
+
     g_object_set(javaSource,
-                 "size", (gint64)locator->GetSizeHint(),
+                 "size", sizeHint,
                  "is-seekable", (gboolean)callbacks->IsSeekable(),
                  "is-random-access", (gboolean)isRandomAccess,
                  "location", locator->GetLocation().c_str(),
@@ -521,26 +668,55 @@ uint32_t CGstPipelineFactory::CreateSourceElement(CLocator *locator, CStreamCall
         if (NULL == buffer)
             return ERROR_GSTREAMER_ELEMENT_CREATE;
 
-        // skia-fx: OPT-IN deeper read-ahead cushion on remote streams.
+        // skia-fx: read-ahead cushion on remote streams.
         // The progressbuffer caches `prebuffer-time * measured-bandwidth`
         // bytes before it reports ready AND before it resumes the src task
         // after an underrun (progressbuffer.c: range_stop = end + bandwidth
         // * prebuffer_time). A larger value loads further ahead so transient
-        // network dips are absorbed. OFF by default (stays at the stock 2s)
-        // because a bigger prebuffer slows the initial start of ALL remote
-        // playback; it's a knob for the still-pending remote dual-source
-        // work. Set OPENJFX_MEDIA_PREBUFFER_TIME (0 < t <= 20 seconds).
+        // network dips are absorbed.
+        //
+        // Default: stock 2 s for single-source. For dual-source
+        // Media(audio,video) the default is 8 s: rate-limited CDNs (e.g.
+        // googlevideo serves ~1.7× media rate sustained) combined with the
+        // small stock hysteresis produce constant stall/resume flapping —
+        // each underrun only buys `prebuffer × bandwidth` bytes before
+        // resuming. The deeper window trades a slower first start for
+        // stall-free steady playback. OPENJFX_MEDIA_PREBUFFER_TIME
+        // (0 < t <= 20 seconds) overrides either default;
+        // OPENJFX_MEDIA_DUAL_DEFAULTS=0 disables the dual-source default.
         if (!pOptions->GetHLSModeEnabled() &&
             g_object_class_find_property(G_OBJECT_GET_CLASS(buffer),
                                          "prebuffer-time") != NULL)
         {
+            gdouble prebufferTime = 0.0; // 0 = leave element default
+
+            // Dual-source detection: the companion is stamped on the
+            // locator (GstMedia.cpp) BEFORE pipeline construction, for
+            // both the bridge (audio callbacks) and filesrc (location)
+            // paths — pOptions' pipeline type isn't set yet when the
+            // MAIN source is built, so read the locator instead.
+            if (locator->GetType() == CLocator::kStreamLocatorType)
+            {
+                CLocatorStream* sl = (CLocatorStream*)locator;
+                if (sl->GetAudioCallbacks() != NULL ||
+                    !sl->GetCompanionAudioLocation().empty())
+                {
+                    const gchar* envDd = g_getenv("OPENJFX_MEDIA_DUAL_DEFAULTS");
+                    if (envDd == NULL || envDd[0] != '0')
+                        prebufferTime = 8.0;
+                }
+            }
+
             const gchar* envPb = g_getenv("OPENJFX_MEDIA_PREBUFFER_TIME");
             if (envPb != NULL && *envPb != '\0')
             {
                 gdouble v = g_ascii_strtod(envPb, NULL);
                 if (v > 0.0 && v <= 20.0)
-                    g_object_set(buffer, "prebuffer-time", v, NULL);
+                    prebufferTime = v;
             }
+
+            if (prebufferTime > 0.0)
+                g_object_set(buffer, "prebuffer-time", prebufferTime, NULL);
         }
 
         gst_bin_add_many(GST_BIN(source), javaSource, buffer, NULL);
@@ -846,6 +1022,79 @@ uint32_t CGstPipelineFactory::CreateMatroskaPipeline(GstElement* pVideoSink,
 }
 
 /**
+ * CGstPipelineFactory::CreateDemuxAVPipeline
+ *
+ * skia-fx: generic AV container with a stream-parser demuxer from the
+ * fetched gst-plugins-good sources (avidemux / flvdemux). The exact
+ * shape of CreateMatroskaPipeline: video decoder picked dynamically by
+ * CGstAVPlaybackPipeline::LoadDecoder from the demuxer's announced
+ * caps; audio preset to ffmpegwrapper (AVI/FLV audio is mp3/aac/ac3/
+ * pcm-law variants — ffmpeg covers them all; SwapAudioDecoderIfNeeded
+ * corrects the rare mismatch). Companion-audio override semantics are
+ * identical to the matroska path.
+ */
+uint32_t CGstPipelineFactory::CreateDemuxAVPipeline(const char* demuxName,
+                                                    GstElement* pVideoSink,
+                                                    CPipelineOptions* pOptions,
+                                                    GstElementContainer* pElements,
+                                                    CPipeline** ppPipeline)
+{
+    const bool hasCompanionAudio =
+        (pOptions->GetPipelineType() == CPipelineOptions::kAudioSourcePipeline);
+
+#if TARGET_OS_WIN32
+    pOptions->SetStreamParser(demuxName);
+    if (!hasCompanionAudio) {
+        // Prefer ffmpeg for audio (covers mp3/aac/ac3/pcm-law in one
+        // element), but when the ffmpeg runtime isn't loaded fall back
+        // to dshowwrapper so an H.264+AAC FLV still plays on a stock
+        // install (per project rule: missing ffmpeg degrades, never
+        // breaks what the platform decoders can handle).
+        bool ffmpegUsable = false;
+        GstElement* probe = gst_element_factory_make("ffmpegwrapper", NULL);
+        if (probe != NULL) {
+            gboolean supported = FALSE;
+            g_object_set(probe, "mimetype", "audio/aac", NULL);
+            g_object_get(probe, "is-supported", &supported, NULL);
+            ffmpegUsable = (supported == TRUE);
+            gst_object_unref(probe);
+        }
+        pOptions->SetAudioDecoder(ffmpegUsable ? "ffmpegwrapper" : "dshowwrapper");
+    }
+    return CreateAVPipeline(true, pVideoSink, pOptions, pElements, ppPipeline);
+#elif TARGET_OS_LINUX
+    pOptions->SetStreamParser(demuxName)
+        ->SetVideoDecoder("avvideodecoder");
+    if (!hasCompanionAudio) {
+        pOptions->SetAudioDecoder("avaudiodecoder");
+    }
+    return CreateAVPipeline(false, pVideoSink, pOptions, pElements, ppPipeline);
+#else
+    return ERROR_PLATFORM_UNSUPPORTED;
+#endif
+}
+
+/**
+ * CGstPipelineFactory::CreateFlacAudioPipeline
+ *
+ * skia-fx: raw .flac. flacparse (fetched gst-plugins-good) frames the
+ * stream and emits audio/x-flac caps; ffmpegwrapper decodes. Mirrors
+ * CreateMp3AudioPipeline.
+ */
+uint32_t CGstPipelineFactory::CreateFlacAudioPipeline(CPipelineOptions *pOptions, GstElementContainer* pElements, CPipeline** ppPipeline)
+{
+#if TARGET_OS_WIN32
+    pOptions->SetStreamParser("flacparse")->SetAudioDecoder("ffmpegwrapper");
+#elif TARGET_OS_LINUX
+    pOptions->SetStreamParser("flacparse")->SetAudioDecoder("avaudiodecoder");
+#else
+    return ERROR_PLATFORM_UNSUPPORTED;
+#endif // TARGET_OS_WIN32
+
+    return CreateAudioPipeline(false, pOptions, pElements, ppPipeline);
+}
+
+/**
     *  GstElement* CreateMp3AudioPipeline(GstElement* source, char* audiodec_factory,
     *                                 char* audiosink)
     *
@@ -863,6 +1112,24 @@ uint32_t CGstPipelineFactory::CreateMp3AudioPipeline(CPipelineOptions *pOptions,
     return ERROR_PLATFORM_UNSUPPORTED;
 #elif TARGET_OS_LINUX
     pOptions->SetStreamParser("mpegaudioparse")->SetAudioDecoder("avaudiodecoder");
+#else
+    return ERROR_PLATFORM_UNSUPPORTED;
+#endif // TARGET_OS_WIN32
+
+    return CreateAudioPipeline(false, pOptions, pElements, ppPipeline);
+}
+
+// skia-fx: raw ADTS AAC (audio/aac). aacparse scans for the ADTS sync,
+// frames the stream and emits audio/mpeg mpegversion=4 caps the
+// platform decoder accepts. Mirrors CreateMp3AudioPipeline.
+uint32_t CGstPipelineFactory::CreateAacAudioPipeline(CPipelineOptions *pOptions, GstElementContainer* pElements, CPipeline** ppPipeline)
+{
+#if TARGET_OS_WIN32
+    pOptions->SetStreamParser("aacparse")->SetAudioDecoder("dshowwrapper");
+#elif TARGET_OS_MAC
+    return ERROR_PLATFORM_UNSUPPORTED;
+#elif TARGET_OS_LINUX
+    pOptions->SetStreamParser("aacparse")->SetAudioDecoder("avaudiodecoder");
 #else
     return ERROR_PLATFORM_UNSUPPORTED;
 #endif // TARGET_OS_WIN32
@@ -1016,7 +1283,7 @@ uint32_t CGstPipelineFactory::CreateAudioPipeline(bool bConvertFormat, CPipeline
     GstElement* audiobin;
     uRetCode = CreateAudioBin(pOptions->GetStreamParser(),
                               pOptions->GetAudioDecoder(),
-                              bConvertFormat, pElements, &flags, &audiobin);
+                              bConvertFormat, pOptions, pElements, &flags, &audiobin);
     if (ERROR_NONE != uRetCode)
         return uRetCode;
 
@@ -1111,7 +1378,7 @@ uint32_t CGstPipelineFactory::CreateAVPipeline(bool bConvertFormat, GstElement* 
     int audioFlags = 0;
     GstElement *audiobin = NULL;
     uRetCode = CreateAudioBin(NULL, pOptions->GetAudioDecoder(), bConvertFormat,
-                              pElements, &audioFlags, &audiobin);
+                              pOptions, pElements, &audioFlags, &audiobin);
     if (ERROR_NONE != uRetCode)
         return uRetCode;
 
@@ -1157,10 +1424,34 @@ uint32_t CGstPipelineFactory::CreateAVPipeline(bool bConvertFormat, GstElement* 
 
 uint32_t CGstPipelineFactory::CreateAudioBin(const char* strParserName, const char* strDecoderName,
                                              bool bConvertFormat,
+                                             CPipelineOptions* pOptions,
                                              GstElementContainer* elements, int* pFlags,
                                              GstElement** ppAudiobin)
 {
-    if ((NULL == strParserName && NULL == strDecoderName) || NULL == elements || NULL == pFlags || NULL == ppAudiobin)
+    // skia-fx: a Media(audio,video) companion delivering raw PCM
+    // (wavparse / aiffparse demuxer outside the bin) legitimately has
+    // neither an in-bin parser nor a decoder — the bin is then just
+    // queue → [audioconvert] → equalizer → spectrum → sink. Only
+    // reject the both-NULL case for single-source pipelines, where it
+    // would mean a misconfigured dispatch.
+    bool bDualSourceCompanion =
+        (pOptions != NULL &&
+         pOptions->GetPipelineType() == CPipelineOptions::kAudioSourcePipeline &&
+         !pOptions->GetHLSModeEnabled());
+    // Kill switch: OPENJFX_MEDIA_DUAL_DEFAULTS=0 reverts the dual-source
+    // buffering defaults below to stock behaviour (diagnostic aid). It
+    // gates ONLY the tuning (queue sizing) — never the structural
+    // both-NULL relaxation above, which wav/aiff companions need to
+    // build at all. A diagnostics knob must not turn off format support.
+    bool bDualTunedDefaults = bDualSourceCompanion;
+    {
+        const gchar* envDd = g_getenv("OPENJFX_MEDIA_DUAL_DEFAULTS");
+        if (envDd != NULL && envDd[0] == '0')
+            bDualTunedDefaults = false;
+    }
+
+    if ((NULL == strParserName && NULL == strDecoderName && !bDualSourceCompanion)
+        || NULL == elements || NULL == pFlags || NULL == ppAudiobin)
         return ERROR_FUNCTION_PARAM_NULL;
 
     *ppAudiobin = gst_bin_new(NULL);
@@ -1183,13 +1474,39 @@ uint32_t CGstPipelineFactory::CreateAudioBin(const char* strParserName, const ch
     GstElement *audioqueue = CreateElement ("queue");
     if (NULL == audioqueue)
         return ERROR_GSTREAMER_ELEMENT_CREATE;
-    // skia-fx: OPT-IN deeper encoded-audio queue so a brief stall in the
-    // upstream feed (e.g. the companion remote source's download/decode
-    // thread getting starved of CPU by 4K video render in dual-source
-    // playback) doesn't drain the audio path and glitch the sink. OFF by
-    // default (stock queue limits) — a knob for the still-pending remote
-    // dual-source work. Set OPENJFX_MEDIA_AUDIO_QUEUE_TIME (seconds) to
-    // enable; limits by time rather than buffer count.
+    // skia-fx: encoded-audio queue sizing.
+    //
+    // Stock limits (bytes unlimited, 10 buffers, no time limit) give
+    // only ~200 ms of decoupling for 20 ms Opus packets. In dual-source
+    // Media(audio,video) playback the companion's feed thread
+    // (javasource → progressbuffer → demuxer) competes with 4K video
+    // decode + render for CPU; any stall longer than the queue drains
+    // the audio path and the sink underruns audibly. So for non-HLS
+    // dual-source pipelines the queue defaults to a TIME limit of 10 s
+    // with unlimited buffer count — the companion stream is tiny
+    // (≈400 KB at 320 kbps), so the cushion is effectively free.
+    // Single-source pipelines keep the stock limits.
+    //
+    // OPENJFX_MEDIA_AUDIO_QUEUE_TIME (1..60 seconds) overrides either
+    // default. NOTE: applied once, below — an earlier revision set the
+    // env override here and then clobbered it with the stock limits at
+    // the end of this function, making the knob a silent no-op.
+    if (bDualTunedDefaults)
+    {
+        g_object_set(audioqueue,
+                     "max-size-bytes", (guint)0,
+                     "max-size-buffers", (guint)0,
+                     "max-size-time", (guint64)(10 * GST_SECOND),
+                     NULL);
+    }
+    else
+    {
+        g_object_set(audioqueue,
+                     "max-size-bytes", (guint)0,
+                     "max-size-buffers", (guint)10,
+                     "max-size-time", (guint64)0,
+                     NULL);
+    }
     {
         const gchar* envAq = g_getenv("OPENJFX_MEDIA_AUDIO_QUEUE_TIME");
         if (envAq != NULL && *envAq != '\0')
@@ -1241,6 +1558,46 @@ uint32_t CGstPipelineFactory::CreateAudioBin(const char* strParserName, const ch
         tail = audioconv;
     }
 
+    // skia-fx: scaletempo — proper time-stretched (pitch-preserved)
+    // audio for setRate(rate != 1.0). It consumes the segment rate
+    // (rewriting it into applied-rate downstream) and outputs stretched
+    // samples the sink plays at 1.0x. Without it GstAudioBaseSink only
+    // scales ring-buffer write POSITIONS for non-1.0 rates — never the
+    // sample data — so 0.5x plays as normal-pitch bursts with gaps.
+    // Optional: when the element isn't compiled in (no matroska/audiofx
+    // sources fetched), playback works as before with rate != 1.0 audio
+    // degraded, not broken. OPENJFX_MEDIA_SCALETEMPO=0 disables.
+    {
+        const gchar* envSt = g_getenv("OPENJFX_MEDIA_SCALETEMPO");
+        GstElement *scaletempo =
+            (envSt != NULL && envSt[0] == '0') ? NULL
+                                               : CreateElement ("scaletempo");
+        if (scaletempo != NULL)
+        {
+            // Upstream gotcha: scaletempo only toggles basetransform
+            // passthrough when a segment CHANGES the rate, and its
+            // initial state is scale=1.0 with passthrough at the
+            // basetransform default (FALSE). On an ordinary rate-1.0
+            // stream the first segment matches the initial scale, the
+            // toggle never runs, and the element actively
+            // WSOLA-processes identity-rate audio — audible jitter.
+            // Start it in passthrough; a rate != 1.0 segment switches
+            // it to active processing (and back) via its own handler.
+            gst_base_transform_set_passthrough(GST_BASE_TRANSFORM(scaletempo), TRUE);
+
+            if (!gst_bin_add(GST_BIN(*ppAudiobin), scaletempo))
+            {
+                // Still floating (the bin never took ownership) — unref
+                // or it leaks on every failed pipeline construction.
+                gst_object_unref(scaletempo);
+                return ERROR_GSTREAMER_BIN_ADD_ELEMENT;
+            }
+            if (!gst_element_link(tail, scaletempo))
+                return ERROR_GSTREAMER_ELEMENT_LINK_AUDIO_BIN;
+            tail = scaletempo;
+        }
+    }
+
     GstElement *audioequalizer = CreateElement ("equalizer-nbands");
     GstElement *audiospectrum = CreateElement ("spectrum");
     if (NULL == audioequalizer || NULL == audiospectrum)
@@ -1250,28 +1607,40 @@ uint32_t CGstPipelineFactory::CreateAudioBin(const char* strParserName, const ch
     if (NULL == audiosink)
         return ERROR_GSTREAMER_AUDIO_SINK_CREATE;
 
-    // skia-fx: OPT-IN deepening of the audio sink's device ring buffer.
-    // A larger ring buffer holds more decoded samples so the audio device
-    // doesn't underrun when the audio sink thread is briefly starved of
-    // CPU (4K video decode + Skia render in dual-source remote playback).
-    // It is OFF by default because a large buffer-time adds A/V latency to
-    // ALL playback (single-source too); it's a knob for the still-pending
-    // remote dual-source audio work. Set OPENJFX_MEDIA_AUDIO_BUFFER_MS
-    // (100..10000 ms) to enable. directsoundsink derives from
-    // GstAudioBaseSink ("buffer-time"/"latency-time", microseconds).
+    // skia-fx: audio sink device ring-buffer sizing.
+    //
+    // The ring buffer is the last cushion between the decode chain and
+    // the audio device: when the decode thread is starved of CPU
+    // (4K video decode + Skia render in dual-source remote playback)
+    // for longer than the ring's slack, the device underruns audibly —
+    // and because this sink provides the pipeline's master clock, the
+    // glitch also perturbs A/V sync. For non-HLS dual-source pipelines
+    // default to a 500 ms ring (stock GstAudioBaseSink default is
+    // 200 ms); lip-sync is unaffected (sync is clock-based, the sink
+    // simply writes further ahead). Single-source keeps the stock
+    // default so ordinary playback latency is unchanged.
+    //
+    // OPENJFX_MEDIA_AUDIO_BUFFER_MS (100..10000 ms) overrides either
+    // default. directsoundsink derives from GstAudioBaseSink
+    // ("buffer-time"/"latency-time", microseconds).
     {
+        gint64 bufMs = bDualTunedDefaults ? 500 : 0;
+
         const gchar* envBuf = g_getenv("OPENJFX_MEDIA_AUDIO_BUFFER_MS");
         if (envBuf != NULL && *envBuf != '\0')
         {
-            gint64 bufMs = g_ascii_strtoll(envBuf, NULL, 10);
-            if (bufMs >= 100 && bufMs <= 10000)
-            {
-                GObjectClass* sinkCls = G_OBJECT_GET_CLASS(audiosink);
-                if (g_object_class_find_property(sinkCls, "buffer-time") != NULL)
-                    g_object_set(audiosink, "buffer-time", (gint64)(bufMs * 1000), NULL);
-                if (g_object_class_find_property(sinkCls, "latency-time") != NULL)
-                    g_object_set(audiosink, "latency-time", (gint64)50000, NULL);
-            }
+            gint64 v = g_ascii_strtoll(envBuf, NULL, 10);
+            if (v >= 100 && v <= 10000)
+                bufMs = v;
+        }
+
+        if (bufMs > 0)
+        {
+            GObjectClass* sinkCls = G_OBJECT_GET_CLASS(audiosink);
+            if (g_object_class_find_property(sinkCls, "buffer-time") != NULL)
+                g_object_set(audiosink, "buffer-time", (gint64)(bufMs * 1000), NULL);
+            if (g_object_class_find_property(sinkCls, "latency-time") != NULL)
+                g_object_set(audiosink, "latency-time", (gint64)50000, NULL);
         }
     }
 
@@ -1340,8 +1709,10 @@ uint32_t CGstPipelineFactory::CreateAudioBin(const char* strParserName, const ch
         *pFlags |= AUDIO_DECODER_HAS_SOURCE_PROBE | AUDIO_DECODER_HAS_SINK_PROBE;
     }
 
-    // Switch off limiting of the audioqueue for bytes and buffers.
-    g_object_set(audioqueue, "max-size-bytes", (guint)0, "max-size-buffers", (guint)10, "max-size-time", (guint64)0, NULL);
+    // skia-fx: queue limits are configured right after the queue is
+    // created (top of this function) — dual-source-aware defaults plus
+    // the OPENJFX_MEDIA_AUDIO_QUEUE_TIME override. The unconditional
+    // reset that used to live here clobbered the override.
 
     return ERROR_NONE;
 }

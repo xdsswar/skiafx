@@ -58,12 +58,20 @@ private:
 
     uint32_t    CreateMP4Pipeline(GstElement* videosink, CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
     uint32_t    CreateMp3AudioPipeline(CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
+    // skia-fx: raw ADTS AAC stream (audio/aac). aacparse frames the
+    // stream; the platform audio decoder decodes it.
+    uint32_t    CreateAacAudioPipeline(CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
     uint32_t    CreateWavPcmAudioPipeline(CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline **ppPipeline);
     uint32_t    CreateAiffPcmAudioPipeline(CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline **ppPipeline);
     uint32_t    CreateHLSPipeline(GstElement* pVideoSink, CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
     // skia-fx: matroska/webm container. matroskademux + dynamic
     // ffmpegwrapper-or-mfwrapper decoder per stream.
     uint32_t    CreateMatroskaPipeline(GstElement* pVideoSink, CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
+    // skia-fx: generic AV container with a named demuxer (avidemux /
+    // flvdemux) — the matroska shape with the demuxer parameterized.
+    uint32_t    CreateDemuxAVPipeline(const char* demuxName, GstElement* pVideoSink, CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
+    // skia-fx: raw .flac — flacparse + ffmpegwrapper decode.
+    uint32_t    CreateFlacAudioPipeline(CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
 
     uint32_t    CreateSourceElement(CLocator *locator, CStreamCallbacks *callbacks, int streamMimeType,
                                     GstElement** ppElement, GstElement** ppBuffer, CPipelineOptions *pOptions);
@@ -78,7 +86,10 @@ private:
     uint32_t    CreateAVPipeline(bool bConvertFormat, GstElement* pVideoSink, CPipelineOptions* pOptions, GstElementContainer* pElements, CPipeline** ppPipeline);
 
 
+    // skia-fx: pOptions added so the bin can apply dual-source-aware
+    // queue / sink buffering defaults (may be NULL → stock behaviour).
     uint32_t    CreateAudioBin(const char* strParserName, const char* strDecoderName, bool bConvertFormat,
+                               CPipelineOptions* pOptions,
                                GstElementContainer* elements, int* pFlags, GstElement** pAudiobin);
     uint32_t    CreateVideoBin(const char* strDecoderName, GstElement* pVideoSink,
                                GstElementContainer* elements, GstElement** ppVideobin);

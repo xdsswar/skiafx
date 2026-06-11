@@ -103,6 +103,17 @@ add_library(fxplugins SHARED
     # mfwrapper / dshowwrapper.
     $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:${PLUGINS_BASE}/ffmpegwrapper/ffmpeg_loader.cpp>
     $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:${PLUGINS_BASE}/ffmpegwrapper/ffmpegwrapper.cpp>
+    # MediaMixer remux engine (openjfx_ffmpeg_remux) — stream-copy
+    # mux of separate audio + video files into MP4 via the loader's
+    # optional avformat group. jfxmedia's MediaMixerBridge resolves
+    # it cross-DLL.
+    $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:${PLUGINS_BASE}/ffmpegwrapper/ffmpeg_remux.cpp>
+    # ffmpegdemux — libavformat-backed catch-all demuxer. Same ffmpeg gate
+    # as the wrapper above; plays any container ffmpeg can open when the
+    # runtime DLLs are present (routed by GstPipelineFactory for content
+    # types with no dedicated gst demuxer).
+    $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:${PLUGINS_BASE}/ffmpegdemux/ffmpeg_caps.cpp>
+    $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:${PLUGINS_BASE}/ffmpegdemux/ffmpegdemux.cpp>
 )
 set_target_properties(fxplugins PROPERTIES
     OUTPUT_NAME fxplugins
@@ -130,6 +141,9 @@ target_compile_definitions(fxplugins PRIVATE
     # into this DLL. fxplugins.c uses it to gate the registration
     # call. Mirrors the source-list generator expression above.
     $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:OPENJFX_HAVE_FFMPEGWRAPPER>
+    # Marks that ffmpegdemux is compiled in; fxplugins.c gates its
+    # registration call on this (built together with the wrapper).
+    $<$<BOOL:${OPENJFX_FFMPEG_INCLUDE_DIR}>:OPENJFX_HAVE_FFMPEGDEMUX>
 )
 target_compile_options(fxplugins PRIVATE
     ${FXP_COMMON_OPTIONS}
@@ -145,6 +159,7 @@ target_include_directories(fxplugins PRIVATE
     ${PLUGINS_BASE}/progressbuffer/win32
     ${PLUGINS_BASE}/mfwrapper
     ${PLUGINS_BASE}/ffmpegwrapper
+    ${PLUGINS_BASE}/ffmpegdemux
     # GLib + GStreamer + BaseClasses headers.
     ${GLIB_BASE}
     ${GLIB_BASE}/glib

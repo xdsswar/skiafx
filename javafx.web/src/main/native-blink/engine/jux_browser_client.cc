@@ -8,6 +8,7 @@
 #include <string>
 #include <utility>
 
+#include "base/command_line.h"
 #include "components/embedder_support/user_agent_utils.h"
 #include "jux/jux_browser_main_parts.h"
 #include "jux/jux_login_delegate.h"
@@ -76,6 +77,24 @@ std::string JuxBrowserClient::GetAcceptLangs(
 
 std::string JuxBrowserClient::GetDefaultDownloadName() {
   return "download";
+}
+
+void JuxBrowserClient::AppendExtraCommandLineSwitches(
+    base::CommandLine* command_line,
+    int child_process_id) {
+  // The GPU process decides DirectComposition support from ITS OWN command
+  // line (gl::init); content's default child-process forwarding list does
+  // not include this switch, so without this hook a browser-side
+  // --disable-direct-composition silently does nothing.
+  const base::CommandLine& browser_cmd = *base::CommandLine::ForCurrentProcess();
+  static const char* const kForwarded[] = {
+      "disable-direct-composition",
+  };
+  for (const char* sw : kForwarded) {
+    if (browser_cmd.HasSwitch(sw) && !command_line->HasSwitch(sw)) {
+      command_line->AppendSwitch(sw);
+    }
+  }
 }
 
 #if BUILDFLAG(ENABLE_PRINT_PREVIEW)

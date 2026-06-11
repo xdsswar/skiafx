@@ -57,6 +57,10 @@ gboolean       cache_set_write_position(Cache* cache, gint64 position);
 // Sets a new read position
 gboolean       cache_set_read_position(Cache* cache, gint64 position);
 
+// Returns the current read position (skia-fx: used to save/restore around
+// out-of-band cache reads such as sidx parsing).
+gint64         cache_get_read_position(Cache* cache);
+
 // Returns true if the cache has enough data for fluent reading, but we can't expect more than total.
 gboolean       cache_has_enough_data(Cache* cache);
 

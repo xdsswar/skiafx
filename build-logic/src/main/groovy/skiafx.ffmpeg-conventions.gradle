@@ -216,9 +216,13 @@ def fetchRuntimeTask = tasks.register('fetchFfmpegRuntime') {
     description = "Download prebuilt ffmpeg ${ffmpegVersion} shared DLLs " +
             "for ${hostPlatform}-${hostArch}"
 
+    inputs.property('runtimeFlavor', "n${ffmpegVersion}")
     outputs.dir(runtimeDir)
     outputs.upToDateWhen {
-        new File(runtimeDir.get().asFile, 'avcodec-61.dll').exists()
+        def dir = runtimeDir.get().asFile
+        new File(dir, 'avcodec-61.dll').exists() &&
+        new File(dir, 'source.txt').exists() &&
+        new File(dir, 'source.txt').text.contains("n${ffmpegVersion}")
     }
 
     doLast {
@@ -234,21 +238,28 @@ def fetchRuntimeTask = tasks.register('fetchFfmpegRuntime') {
         outDir.mkdirs()
         dlDir.mkdirs()
 
-        // BtbN's auto-built "latest" win64 LGPL shared build. The URL
-        // is stable across rebuilds (BtbN re-uploads the `latest` tag
-        // when master advances). The DLL major versions match our
-        // pinned ffmpeg ${ffmpegVersion} headers (avcodec-61, avutil-59,
-        // …) because both track the same upstream branch.
+        // BtbN's auto-built RELEASE-BRANCH win64 LGPL shared build,
+        // pinned to the same major.minor as our compiled headers
+        // (ffmpeg ${ffmpegVersion}). The previous fetch used the
+        // `master-latest` asset — a moving target whose internal
+        // struct layouts drifted from the 7.1 headers and silently
+        // corrupted deep AVFrame/AVCodecContext field reads (the
+        // dual-source "speedy wavy audio": ch_layout read as 0 →
+        // mono packing → half-size buffers). Release-branch builds
+        // are ABI-consistent with release headers.
         //
-        // We DON'T verify a SHA-256 here — the upstream zip is
-        // rebuilt on every commit so its hash drifts. If supply-chain
-        // integrity is a concern, override this fetch with a
-        // pre-staged ffmpegDir Gradle property pointing at a
+        // We DON'T verify a SHA-256 here — the branch asset is
+        // rebuilt as the release branch advances, so its hash drifts.
+        // If supply-chain integrity is a concern, override this fetch
+        // with a pre-staged ffmpegDir Gradle property pointing at a
         // user-vendored install.
         def candidates = [
-            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-lgpl-shared.zip",
-            // Fallback for known-stable gyan.dev release naming.
+            // Exact-release build matching the pinned headers —
+            // deterministic, preferred.
             "https://github.com/GyanD/codexffmpeg/releases/download/${ffmpegVersion}/ffmpeg-${ffmpegVersion}-full_build-shared.7z",
+            // Release-branch build as fallback (asset only exists while
+            // the branch is BtbN's current release).
+            "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n${ffmpegVersion}-latest-win64-lgpl-shared.zip",
         ]
         def zipFile = null
         Throwable lastErr = null
@@ -306,10 +317,17 @@ def fetchRuntimeTask = tasks.register('fetchFfmpegRuntime') {
                 "[ffmpeg.runtime] no bin/ dir found in ${zipFile.name}")
         }
 
+        // Clear stale DLLs first — leftovers from a different ffmpeg
+        // branch (e.g. avcodec-62 from the old master-latest fetch)
+        // would coexist with the pinned ones and win the loader probe.
+        outDir.eachFileMatch(~/.*\.dll$/) { old -> old.delete() }
         binDir.eachFileMatch(~/.*\.dll$/) { dll ->
             new File(outDir, dll.name).bytes = dll.bytes
         }
         tmp.deleteDir()
+        // Flavor marker — lets up-to-date checks detect a stale extract
+        // from a different ffmpeg branch (e.g. the old master-latest).
+        new File(outDir, 'source.txt').text = "n${ffmpegVersion} <- ${zipFile.name}"
         def dllCount = outDir.listFiles({ f -> f.name.endsWith('.dll') } as FileFilter)?.length ?: 0
         logger.lifecycle "[ffmpeg.runtime] ${dllCount} DLLs ready: ${outDir}"
     }

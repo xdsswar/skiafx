@@ -57,6 +57,12 @@ tasks.register('collectIntoSdk', Copy) {
     }
 }
 
+// Native-bearing modules pack their binaries INSIDE the module jar (one
+// artifact per module, platform triple in the name — see
+// skiafx.native-conventions / skiafx.blink-native-conventions); the jar copy
+// above therefore already carries the natives. The loose lib/<triple>/ files
+// remain as the java.library.path fallback for module-path consumers.
+
 // Make `assemble` quietly populate sdk/ too, so a developer who runs
 // `./gradlew :javafx.media:assemble` for a single module sees sdk/
 // stay current. Full `./gradlew buildAll` at the root collects the lot.

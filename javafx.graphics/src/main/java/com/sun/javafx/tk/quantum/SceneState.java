@@ -29,6 +29,7 @@ import com.sun.glass.ui.Application;
 import com.sun.javafx.sg.prism.NGCamera;
 import com.sun.prism.PixelSource;
 import com.sun.prism.PresentableState;
+import com.sun.prism.impl.RectQueuedPixelSource;
 import com.sun.prism.paint.Color;
 import com.sun.prism.paint.Paint;
 
@@ -123,6 +124,19 @@ class SceneState extends PresentableState {
             if (isValid()) {
                 SceneState.super.uploadPixels(source);
             } else {
+                source.skipLatestPixels();
+            }
+       });
+    }
+
+    @Override
+    public void uploadPixelsRect(RectQueuedPixelSource source) {
+        Application.invokeLater(() -> {
+            if (isValid()) {
+                SceneState.super.uploadPixelsRect(source);
+            } else {
+                // The skipped frame's dirty rect stays pending inside the
+                // source and rides along with the next upload.
                 source.skipLatestPixels();
             }
        });

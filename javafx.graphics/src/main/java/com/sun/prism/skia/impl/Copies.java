@@ -47,6 +47,11 @@ public final class Copies {
         SK_PICTURE_RECORD,
         /** MemorySegment.copy invocation. */
         MEMORY_SEGMENT_COPY,
+        /** Present-path pixel copy on the READBACK tier (surface readback
+         *  into the Glass {@code Pixels} buffer). Kept separate from
+         *  {@link #SNAPSHOT_READBACK} so app-driven snapshots don't hide
+         *  the per-frame present cost (and vice versa). */
+        PRESENT_COPY,
     }
 
     private static final EnumMap<Category, LongAdder> COUNTERS;

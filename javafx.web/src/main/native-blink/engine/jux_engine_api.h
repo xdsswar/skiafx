@@ -524,6 +524,14 @@ JUX_EXPORT void JuxSetHitSpotNodes(JuxWebContentsHandle handle,
 // and on_dom_text callbacks for each node, followed by on_dom_tree_ready.
 JUX_EXPORT void JuxRequestDomTree(JuxWebContentsHandle handle);
 
+// Establishes the DOM handler/client mojo pipe for `handle` WITHOUT
+// requesting the DOM tree (nothing is surfaced to Java). The renderer-side
+// document listeners (the capture-phase mousedown that powers the
+// engine-drawn <select> dropdown, tooltips) only arm once this pipe is
+// bound, so detached off-screen pages — the print preview — must call this
+// where attached pages bind via JuxRequestDomTree. UI thread only.
+JUX_EXPORT void JuxBindDomPipe(JuxWebContentsHandle handle);
+
 // =========================================================================
 // Callbacks
 //

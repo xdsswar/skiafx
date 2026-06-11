@@ -26,6 +26,7 @@
 #include "JavaInputStreamCallbacks.h"
 #include "JniUtils.h"
 #include <Common/VSMemory.h>
+#include <Common/LeakCounter.h>
 #if TARGET_OS_LINUX
 #include <stdlib.h>
 #include <string.h>
@@ -43,10 +44,14 @@ jmethodID CJavaInputStreamCallbacks::m_PropertyMID = 0;
 
 CJavaInputStreamCallbacks::CJavaInputStreamCallbacks()
     : m_ConnectionHolder(0)
-{}
+{
+    SKIAFX_LEAK_CREATED("CJavaInputStreamCallbacks");
+}
 
 CJavaInputStreamCallbacks::~CJavaInputStreamCallbacks()
-{}
+{
+    SKIAFX_LEAK_DESTROYED("CJavaInputStreamCallbacks");
+}
 
 bool CJavaInputStreamCallbacks::Init(JNIEnv *env, jobject jConnectionHolder)
 {

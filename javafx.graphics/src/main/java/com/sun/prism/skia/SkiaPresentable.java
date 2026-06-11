@@ -6,7 +6,7 @@ import com.sun.javafx.geom.Rectangle;
 import com.sun.prism.Presentable;
 import com.sun.prism.PresentableState;
 import com.sun.prism.Texture.WrapMode;
-import com.sun.prism.impl.QueuedPixelSource;
+import com.sun.prism.impl.RectQueuedPixelSource;
 import com.sun.prism.skia.impl.Copies;
 import com.sun.prism.skia.impl.Copies.Category;
 import com.sun.prism.skia.impl.NativeBridge;
@@ -20,6 +20,8 @@ import java.lang.System.Logger.Level;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.IntBuffer;
+import java.util.Arrays;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Skia-backed {@link Presentable} with a four-tier surface allocation:
@@ -83,8 +85,45 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
     // previous pulse's values; seeded to the built state in the constructor.
     private float lastSeenScaleX, lastSeenScaleY;
     private int   lastSeenRenderW, lastSeenRenderH;
-    private final QueuedPixelSource pixelSource = new QueuedPixelSource(false);
+    // Direct IntBuffers on the READBACK tier: the native readback writes
+    // straight into the pooled Pixels buffer (no scratch-segment hop), and
+    // Glass's Windows upload uses GetDirectBufferAddress instead of pinning
+    // a heap array across the GDI blit. Other tiers never touch the pool.
+    private final RectQueuedPixelSource pixelSource;
     private Pixels currentPixels;
+    // Identity cache of MemorySegment views over the pooled direct
+    // IntBuffers (the queue keeps at most 3 alive). Render-thread only;
+    // avoids a wrapper allocation per presented frame.
+    private final IntBuffer[]     segKeys = new IntBuffer[4];
+    private final MemorySegment[] segVals = new MemorySegment[4];
+
+    // ---- Partial present (READBACK tier) --------------------------------
+    // The painter hands prepare() the device-px union of what it painted;
+    // we read back only that rect and ask Glass to blit only that rect.
+    // Two staleness domains are tracked:
+    //  - BUFFER: a pooled Pixels reused after K frames holds frame N-K
+    //    content, so the readback must also cover the dirty rects of the
+    //    frames it missed (the ring below remembers the last few).
+    //  - WINDOW: frames the queue dropped were never shown; the
+    //    RectQueuedPixelSource accumulates their rects into the next blit.
+    // -Dskia.partial.present=false is the kill switch (full copy + blit).
+    private static final boolean PARTIAL_PRESENT =
+        !"false".equals(System.getProperty("skia.partial.present"))
+        && NativeBridge.hasReadPixelsArgbStride();
+    private static final int DIRTY_RING = 8;
+    private final Rectangle[] ringRect  = new Rectangle[DIRTY_RING];
+    private final long[]      ringFrame = new long[DIRTY_RING];
+    private long frameSeq;
+    private final Pixels[] slotPixels = new Pixels[4];
+    private final long[]   slotFrame  = new long[4];
+    private final Rectangle copyRect = new Rectangle();
+    private final Rectangle blitRect = new Rectangle();
+    private boolean blitPartial;
+    {
+        for (int i = 0; i < DIRTY_RING; i++) {
+            ringRect[i] = new Rectangle();
+        }
+    }
 
     /** Selected by {@link #allocate}; drives {@code prepare}/{@code present}. */
     private enum PresentMode {
@@ -110,6 +149,8 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
               /*msaa*/ false);
         this.pState = pState;
         this.presentMode = alloc.mode();
+        this.pixelSource =
+            new RectQueuedPixelSource(presentMode == PresentMode.READBACK);
         this.builtRenderScaleX = pState.getRenderScaleX();
         this.builtRenderScaleY = pState.getRenderScaleY();
         this.lastSeenScaleX = builtRenderScaleX;
@@ -153,6 +194,33 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
     /** Surface-allocation result. */
     private record AllocResult(long handle, PresentMode mode) {}
 
+    // ---- GL tier-demotion latch ------------------------------------------
+    // A persistently failing GL direct-present (broken context, driver
+    // wedge) would otherwise dispose + recreate the presentable every
+    // pulse forever, because allocate() retries the GL tier each time.
+    // After N consecutive GL present failures, permanently skip tier 1:
+    // the chain degrades to GPU-offscreen readback (and, if the shared
+    // GrDirectContext itself is dead, on to software raster). Process-
+    // wide by design — all GL windows share one HGLRC/GrDirectContext,
+    // so if it is broken for one window it is broken for all.
+    private static final int GL_TIER_MAX_FAILURES = 5;
+    private static final AtomicInteger GL_TIER_FAILURES = new AtomicInteger();
+    private static volatile boolean GL_TIER_DISABLED;
+
+    private static void noteGlPresentResult(boolean ok) {
+        if (ok) {
+            GL_TIER_FAILURES.set(0);
+            return;
+        }
+        if (!GL_TIER_DISABLED
+                && GL_TIER_FAILURES.incrementAndGet() >= GL_TIER_MAX_FAILURES) {
+            GL_TIER_DISABLED = true;
+            LOG.log(Level.WARNING,
+                "GL direct-present disabled after " + GL_TIER_MAX_FAILURES
+                + " consecutive failures; degrading to the readback tier");
+        }
+    }
+
     private static AllocResult allocate(PresentableState pState) {
         int w = pState.getRenderWidth();
         int h = pState.getRenderHeight();
@@ -170,7 +238,7 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
             // failed earlier) or swap-chain creation failed.
         }
         // Tier 1: GL window-bound GPU (direct-present via SwapBuffers).
-        if (SkiaGpu.isEnabled() && hwnd != 0L) {
+        if (SkiaGpu.isEnabled() && hwnd != 0L && !GL_TIER_DISABLED) {
             MemorySegment seg = NativeBridge.surfaceCreateWindowGpu(
                 MemorySegment.ofAddress(hwnd), w, h);
             if (seg != null && !seg.equals(MemorySegment.NULL)) {
@@ -186,14 +254,24 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
                 return new AllocResult(seg.address(), PresentMode.READBACK);
             }
         }
-        // Tier 3: software raster.
-        MemorySegment seg = NativeBridge.surfaceCreateRaster(w, h);
+        // Tier 3: software raster. -Dskia.raster.bgra=true swaps in a BGRA
+        // surface so the present readback is a straight row copy instead of
+        // a channel swizzle — measured SLOWER overall on this Skia build
+        // (raster into BGRA costs ~1.4 ms/frame at 1080p vs RGBA, more than
+        // the SIMD swizzle it saves), so RGBA stays the default. The flag
+        // exists for Skia builds whose native order is BGRA (SK_R32_SHIFT).
+        MemorySegment seg = RASTER_BGRA
+            ? NativeBridge.surfaceCreateRasterBgra(w, h)
+            : NativeBridge.surfaceCreateRaster(w, h);
         if (seg == null || seg.equals(MemorySegment.NULL)) {
             throw new IllegalStateException(
                 "Skia surface allocation failed (" + w + "x" + h + ")");
         }
         return new AllocResult(seg.address(), PresentMode.READBACK);
     }
+
+    private static final boolean RASTER_BGRA =
+        Boolean.getBoolean("skia.raster.bgra");
 
     @Override
     public boolean lockResources(PresentableState newState) {
@@ -339,37 +417,152 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         currentPixels = pixelSource.getUnusedPixels(
             w, h, pState.getOutputScaleX(), pState.getOutputScaleY());
         IntBuffer dst = (IntBuffer) currentPixels.getPixels();
-        if (!dst.hasArray()) {
-            // QueuedPixelSource is constructed with useDirectBuffers=false,
-            // so this should always have an array. Defensive check.
-            return false;
+        long bytes = (long) w * h * 4;
+
+        // Read directly into INT_ARGB_PRE layout — Skia handles any
+        // channel swap in C++ during the native readPixels call (a
+        // straight row copy when the surface is the BGRA raster
+        // variant). The pool hands out direct IntBuffers, so the native
+        // readback writes straight into the Pixels buffer Glass will
+        // upload — no intermediate scratch segment, no second copy.
+        MemorySegment dstSeg;
+        if (dst.isDirect()) {
+            dstSeg = segmentOf(dst);
+            if (dstSeg.byteSize() < bytes) return false; // defensive
+        } else {
+            // Heap-buffer fallback (older pool configuration): readback
+            // into the pooled per-thread scratch, then one copy into the
+            // heap array.
+            if (!dst.hasArray()) return false;
+            dstSeg = null;
         }
 
-        // Read directly into INT_ARGB_PRE layout — Skia does the
-        // channel swap in C++ during the native readPixels call, so
-        // Java doesn't need a second pass. One GPU→CPU readback into
-        // the POOLED per-thread scratch buffer (shared with
-        // SkiaRTTexture.readPixels — grown monotonically, never freed
-        // per frame), then a single MemorySegment.copy into the
-        // IntBuffer's heap array. prepare() runs on the render thread,
-        // so it gets that thread's pooled buffer; this avoids the
-        // ~4 MB-at-1080p confined-arena malloc/free every presented
-        // frame on the READBACK tier (BUG-5).
-        long bytes = (long) w * h * 4;
+        if (dstSeg != null) {
+            frameSeq++;
+            blitPartial = false;
+
+            // Clamp the painter's dirty union to the surface.
+            boolean partial = PARTIAL_PRESENT && dirtyregion != null;
+            int cx = 0, cy = 0, cw = w, ch = h;
+            if (partial) {
+                cx = Math.max(0, dirtyregion.x);
+                cy = Math.max(0, dirtyregion.y);
+                int x1 = Math.min(w, dirtyregion.x + dirtyregion.width);
+                int y1 = Math.min(h, dirtyregion.y + dirtyregion.height);
+                cw = x1 - cx;
+                ch = y1 - cy;
+                if (cw <= 0 || ch <= 0) partial = false;
+            }
+
+            // Remember this frame's dirty rect (full when not partial) for
+            // buffer-staleness reconstruction on later frames.
+            int ri = (int) (frameSeq % DIRTY_RING);
+            ringFrame[ri] = frameSeq;
+            if (partial) {
+                ringRect[ri].setBounds(cx, cy, cw, ch);
+            } else {
+                ringRect[ri].setBounds(0, 0, w, h);
+            }
+
+            // The copy rect must also cover the dirty rects of every frame
+            // this pooled buffer missed since it was last filled.
+            int slot = slotFor(currentPixels);
+            long lastFilled = slotFrame[slot];
+            boolean copyFull = !partial || lastFilled == 0
+                || frameSeq - lastFilled > DIRTY_RING;
+            if (!copyFull) {
+                copyRect.setBounds(cx, cy, cw, ch);
+                for (long f = lastFilled + 1; f < frameSeq; f++) {
+                    int idx = (int) (f % DIRTY_RING);
+                    if (ringFrame[idx] != f) { copyFull = true; break; }
+                    copyRect.add(ringRect[idx]);
+                }
+            }
+            slotFrame[slot] = frameSeq;
+
+            int rc;
+            if (copyFull) {
+                rc = NativeBridge.surfaceReadPixelsArgb(
+                    MemorySegment.ofAddress(getNativeHandle()),
+                    dstSeg, 0, 0, w, h);
+            } else {
+                int rx = Math.max(0, copyRect.x);
+                int ry = Math.max(0, copyRect.y);
+                int rx1 = Math.min(w, copyRect.x + copyRect.width);
+                int ry1 = Math.min(h, copyRect.y + copyRect.height);
+                rc = NativeBridge.surfaceReadPixelsArgbStride(
+                    MemorySegment.ofAddress(getNativeHandle()),
+                    dstSeg, w * 4, rx, ry, rx1 - rx, ry1 - ry);
+            }
+            if (rc != 0) return false;
+            Copies.add(Category.PRESENT_COPY, 1);
+            // The OS blit only needs THIS frame's changes; dropped-frame
+            // accumulation happens inside RectQueuedPixelSource.
+            if (partial) {
+                blitRect.setBounds(cx, cy, cw, ch);
+                blitPartial = true;
+            }
+            return true;
+        }
+
         MemorySegment src = ensureReadBuffer(bytes);
         int rc = NativeBridge.surfaceReadPixelsArgb(
             MemorySegment.ofAddress(getNativeHandle()),
             src, 0, 0, w, h);
         if (rc != 0) return false;
-        Copies.add(Category.SNAPSHOT_READBACK, 1);
+        Copies.add(Category.PRESENT_COPY, 1);
 
         int[] outArr = dst.array();
         int outOff = dst.arrayOffset() + dst.position();
-        MemorySegment dstSeg = MemorySegment.ofArray(outArr)
+        MemorySegment heapSeg = MemorySegment.ofArray(outArr)
             .asSlice((long) outOff * 4, bytes);
-        MemorySegment.copy(src, 0L, dstSeg, 0L, bytes);
-        Copies.add(Category.MEMORY_SEGMENT_COPY, 1);
+        MemorySegment.copy(src, 0L, heapSeg, 0L, bytes);
+        Copies.add(Category.PRESENT_COPY, 1);
         return true;
+    }
+
+    /**
+     * Slot index tracking when each pooled Pixels was last filled.
+     * Identity match; unseen Pixels evict the least-recently-filled slot
+     * and report frame 0 (= unknown content, forces a full copy).
+     */
+    private int slotFor(Pixels p) {
+        int free = -1, lru = 0;
+        long lruFrame = Long.MAX_VALUE;
+        for (int i = 0; i < slotPixels.length; i++) {
+            if (slotPixels[i] == p) return i;
+            if (slotPixels[i] == null && free < 0) free = i;
+            if (slotFrame[i] < lruFrame) { lruFrame = slotFrame[i]; lru = i; }
+        }
+        int s = free >= 0 ? free : lru;
+        slotPixels[s] = p;
+        slotFrame[s] = 0;
+        return s;
+    }
+
+    /**
+     * MemorySegment view of a pooled direct IntBuffer, cached by buffer
+     * identity (the queue keeps at most 3 buffers alive). Render-thread
+     * only. A resize churns the pool's buffers; the cache restarts when
+     * it fills with stale keys.
+     */
+    private MemorySegment segmentOf(IntBuffer buf) {
+        for (int i = 0; i < segKeys.length; i++) {
+            if (segKeys[i] == buf) return segVals[i];
+        }
+        MemorySegment seg = MemorySegment.ofBuffer(buf);
+        for (int i = 0; i < segKeys.length; i++) {
+            if (segKeys[i] == null) {
+                segKeys[i] = buf;
+                segVals[i] = seg;
+                return seg;
+            }
+        }
+        Arrays.fill(segKeys, null);
+        Arrays.fill(segVals, null);
+        segKeys[0] = buf;
+        segVals[0] = seg;
+        return seg;
     }
 
     // ---- FPS counter (logged every second, gated by -Dskia.verbose) -----
@@ -424,6 +617,7 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
                 // grCtx->flushAndSubmit + wglSwapBuffers (vsync via wglSwapIntervalEXT).
                 int rc = NativeBridge.surfacePresentWindow(
                     MemorySegment.ofAddress(getNativeHandle()), vsync);
+                noteGlPresentResult(rc == 0);
                 if (rc != 0) return false;
                 countFrame();
                 // Drive the 3D deferred-target-free clock off real presents (no-op
@@ -433,10 +627,14 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
             }
             case READBACK -> {
                 if (currentPixels == null) return false;
-                pixelSource.enqueuePixels(currentPixels);
-                pState.uploadPixels(pixelSource);
+                // Enqueue with this frame's dirty rect (null = whole frame);
+                // the source unions in any dropped frames' rects so the OS
+                // blit always covers everything since the last shown frame.
+                pixelSource.enqueuePixels(currentPixels,
+                    blitPartial ? blitRect : null);
+                pState.uploadPixelsRect(pixelSource);
                 // One CPU → OS-window pixel upload via Glass per frame.
-                Copies.add(Category.TEXTURE_UPLOAD, 1);
+                Copies.add(Category.PRESENT_COPY, 1);
                 currentPixels = null;
                 countFrame();
                 // Drive the 3D deferred-target-free clock off real presents (no-op

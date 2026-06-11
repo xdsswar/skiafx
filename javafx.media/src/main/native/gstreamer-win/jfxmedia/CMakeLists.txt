@@ -77,6 +77,9 @@ add_library(jfxmedia SHARED
     # Phase-4 ffmpeg config bridge — Java sets a library dir which
     # we forward to the loader living in fxplugins.dll via GetProcAddress
     ${JFXM_BASE}/jni/MediaFfmpegConfig.cpp
+    # MediaMixer JNI bridge — resolves openjfx_ffmpeg_remux from
+    # fxplugins.dll (same cross-DLL pattern as MediaFfmpegConfig)
+    ${JFXM_BASE}/jni/MediaMixerBridge.cpp
     # Utilities (cross-platform + Windows-specific)
     ${JFXM_BASE}/Utils/ColorConverter.c
     ${JFXM_BASE}/Utils/MediaWarningDispatcher.cpp

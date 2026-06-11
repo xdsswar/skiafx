@@ -103,18 +103,40 @@ final class FrameSurface {
     boolean publish(int bufIndex, int width, int height, int stride,
                     double logicalW, double logicalH) {
         if (bufIndex < 0 || bufIndex >= MemoryLayout.FRAME_BUFFER_COUNT) {
+            warnRejected("bad slot index", bufIndex, width, height, stride);
             return false;
         }
         if (width <= 0 || height <= 0 || stride < (long) width * 4) {
+            warnRejected("invalid geometry", bufIndex, width, height, stride);
             return false;
         }
         long need = (long) stride * height;
         if (need <= 0 || need > slotBytes) {
+            warnRejected("exceeds slot capacity", bufIndex, width, height, stride);
             return false;
         }
         long address = baseAddress + (long) bufIndex * slotBytes;
         latest = new Frame(address, width, height, stride, logicalW, logicalH);
         return true;
+    }
+
+    // A rejected frame is silently invisible to the user (the node keeps
+    // showing the previous frame), which made the stale-DPI-override freeze
+    // hard to diagnose. Surface the first rejection once — never per-frame.
+    private static volatile boolean warnedRejected;
+
+    private void warnRejected(String reason, int bufIndex,
+                              int width, int height, int stride) {
+        if (warnedRejected) {
+            return;
+        }
+        warnedRejected = true;
+        System.getLogger(FrameSurface.class.getName()).log(
+            System.Logger.Level.WARNING,
+            "WebView frame rejected (" + reason + "): slot=" + bufIndex
+            + " " + width + "x" + height + " stride=" + stride
+            + " slotBytes=" + slotBytes
+            + " (reported once; frames may be stale until recovery)");
     }
 
     /** The most recently published frame, or {@code null} if none yet. */

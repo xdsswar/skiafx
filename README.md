@@ -85,7 +85,10 @@ foresight of the foundation they built. **Thank you.**
 | **Bounded, observable memory** — GPU budgets, eviction policies, `Cleaner`-driven native lifecycles | Working |
 | **Copy elimination** — architecturally zero-copy hot paths, per-frame off-heap arenas, no per-frame `new` | Ongoing |
 | **Brand-new WebView** — a from-scratch **Chromium/Blink** engine, off-screen-rendered straight into the scene | Heavy WIP |
-| **Modern media** — ffmpeg-backed decode, CPU/GPU/AUTO selection, HDR tone-mapping, zero-copy D3D11 video | Ongoing |
+| **Modern media engine** — hardware decode (D3D11VA) for H.264/H.265/VP9/AV1, CPU/GPU/AUTO selection, HDR tone-mapping, zero-copy D3D11 video into the scene | Working |
+| **Broad format support** — MP4/MP3/HLS out of the box; WebM, MKV, FLAC, AVI, FLV, OGG and *any* container ffmpeg can demux when its DLLs are present | Working |
+| **Dual-source playback** — `Media(audioSource, videoSource)` plays separate audio + video URLs as one synced stream, with accurate seeking on fragmented (DASH-style) MP4 | Working |
+| **MediaMixer** — mux separate audio + video files/URLs into a single MP4, off the FX thread, with progress callbacks | Working |
 | **Custom primary stage** — generic `Application<W extends Stage>` so apps can use their own `Stage` subclass | Working |
 | **Signed native libs** — per-module SHA-256 manifest + loader override for cache integrity | Working |
 | **3D scene graph** — bgfx engine sharing Skia's D3D12 device: meshes, `PerspectiveCamera`, lights, `PhongMaterial`, textures, MSAA, shadows | Working |
@@ -177,17 +180,73 @@ stylesheet and CSS engine. **Untouched** API; renders through Skia like everythi
 ### `javafx.fxml`
 FXML loading and Scene Builder integration. **Untouched.**
 
-### `javafx.media`
-A modernized media stack:
+### `javafx.media` — *a modernized media engine*
+The public `Media` / `MediaPlayer` / `MediaView` API is preserved and extended with
+additive capabilities; underneath, the GStreamer-based engine has been substantially
+rebuilt around ffmpeg and GPU decode.
 
-- **`Media.setDecodeMethod(AUTO | CPU | GPU | GPU_PREFERRED)`** and
-  **`Media.setFfmpegDirectory(...)`** — first-class, public control over decode strategy
-  and codec provenance, backed by the `skia.media.decode` system property.
-- **ffmpeg-backed decode** with a CPU path (libdav1d preferred for AV1) and a GPU path,
-  selected at runtime.
+**Decode control (new public API on `Media`):**
+
+- **`Media.setDecodeMethod(AUTO | CPU | GPU | GPU_PREFERRED)`** — first-class control
+  over decode strategy, backed by the `skia.media.decode` system property.
+- **`Media.setFfmpegDirectory(dir)`** / **`Media.getFfmpegDirectory()`** — point the
+  engine at an ffmpeg runtime; also honored via `OPENJFX_MEDIA_FFMPEG_DIR`.
+- **`Media.isFfmpegAvailable()`** / **`Media.getFfmpegStatus()`** — query (and
+  diagnose) whether the ffmpeg tier is active.
+
+**Two format tiers** (see [`docs/MEDIA_FORMATS.md`](docs/MEDIA_FORMATS.md)):
+
+- **Default tier** — no external dependencies: MP4 (H.264/H.265 + AAC), MP3, ADTS AAC,
+  WAV, AIFF, FLV, and HLS, using the platform decoders (DirectShow / Media Foundation).
+- **ffmpeg tier** — when the ffmpeg DLLs are present: WebM (VP8/VP9/AV1 + Opus/Vorbis),
+  Matroska, FLAC, AVI, extended FLV — and a **libavformat catch-all demuxer**
+  (`ffmpegdemux`) that plays *any container ffmpeg can open* (MOV, OGG, MPEG-TS,
+  WMV/ASF, 3GP, MPEG-PS, ...). A missing or broken ffmpeg never degrades the default
+  tier: the loader fails once with a clear message and everything stock keeps playing.
+- Java-side **metadata parsers** for the new containers (Matroska/WebM, FLAC
+  vorbis-comments, AVI, FLV) feed `Media.getMetadata()` without touching the pipeline.
+
+**Hardware decode + zero-copy video:**
+
+- **D3D11VA hardware decode** through ffmpeg for H.264, H.265, VP9 and AV1 (tested
+  up to 4K), with automatic software fallback (libdav1d preferred for CPU AV1).
 - **`SkiaMediaTexture`** — pooled scratch buffers, `Cleaner`-managed native handles,
   YUV I420 / HDR upload, **HDR tone-mapping** (BT.2390), and a **D3D11 zero-copy**
-  interop path for video frames straight onto the GPU.
+  interop path (`WGL_NV_DX_interop2`) that lands decoded frames on the GPU with no
+  CPU round-trip. The interop is quiesced around window resizes / fullscreen
+  transitions so swap-chain rebuilds and GPU video can never deadlock the driver.
+
+**Dual-source playback (new public constructors):**
+
+- **`Media(audioSource, videoSource)`** and
+  **`Media(audioSource, videoSource, headers)`** — play separate audio and video URLs
+  (adaptive-streaming style: a video-only stream plus an audio-only companion) as one
+  player with one timeline. The two pipelines share a clock and are sync-corrected to
+  within about a video frame; the headers overload applies HTTP headers and an optional
+  `User-Agent` to both streams.
+- **Accurate seeking on fragmented (DASH-style) MP4** — the engine parses the `sidx`
+  fragment index and maps time seeks to exact fragment byte ranges, so video lands on
+  target and stays in lock-step with the sample-accurate audio, forward and backward.
+- **Seek hardening** — rapid seeks (slider drags) are coalesced at the player level so
+  only the final target executes; post-seek the video fast-forwards to the audio clock;
+  a watchdog detects a frozen or lagging video chain and re-syncs it onto the live
+  audio position with bounded, backed-off retries. See
+  [`docs/DUAL_SOURCE_MEDIA.md`](docs/DUAL_SOURCE_MEDIA.md).
+- **HTTP source hardening** — bounded range-request rotation defeats per-connection
+  CDN throttling, with verified `Content-Range` handling and reconnect-on-truncation.
+
+**`MediaMixer` (new public class):**
+
+- **`MediaMixer(audioSource, videoSource, output)`** muxes separate audio + video
+  inputs (files or URLs) into a single MP4 — stream copy, no re-encode — off the FX
+  thread, reporting through **`MediaMixerListener`** (`onStart` / `onProgress` /
+  `onFinished` / `onError`), with cancel support and optional faststart. See
+  [`docs/MEDIA_MIXER.md`](docs/MEDIA_MIXER.md).
+
+**Robustness** (see [`docs/MEDIA_HARDENING.md`](docs/MEDIA_HARDENING.md)): a stall
+watchdog turns silent pipeline hangs into ordinary catchable `MediaException`s,
+buffering stalls resume with anti-flap hysteresis, native error paths surface as
+events instead of process death, and the native side is leak-counted in dev builds.
 
 ### `javafx.web` — *a completely new browser engine*
 The WebView is no longer WebKit. skia-fx embeds a **from-scratch Chromium/Blink engine**
@@ -385,11 +444,13 @@ Skia for you) and a C++ toolchain. The Chromium/Blink WebView engine is opt-in
 ./gradlew buildAll
 
 # Run a sample on the Skia pipeline
-./gradlew :samples:ensemble:runShowcase  # FXML dashboard: controls, custom title bar, FPS
-./gradlew :samples:ensemble:runSvgDemo   # SVG: zoom, grid, tint, Open SVG
-./gradlew :samples:ensemble:runDemo3D    # 3D scene-graph showcase (bgfx)
-./gradlew :samples:ensemble:runModelDemo # load a glTF 2.0 model (javafx.scene3d)
-./gradlew :samples:ensemble:runWebView   # drive the Blink WebView
+./gradlew :samples:ensemble:runShowcase   # FXML dashboard: controls, custom title bar, FPS
+./gradlew :samples:ensemble:runSvgDemo    # SVG: zoom, grid, tint, Open SVG
+./gradlew :samples:ensemble:runDemo3D     # 3D scene-graph showcase (bgfx)
+./gradlew :samples:ensemble:runModelDemo  # load a glTF 2.0 model (javafx.scene3d)
+./gradlew :samples:ensemble:runWebView    # drive the Blink WebView
+./gradlew :samples:ensemble:runDualPlayer # dual-source player (separate audio + video URLs)
+./gradlew :samples:ensemble:runMixerDemo  # MediaMixer: audio + video files -> one MP4
 
 # Compile a single module / just the native Skia bridge
 ./gradlew :javafx.graphics:assemble
@@ -416,6 +477,10 @@ java --module-path sdk/lib --add-modules javafx.controls,javafx.fxml -jar your-a
 - Vector SVG (`SvgImage` / `SvgImageView`) — crisp at any zoom/DPI, zoom + tint + grid
 - 3D scene graph via bgfx (meshes, `PerspectiveCamera`, lights, `PhongMaterial`, textures,
   MSAA, shadows) + glTF 2.0 model loading (`javafx.scene3d`)
+- Media: hardware decode (H.264/H.265/VP9/AV1, up to 4K) with zero-copy video, broad
+  container support (MP4/MP3/HLS stock; WebM/MKV/FLAC/AVI/FLV + any-container with
+  ffmpeg), dual-source `Media(audio, video)` with accurate fragmented-MP4 seeking,
+  `MediaMixer` muxing
 - Uncapped / display-rate frame pacing, wall-clock animations, runtime VSync toggle
 - Memory budgets + render-thread-safe native lifecycles
 - Custom primary stage, signed native-lib manifest
@@ -424,7 +489,8 @@ java --module-path sdk/lib --add-modules javafx.controls,javafx.fxml -jar your-a
 - **WebView / Blink** — DOM, JSObject bridge, network interception, dialogs,
   downloads, permissions, history are landing; composited-layer fidelity, more chrome,
   and robustness hardening are ongoing.
-- **Media** — broader codec coverage, fuller GPU decode + zero-copy present.
+- **Media** — Linux/macOS wiring for the new format tiers, subtitle tracks, and
+  continued soak-hardening of the streaming paths.
 - **Copy elimination and profiling** — `SkPicture` subtree caching, atlas tuning,
   persistent staging buffers, copy/memory instrumentation.
 - **SVG animation** — SMIL / CSS-in-SVG playback (a render-thread-driven animation pass);

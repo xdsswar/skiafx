@@ -45,11 +45,6 @@ out/
 /CLAUDE.md
 
 # =============================================================================
-# Internal design/engineering docs — not shared with the public mirror
-# =============================================================================
-/docs/
-
-# =============================================================================
 # External read-only upstream reference (sibling directory, never tracked)
 # =============================================================================
 /jfx-master/
@@ -85,3 +80,4 @@ Thumbs.db
 /resume.md
 /.claude/
 /Reaseach /
+/Research/

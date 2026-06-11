@@ -539,6 +539,10 @@ void* openjfxD3DHwnd(OpenJfxD3DSwapChain* sc) {
 
 int32_t openjfxD3DAcquireNextBuffer(OpenJfxD3DSwapChain* sc) {
     if (!sc || !sc->swapChain) return 1;
+    // A removed device's fences still signal (UINT64_MAX) so the wait below
+    // cannot hang, but acquiring a buffer on a dead device is pointless —
+    // fail fast so Java's prepare() takes the dispose path immediately.
+    if (skia_fx::d3d12_device_lost()) return 2;
 
     // Wait for the back buffer DXGI is about to hand us to have
     // actually finished its previous GPU use. With 3 back buffers
@@ -569,11 +573,18 @@ int32_t openjfxD3DPresent(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx, int32
     // (DXGI forbids combining a non-zero sync interval with ALLOW_TEARING.)
     UINT syncInterval = vsync ? 1u : 0u;
     UINT flags = vsync ? 0u : (sc->allowTearing ? DXGI_PRESENT_ALLOW_TEARING : 0u);
+    // Note: DXGI_STATUS_OCCLUDED is a SUCCESS status (legacy bitblt-model
+    // signal; flip-model swap chains essentially never return it), so it
+    // falls through the FAILED() check below as a normal present.
     HRESULT hr = sc->swapChain->Present(syncInterval, flags);
     if (FAILED(hr)) {
         // A device-removed/reset present is terminal for this device — latch it so
         // every other GPU path (Skia readback, the bgfx 3D pass) stops calling it.
-        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET) {
+        // DEVICE_HUNG / DRIVER_INTERNAL_ERROR and any other removal-class failure
+        // don't return those exact HRESULTs, so also probe the device itself:
+        // GetDeviceRemovedReason() != S_OK covers the whole class.
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+            || (g().device && g().device->GetDeviceRemovedReason() != S_OK)) {
             skia_fx::d3d12_mark_device_lost();
         }
         return 2;
@@ -660,7 +671,16 @@ int32_t openjfxD3DResize(OpenJfxD3DSwapChain* sc,
         kBufferCount,
         static_cast<UINT>(width), static_cast<UINT>(height),
         kSwapFormat, flags);
-    if (FAILED(hr)) return 2;
+    if (FAILED(hr)) {
+        // ResizeBuffers fails for removal-class errors too (TDR mid-drag,
+        // adapter change on a cross-DPI monitor move). Latch device-lost so
+        // the rebuild the caller triggers doesn't hammer a dead device.
+        if (hr == DXGI_ERROR_DEVICE_REMOVED || hr == DXGI_ERROR_DEVICE_RESET
+            || (g().device && g().device->GetDeviceRemovedReason() != S_OK)) {
+            skia_fx::d3d12_mark_device_lost();
+        }
+        return 2;
+    }
 
     sc->width  = width;
     sc->height = height;

@@ -52,4 +52,18 @@
 #define CONTENT_TYPE_MATROSKA "video/x-matroska"
 #define CONTENT_TYPE_WEBM     "video/webm"
 
+// skia-fx format expansion (same gst-plugins-good fetch as matroska):
+// raw FLAC (flacparse + ffmpegwrapper decode), AVI (avidemux) and
+// FLV (flvdemux) — both AV containers use the dynamic decoder pick.
+#define CONTENT_TYPE_FLAC   "audio/flac"
+#define CONTENT_TYPE_AVI    "video/x-msvideo"
+#define CONTENT_TYPE_FLV    "video/x-flv"
+
+// skia-fx catch-all: any container ffmpeg's libavformat can open, when
+// the ffmpeg runtime is loaded. The Java side assigns this content type
+// to otherwise-unrecognized media only when ffmpeg is available, and the
+// pipeline factory routes it to the ffmpegdemux element. Hybrid: the
+// dedicated demuxers above stay preferred for the formats they handle.
+#define CONTENT_TYPE_FFMPEG "application/x-ffmpeg"
+
 #endif

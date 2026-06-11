@@ -43,6 +43,13 @@ class JuxBrowserClient : public content::ContentBrowserClient {
   std::string GetAcceptLangs(content::BrowserContext* context) override;
   std::string GetDefaultDownloadName() override;
 
+  // Forwards OSR-relevant switches (e.g. --disable-direct-composition) from
+  // the browser command line to child processes — the GPU process reads them
+  // from ITS OWN command line, and content's default forwarding list does not
+  // include them, so a browser-only switch would silently do nothing.
+  void AppendExtraCommandLineSwitches(base::CommandLine* command_line,
+                                      int child_process_id) override;
+
   // Under print preview, gives the off-screen chrome://print frame (and its PDF
   // viewer subframe) a chrome-untrusted://print subresource loader factory, so the
   // PDF plugin can fetch the generated preview PDF from the untrusted byte-server

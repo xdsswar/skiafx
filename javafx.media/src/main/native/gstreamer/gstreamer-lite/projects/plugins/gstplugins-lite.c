@@ -58,6 +58,36 @@ gboolean lite_plugins_init (GstPlugin * plugin)
       return FALSE;
     }
   }
+
+  /* skia-fx addition: scaletempo for time-stretched (pitch-preserved)
+   * audio at MediaPlayer.setRate(rate != 1.0). Fetched from the same
+   * gst-plugins-good tarball (audiofx/) by skiafx.matroska-conventions;
+   * registered via the scaletempo-lite-plugin.c wrapper. Shares the
+   * OPENJFX_HAVE_MATROSKA guard because the sources arrive together. */
+  {
+    extern gboolean plugin_init_scaletempo (GstPlugin * plugin);
+    if (!plugin_init_scaletempo (plugin)) {
+      return FALSE;
+    }
+  }
+
+  /* skia-fx addition: avi + flv demuxers and the flac parser — the
+   * format-expansion set. All fetched from the same pinned
+   * gst-plugins-good tarball; each registered by its own thin
+   * *-lite-plugin.c wrapper. Decoders are the existing ones
+   * (ffmpegwrapper/dshowwrapper picked per caps). */
+  {
+    extern gboolean plugin_init_avi (GstPlugin * plugin);
+    extern gboolean plugin_init_flv (GstPlugin * plugin);
+    extern gboolean plugin_init_flacparse (GstPlugin * plugin);
+    const gchar* dbg = g_getenv ("SKIA_MEDIA_DEBUG");
+    if (!plugin_init_flacparse (plugin)) return FALSE;
+    if (dbg) g_print ("[lite] flacparse registered\n");
+    if (!plugin_init_avi (plugin)) return FALSE;
+    if (dbg) g_print ("[lite] avi registered\n");
+    if (!plugin_init_flv (plugin)) return FALSE;
+    if (dbg) g_print ("[lite] flv registered\n");
+  }
 #endif
 
 #ifdef WIN32

@@ -28,6 +28,7 @@ import com.sun.javafx.PlatformUtil;
 
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.FilterInputStream;
 import java.io.InputStream;
 import java.io.IOException;
 import java.io.RandomAccessFile;
@@ -45,6 +46,9 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 public class NativeLibLoader {
 
@@ -208,7 +212,7 @@ public class NativeLibLoader {
                 }
             }
             String reallib = "/"+System.mapLibraryName(libraryName);
-            InputStream is = caller.getResourceAsStream(reallib);
+            InputStream is = openBundledResource(caller, reallib);
             if (is != null) {
                 String fp = cacheLibrary(is, reallib, caller);
                 if (load) {
@@ -228,6 +232,153 @@ public class NativeLibLoader {
             t.printStackTrace();
         }
         return false;
+    }
+
+    /**
+     * Opens a native-bundle resource for {@code caller}, transparently handling
+     * the per-platform natives split. skia-fx ships each module's native libs
+     * (and its {@code /checksums.properties}) in a SEPARATE classifier jar
+     * (e.g. {@code javafx.graphics-<version>-win-x64.jar}) rather than the main
+     * classes jar. Resolution order:
+     *
+     * <ol>
+     *   <li>{@code caller.getResourceAsStream} — succeeds on a flat classpath
+     *       (the classifier jar's entries are visible) and for the legacy
+     *       single-jar layout where natives sat in the main jar.</li>
+     *   <li>Otherwise — typically the JPMS module path, where a module may only
+     *       read resources from its OWN jar — locate the sibling classifier jar
+     *       on disk (beside the caller module's jar, or in {@code build/libs}
+     *       for the in-tree dev build) and read the entry straight from the
+     *       zip.</li>
+     * </ol>
+     *
+     * This is what lets a downstream app launch with no JVM args on either the
+     * classpath or {@code --module-path sdk/lib} and still find the natives.
+     * Returns {@code null} if neither route has the resource, so the existing
+     * java.library.path / System.loadLibrary fallbacks still apply.
+     */
+    private static InputStream openBundledResource(Class caller, String resource) {
+        InputStream is = caller.getResourceAsStream(resource);
+        if (is != null) {
+            return is;
+        }
+        Path jar = locateNativesJar(caller);
+        if (jar == null) {
+            return null;
+        }
+        try {
+            final ZipFile zf = new ZipFile(jar.toFile());
+            String entry = resource.startsWith("/") ? resource.substring(1) : resource;
+            ZipEntry e = zf.getEntry(entry);
+            if (e == null) {
+                zf.close();
+                return null;
+            }
+            // Close the backing zip when the returned stream is closed.
+            return new FilterInputStream(zf.getInputStream(e)) {
+                @Override
+                public void close() throws IOException {
+                    try {
+                        super.close();
+                    } finally {
+                        zf.close();
+                    }
+                }
+            };
+        } catch (IOException ex) {
+            if (verbose) {
+                System.err.println("WARNING: reading " + resource + " from " + jar + " failed: " + ex);
+            }
+            return null;
+        }
+    }
+
+    /** Host triple ({@code <platform>-<arch>}) matching the build's jar classifier. */
+    private static String hostTriple() {
+        String plat = PlatformUtil.isWindows() ? "win"
+                : PlatformUtil.isMac() ? "mac"
+                : "linux";
+        String arch = System.getProperty("os.arch", "");
+        String a = (arch.equals("x86_64") || arch.equals("amd64")) ? "x64" : "arm64";
+        return plat + "-" + a;
+    }
+
+    /** Per-classloader cache of the located natives classifier jar (null = none found). */
+    private static final Map<ClassLoader, Path> nativesJarCache = new HashMap<>();
+
+    private static synchronized Path locateNativesJar(Class caller) {
+        ClassLoader cl = caller.getClassLoader();
+        if (nativesJarCache.containsKey(cl)) {
+            return nativesJarCache.get(cl);
+        }
+        Path found = findNativesJar(caller);
+        nativesJarCache.put(cl, found);
+        return found;
+    }
+
+    private static Path findNativesJar(Class caller) {
+        try {
+            var cs = caller.getProtectionDomain().getCodeSource();
+            if (cs == null || cs.getLocation() == null) {
+                return null;
+            }
+            Path self = Path.of(cs.getLocation().toURI());
+            String triple = hostTriple();
+            String modulePrefix = (caller.getModule() != null && caller.getModule().isNamed())
+                    ? caller.getModule().getName() : null;
+
+            // Loaded from a jar: the classifier jar sits beside it. Derive the
+            // exact name first, then fall back to a directory scan.
+            if (Files.isRegularFile(self)) {
+                String n = self.getFileName().toString();
+                if (n.endsWith(".jar")) {
+                    Path sibling = self.resolveSibling(
+                            n.substring(0, n.length() - 4) + "-" + triple + ".jar");
+                    if (Files.isRegularFile(sibling)) {
+                        return sibling;
+                    }
+                }
+                Path hit = firstClassifierJar(self.getParent(), triple, modulePrefix);
+                if (hit != null) {
+                    return hit;
+                }
+            }
+
+            // Loaded from a classes directory (in-tree dev build): probe nearby
+            // libs dirs walking up a few levels (build/classes/java/main ->
+            // build/libs).
+            Path p = self;
+            for (int i = 0; i < 6 && p != null; i++) {
+                Path hit = firstClassifierJar(p.resolve("libs"), triple, modulePrefix);
+                if (hit != null) {
+                    return hit;
+                }
+                p = p.getParent();
+            }
+        } catch (Exception ignore) {
+            // best-effort discovery; null falls back to the other load paths
+        }
+        return null;
+    }
+
+    /** First {@code <modulePrefix>*-<triple>.jar} in {@code dir}, or {@code null}. */
+    private static Path firstClassifierJar(Path dir, String triple, String modulePrefix) {
+        if (dir == null || !Files.isDirectory(dir)) {
+            return null;
+        }
+        try (Stream<Path> s = Files.list(dir)) {
+            return s.filter(f -> {
+                        String n = f.getFileName().toString();
+                        if (!n.endsWith("-" + triple + ".jar")) {
+                            return false;
+                        }
+                        return modulePrefix == null || n.startsWith(modulePrefix);
+                    })
+                    .findFirst()
+                    .orElse(null);
+        } catch (IOException e) {
+            return null;
+        }
     }
 
     private static String cacheLibrary(InputStream is, String name, Class caller) throws IOException {
@@ -325,7 +476,7 @@ public class NativeLibLoader {
                 while (dis.read(buffer) != -1) { /* empty loop body is intentional */ }
                 isHash = dis.getMessageDigest().digest();
                 is.close();
-                is = caller.getResourceAsStream(name); // mark/reset not supported, we have to reread
+                is = openBundledResource(caller, name); // mark/reset not supported, we have to reread
             }
             catch (NoSuchAlgorithmException nsa) {
                 isHash = new byte[1];
@@ -399,7 +550,7 @@ public class NativeLibLoader {
             return cached;
         }
         Map<String, String> manifest = new HashMap<>();
-        try (InputStream in = caller.getResourceAsStream("/checksums.properties")) {
+        try (InputStream in = openBundledResource(caller, "/checksums.properties")) {
             if (in != null) {
                 Properties props = new Properties();
                 props.load(in);

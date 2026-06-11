@@ -214,37 +214,41 @@ if (hasNative) {
     // making assemble compile natives explicitly is cleaner.
     tasks.named('assemble') { dependsOn nativeCompileTask }
 
-    // Ship native libs at the JAR ROOT — that's where
+    // Natives ship INSIDE the module jar — ONE artifact per module, with
+    // the host triple in its name since the contents are platform-specific.
+    // A host build on Windows produces:
+    //
+    //   javafx.graphics-<version>-win-x64.jar  (classes + module-info
+    //                                            + *.dll + checksums.properties)
+    //
+    // (Reverted from the earlier two-jar split — a separate natives-only
+    // classifier jar per module — by request: one jar per module, binaries
+    // included.) Each host builds only its own platform jar (Windows ->
+    // -win-x64, macOS -> -mac-x64, Linux -> -linux-x64); building for other
+    // platforms means re-running this on that host.
+    //
+    // Native libs sit at the JAR ROOT — that's where
     // com.sun.glass.utils.NativeLibLoader looks them up:
     //
     //   String reallib = "/" + System.mapLibraryName(libraryName);
     //   InputStream is = caller.getResourceAsStream(reallib);
     //
-    // (see NativeLibLoader.java#installLibraryFromResource line 207).
-    // Putting them under `native/<host>-<arch>/` would make the
-    // resource path lookup fail, the loader would fall through to
-    // System.loadLibrary, and apps would have to supply
-    // -Djava.library.path to find them on disk. Jar-root + the
-    // existing NativeLibLoader cache-and-extract logic means a user
-    // app just needs --module-path sdk/lib and the toolkit
-    // auto-extracts host-platform libs into ~/.openjfx/cache/ on
-    // first load — same UX as stock OpenJFX from Maven.
-    //
-    // Cross-platform note: a jar built on Windows ships .dll files
-    // at the root, on macOS .dylib, on Linux .so. Building for
-    // multiple platforms requires re-running on each host (or
-    // cross-compile + multi-classifier publication; a later
-    // milestone).
-    tasks.withType(Jar).configureEach {
-        dependsOn generateChecksums
+    // (see NativeLibLoader.java#installLibraryFromResource). With the libs
+    // in the SAME jar as the loading class this works on both the classpath
+    // AND the JPMS module path (a class can always read its own module's
+    // resources); the existing cache-and-extract logic unpacks into
+    // ~/.skia-fx/cache/ on first load. The loose sdk/lib/<triple>/ files
+    // remain as the java.library.path fallback (see skiafx.sdk-conventions).
+    tasks.named('jar', Jar) {
+        dependsOn nativeCompileTask, generateChecksums
+        archiveClassifier.set("${hostPlatform}-${hostArch}")
         from(nativeBuildDir.map { it.dir('lib') }) {
             include '**/*.so', '**/*.dll', '**/*.dylib'
-            // NO `into` clause — drop at jar root.
+            // NO `into` clause — drop at jar root (NativeLibLoader lookup).
         }
         // Ship the SHA-256 manifest alongside the libs, at the jar root.
         from(checksumsOutDir) {
             include 'checksums.properties'
-            // NO `into` clause — drop at jar root.
         }
     }
 }

@@ -10,6 +10,7 @@
  */
 package com.sun.webkit.blink;
 
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
@@ -21,6 +22,9 @@ import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.HexFormat;
 import java.util.Properties;
+import java.util.stream.Stream;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 /**
  * Extracts the {@code skia-fx-webview} engine runtime bundle (exe, dll/so/dylib,
@@ -117,36 +121,38 @@ final class BlinkBundle {
                 enginePath = exe;
                 return exe;
             }
-            Properties manifest = loadManifest();
-            Path dir = cacheDir();
-            Files.createDirectories(dir);
+            try (BundleSource source = BundleSource.resolve()) {
+                Properties manifest = loadManifest(source);
+                Path dir = cacheDir();
+                Files.createDirectories(dir);
 
-            for (String key : manifest.stringPropertyNames()) {
-                // keys are jar-root resource paths, e.g. "/skia-fx-webview.dll"
-                String resource = key.startsWith("/") ? key : "/" + key;
-                String name = resource.substring(resource.lastIndexOf('/') + 1);
-                if (name.isEmpty()) {
-                    continue;
+                for (String key : manifest.stringPropertyNames()) {
+                    // keys are jar-root resource paths, e.g. "/skia-fx-webview.dll"
+                    String resource = key.startsWith("/") ? key : "/" + key;
+                    String name = resource.substring(resource.lastIndexOf('/') + 1);
+                    if (name.isEmpty()) {
+                        continue;
+                    }
+                    extractOne(source, resource, name, dir, manifest.getProperty(key));
                 }
-                extractOne(resource, name, dir, manifest.getProperty(key));
-            }
 
-            Path exe = dir.resolve(engineExeName());
-            if (!Files.exists(exe)) {
-                throw new IOException("engine executable missing after extraction: " + exe);
+                Path exe = dir.resolve(engineExeName());
+                if (!Files.exists(exe)) {
+                    throw new IOException("engine executable missing after extraction: " + exe);
+                }
+                if (!engineExeName().endsWith(".exe")) {
+                    exe.toFile().setExecutable(true, true);
+                }
+                enginePath = exe;
+                return exe;
             }
-            if (!engineExeName().endsWith(".exe")) {
-                exe.toFile().setExecutable(true, true);
-            }
-            enginePath = exe;
-            return exe;
         }
     }
 
-    private static Properties loadManifest() throws IOException {
-        try (InputStream in = BlinkBundle.class.getResourceAsStream("/checksums.properties")) {
+    private static Properties loadManifest(BundleSource source) throws IOException {
+        try (InputStream in = source.open("/checksums.properties")) {
             if (in == null) {
-                throw new IOException("/checksums.properties not found on the classpath — "
+                throw new IOException("/checksums.properties not found" + source.describe() + " — "
                     + "the skia-fx-webview native bundle is not packaged "
                     + "(build with -PbuildWebNative=true).");
             }
@@ -159,7 +165,7 @@ final class BlinkBundle {
         }
     }
 
-    private static void extractOne(String resource, String name, Path dir, String wantHash)
+    private static void extractOne(BundleSource source, String resource, String name, Path dir, String wantHash)
             throws IOException {
         Path target = dir.resolve(name);
         Path sidecar = dir.resolve(name + ".sha256");
@@ -169,7 +175,7 @@ final class BlinkBundle {
             return;
         }
 
-        try (InputStream in = BlinkBundle.class.getResourceAsStream(resource)) {
+        try (InputStream in = source.open(resource)) {
             if (in == null) {
                 // A manifest entry with no packaged resource is non-fatal: the
                 // engine executable is the hard requirement (verified by the
@@ -197,6 +203,147 @@ final class BlinkBundle {
             if (wantHash != null) {
                 Files.writeString(sidecar, wantHash);
             }
+        }
+    }
+
+    /**
+     * Backing store for the engine bundle. The bundle (the {@code
+     * checksums.properties} manifest + every engine file) ships at the root
+     * of the {@code javafx.web} module jar itself (the single per-platform
+     * jar, e.g. {@code javafx.web-<version>-win-x64.jar}, classes and
+     * binaries together), so the primary path — reading this class's own
+     * resources via {@code getResourceAsStream} — works on both the flat
+     * classpath and the JPMS module path (a class can always read its own
+     * module's resources).
+     *
+     * <p>The on-disk lookup below is retained as a fallback for the older
+     * two-jar layout (a separate natives-only classifier jar beside the
+     * classes jar), where JPMS resource encapsulation hid the second jar
+     * from {@code getResourceAsStream} on the module path.</p>
+     */
+    private static final class BundleSource implements Closeable {
+        // Non-null => read entries from this jar; null => read from the classpath.
+        private final ZipFile zip;
+
+        private BundleSource(ZipFile zip) {
+            this.zip = zip;
+        }
+
+        static BundleSource resolve() {
+            // Prefer the classpath: covers flat-classpath / legacy layouts and
+            // is the cheap path when the resource is directly visible.
+            if (BlinkBundle.class.getResource("/checksums.properties") != null) {
+                return new BundleSource(null);
+            }
+            Path jar = locateNativesJar();
+            if (jar != null) {
+                try {
+                    return new BundleSource(new ZipFile(jar.toFile()));
+                } catch (IOException e) {
+                    // Fall through: the classpath source's open() returns null and
+                    // loadManifest throws the helpful "not packaged" error.
+                }
+            }
+            return new BundleSource(null);
+        }
+
+        /** Opens a bundle entry, or returns {@code null} if it is absent. */
+        InputStream open(String resource) throws IOException {
+            if (zip == null) {
+                return BlinkBundle.class.getResourceAsStream(resource);
+            }
+            String entryName = resource.startsWith("/") ? resource.substring(1) : resource;
+            ZipEntry e = zip.getEntry(entryName);
+            return e == null ? null : zip.getInputStream(e);
+        }
+
+        /** Human-readable source, woven into the "not packaged" diagnostic. */
+        String describe() {
+            return zip == null ? " on the classpath" : " in " + zip.getName();
+        }
+
+        @Override
+        public void close() throws IOException {
+            if (zip != null) {
+                zip.close();
+            }
+        }
+    }
+
+    /** Host triple ({@code <platform>-<arch>}) matching the build's jar classifier. */
+    private static String hostTriple() {
+        String os = System.getProperty("os.name", "").toLowerCase();
+        String plat = os.contains("win") ? "win"
+            : (os.contains("mac") || os.contains("darwin")) ? "mac"
+            : "linux";
+        String arch = System.getProperty("os.arch", "");
+        String a = (arch.equals("x86_64") || arch.equals("amd64")) ? "x64" : "arm64";
+        return plat + "-" + a;
+    }
+
+    /**
+     * Locates the per-platform natives classifier jar
+     * ({@code javafx.web-<version>-<triple>.jar}) on disk, anchored on this
+     * module's own code-source location so it resolves for both the packaged
+     * SDK ({@code sdk/lib/}) and the in-tree dev build ({@code build/libs/}).
+     * Returns {@code null} when it cannot be found (caller then degrades to the
+     * classpath source + helpful error).
+     */
+    private static Path locateNativesJar() {
+        try {
+            var cs = BlinkBundle.class.getProtectionDomain().getCodeSource();
+            if (cs == null || cs.getLocation() == null) {
+                return null;
+            }
+            Path self = Path.of(cs.getLocation().toURI());
+            String triple = hostTriple();
+
+            // Loaded from a jar: the classifier jar sits beside it; derive its
+            // exact name, then fall back to a directory scan.
+            if (Files.isRegularFile(self)) {
+                String n = self.getFileName().toString();
+                if (n.endsWith(".jar")) {
+                    Path sibling = self.resolveSibling(
+                        n.substring(0, n.length() - 4) + "-" + triple + ".jar");
+                    if (Files.isRegularFile(sibling)) {
+                        return sibling;
+                    }
+                }
+                Path hit = findInDir(self.getParent(), triple);
+                if (hit != null) {
+                    return hit;
+                }
+            }
+
+            // Loaded from a classes directory (dev tree): probe nearby libs dirs.
+            Path p = self;
+            for (int i = 0; i < 6 && p != null; i++) {
+                Path hit = findInDir(p.resolve("libs"), triple);
+                if (hit != null) {
+                    return hit;
+                }
+                p = p.getParent();
+            }
+        } catch (Exception ignore) {
+            // best-effort discovery; null falls back to the classpath source
+        }
+        return null;
+    }
+
+    /** First {@code javafx.web*-<triple>.jar} in {@code dir}, or {@code null}. */
+    private static Path findInDir(Path dir, String triple) {
+        if (dir == null || !Files.isDirectory(dir)) {
+            return null;
+        }
+        try (Stream<Path> s = Files.list(dir)) {
+            return s.filter(f -> {
+                    String n = f.getFileName().toString();
+                    return n.startsWith("javafx.web") && n.endsWith("-" + triple + ".jar");
+                })
+                .findFirst()
+                .orElse(null);
+        } catch (IOException e) {
+            return null;
         }
     }
 

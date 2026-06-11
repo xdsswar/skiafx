@@ -138,6 +138,25 @@ public class Locator {
     private volatile String companionAudioContentType;
 
     /**
+     * Skia-fx: the companion stream's own content length in bytes
+     * ({@code -1} = unknown). Captured when the companion connection is
+     * established. Without this the native pipeline stamps the PRIMARY
+     * locator's size onto the companion's {@code javasource}, which
+     * corrupts every byte-based progress/EOS computation for the
+     * companion (e.g. a 2.75 MB audio stream claiming to be 281 MB).
+     */
+    private volatile long companionAudioContentLength = -1;
+
+    /**
+     * Skia-fx: companion content length in bytes, or {@code -1} when
+     * unknown / no companion. Read from native ({@code CLocator}) via
+     * JNI during pipeline construction.
+     */
+    public long getCompanionAudioContentLength() {
+        return companionAudioContentLength;
+    }
+
+    /**
      * Skia-fx: build a {@link ConnectionHolder} for the companion audio
      * URL so the native pipeline can stream it through the very same
      * {@code javasource} Java-I/O bridge the primary source already uses.
@@ -158,12 +177,18 @@ public class Locator {
         }
         URI cu = new URI(url);
         String sch = cu.getScheme();
+        ConnectionHolder holder;
         if ("file".equalsIgnoreCase(sch)) {
-            return ConnectionHolder.createFileConnectionHolder(cu);
+            holder = ConnectionHolder.createFileConnectionHolder(cu);
+        } else {
+            synchronized (propertyLock) {
+                holder = ConnectionHolder.createURIConnectionHolder(cu, connectionProperties);
+            }
         }
-        synchronized (propertyLock) {
-            return ConnectionHolder.createURIConnectionHolder(cu, connectionProperties);
-        }
+        // Capture the companion's true size for the native pipeline
+        // (see companionAudioContentLength).
+        companionAudioContentLength = holder.getContentLength();
+        return holder;
     }
 
     /**
@@ -184,11 +209,20 @@ public class Locator {
             return null;
         }
         if (companionAudioContentType == null) {
+            // getContentTypeFromFileSignature -> getInputStream stamps
+            // this.contentLength as a side effect — that is the PRIMARY
+            // locator's size hint, and the probe runs against the
+            // COMPANION URL. Preserve it or the primary's byte math
+            // (metadata parsing, progress/EOS) inherits the companion's
+            // tiny size.
+            long primaryLength = contentLength;
             try {
                 companionAudioContentType =
                     getContentTypeFromFileSignature(new URI(url));
             } catch (Exception e) {
                 companionAudioContentType = DEFAULT_CONTENT_TYPE;
+            } finally {
+                contentLength = primaryLength;
             }
         }
         return companionAudioContentType;
@@ -764,11 +798,70 @@ public class Locator {
 
     private String getContentTypeFromFileSignature(URI uri) throws MalformedURLException, IOException {
         InputStream stream = getInputStream(uri);
-        byte[] signature = new byte[MediaUtils.MAX_FILE_SIGNATURE_LENGTH];
-        int size = stream.read(signature);
-        stream.close();
+        try {
+            byte[] signature = new byte[MediaUtils.MAX_FILE_SIGNATURE_LENGTH];
+            int size = readFully(stream, signature);
 
-        return MediaUtils.fileSignatureToContentType(signature, size);
+            // skia-fx: an ID3v2 tag hides the real signature — the first
+            // audio frame sits AFTER the tag, and "ID3" alone cannot
+            // distinguish MP3 from ADTS AAC (taggers put ID3v2 on both).
+            // Skip the tag (bounded) and sniff what actually follows;
+            // when skipping is impossible, fall through to the legacy
+            // "ID3 means MP3" assumption.
+            if (size >= 10 && signature[0] == 'I' && signature[1] == 'D'
+                    && signature[2] == '3') {
+                long tagSize = ((signature[6] & 0x7f) << 21)
+                             | ((signature[7] & 0x7f) << 14)
+                             | ((signature[8] & 0x7f) << 7)
+                             |  (signature[9] & 0x7f);
+                // 10-byte header (+10-byte footer if flagged), capped so a
+                // corrupt size field can't make us trawl a whole file.
+                long skip = tagSize + (((signature[5] & 0x10) != 0) ? 20 : 10)
+                          - size;
+                if (skip >= 0 && tagSize <= 4 * 1024 * 1024) {
+                    while (skip > 0) {
+                        long n = stream.skip(skip);
+                        if (n <= 0) {
+                            break;
+                        }
+                        skip -= n;
+                    }
+                    if (skip == 0) {
+                        byte[] after = new byte[MediaUtils.MAX_FILE_SIGNATURE_LENGTH];
+                        int afterSize = readFully(stream, after);
+                        if (afterSize > 0) {
+                            try {
+                                String real = MediaUtils.fileSignatureToContentType(after, afterSize);
+                                if (real != null) {
+                                    return real;
+                                }
+                            } catch (MediaException unrecognized) {
+                                // Whatever follows the tag isn't a known
+                                // frame — keep the legacy "ID3 means MP3"
+                                // answer from the original signature.
+                            }
+                        }
+                    }
+                }
+            }
+
+            return MediaUtils.fileSignatureToContentType(signature, size);
+        } finally {
+            stream.close();
+        }
+    }
+
+    /** Like read() but keeps reading until the buffer is full or EOF. */
+    private static int readFully(InputStream stream, byte[] buf) throws IOException {
+        int total = 0;
+        while (total < buf.length) {
+            int n = stream.read(buf, total, buf.length - total);
+            if (n < 0) {
+                break;
+            }
+            total += n;
+        }
+        return total;
     }
 
     static void closeConnection(URLConnection connection) {

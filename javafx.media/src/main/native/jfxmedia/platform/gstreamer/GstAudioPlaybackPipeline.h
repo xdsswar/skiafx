@@ -112,6 +112,24 @@ public:
 
     virtual void CheckQueueSize(GstElement *element) {};
 
+    // skia-fx: called the moment a seek is REQUESTED (before it executes, even
+    // before coalescing), so a subclass can arm its recovery grace and reset
+    // its lag baseline to the target. Without this the recovery watchdog can
+    // see the stale pre-seek video PTS against the just-applied new audio
+    // position and fire a spurious "lagging" recovery that races the user seek.
+    virtual void OnSeekRequested(gint64 seekTimeNs) {};
+
+    // skia-fx: called right after a flushing seek succeeds, so a subclass can
+    // prime its video path (the dual-source AV pipeline temporarily lets the
+    // video sink render the late post-seek catch-up frames instead of
+    // dropping them, then re-locks to the audio master clock once caught up).
+    virtual void OnSeekIssued(gint64 seekTimeNs) {};
+
+    // skia-fx: called once per watchdog wake (~2 s) so a subclass can run a
+    // soft recovery (the dual-source AV pipeline re-seeks a stalled video
+    // chain back onto the still-playing audio instead of freezing).
+    virtual void WatchdogTick() {};
+
     GstElementContainer m_Elements;
 
 protected:
@@ -138,6 +156,12 @@ protected:
 
     // Stall handling stuff
     volatile bool        m_StallOnPause; // True if paused because of stall condition
+
+    // skia-fx: re-seek ONLY the video chain to a TIME (ns), serialised through
+    // m_SeekLock so it can't interleave with a coalesced full SeekPipeline()
+    // (a concurrent flushing seek on the shared video chain wedges it).
+    // Returns false (no-op) if a user seek is already queued in the coalescer.
+    bool                RecoverVideoSeekLocked(gint64 seekTimeNs);
 
 #if ENABLE_LOWLEVELPERF
     // Proportion value of QoS event if enabled:
@@ -201,11 +225,62 @@ private:
     bool                m_bSetClock;
     bool                m_bIsClockSet;
     // skia-fx: one-shot guard for the dual-source initial resync seek
-    // (see BusCallback PLAYING handling). Two independent remote sources
-    // reach PLAYING with misaligned segments and the audio-master clock
-    // doesn't advance until a flushing seek re-segments them; we do that
-    // once automatically. The flag prevents any seek->preroll->play loop.
+    // (see GetStreamTime). Two independent remote sources can reach
+    // PLAYING with misaligned segments so the audio-master clock never
+    // advances; one flushing seek re-segments them (the same effect a
+    // manual seek has). The resync is DEFERRED: it fires from the
+    // position-poll path only after the clock has been observed frozen
+    // at 0 for several polls in PLAYING. Firing it eagerly from the
+    // bus callback at the PLAYING transition (the previous design)
+    // raced the dynamic video-chain build — flushing mid-preroll
+    // wedged the pipeline in async limbo (ring buffer never restarted,
+    // clock pinned at 0, unrecoverable even by user seeks).
     bool                m_bDualSourceInitialResyncDone;
+    // Consecutive position polls observed at 0 while PLAYING, and the
+    // monotonic time of the first one. GetStreamTime is called from
+    // more than the ~100ms Java poll (bus-thread UpdateBufferPosition
+    // fires it per BUFFERING message, bursty during startup), so the
+    // poll COUNT alone can accumulate in well under the intended ~3s —
+    // the detector requires both the count AND real elapsed time.
+    int                 m_DualResyncZeroPosPolls;
+    gint64              m_DualResyncFirstZeroPosTime;
+
+    // skia-fx: stall/preroll watchdog. A pipeline that sits in Stalled
+    // or stuck in preroll with ZERO progress (no download movement, no
+    // position movement) for OPENJFX_MEDIA_STALL_TIMEOUT seconds
+    // (default 45, 0 disables) posts a bus ERROR instead of freezing
+    // the player forever — every silent-hang bug class becomes an
+    // ordinary catchable MediaException. One-shot per pipeline.
+    GThread*            m_WatchdogThread;
+    GMutex              m_WatchdogMutex;
+    GCond               m_WatchdogCond;
+    bool                m_bWatchdogStop;
+    int                 m_WatchdogTimeoutSec;
+    void                StartWatchdog();
+    void                StopWatchdog();
+    static gpointer     WatchdogLoop(gpointer data);
+
+    // skia-fx: player-level seek coalescing. Rapid seeks (slider dragging,
+    // programmatic scrubbing) are debounced HERE rather than relying on every
+    // app to "seek on mouse release" — only the latest target after a short
+    // quiet window (OPENJFX_MEDIA_SEEK_DEBOUNCE_MS, default 180, 0 disables)
+    // is actually executed, so a drag-storm can't thrash the (expensive,
+    // fragment-refetching) seek path. Active for dual-source A/V; single
+    // source keeps the immediate synchronous seek. DoSeekNow() is the actual
+    // work, run on the coalescer thread.
+    GThread*            m_SeekCoalesceThread;
+    GMutex              m_SeekCoalesceMutex;
+    GCond               m_SeekCoalesceCond;
+    bool                m_bSeekCoalesceStop;
+    bool                m_bSeekCoalescePending;
+    double              m_SeekCoalesceTargetSec;
+    gint64              m_SeekCoalesceLastReqUs;
+    int                 m_SeekDebounceMs;
+    bool                SeekCoalescingEnabled();
+    void                StartSeekCoalescer();
+    void                StopSeekCoalescer();
+    static gpointer     SeekCoalesceLoop(gpointer data);
+    uint32_t            DoSeekNow(double dSeekTime);
 
     CJfxCriticalSection* m_StateLock;
 
@@ -214,6 +289,21 @@ private:
     gint64    m_llLastProgressValuePosition;
     gint64    m_llLastProgressValueStop;
     gboolean  m_bLastProgressValueEOS;
+
+    // skia-fx: dual-source companion-audio buffering state, tracked
+    // SEPARATELY from the primary's progress values above. The
+    // companion's BUFFERING messages must not feed the shared resume
+    // math (its tiny stream reports "far ahead" and causes premature
+    // resumes), but ignoring its UNDERRUN entirely meant a starving
+    // companion froze playback silently. The companion's progress is
+    // recorded here and the stall-resume condition requires BOTH
+    // cushions (video AND audio-or-EOS). See UpdateBufferPosition /
+    // IsCompanionAudioCushionOk.
+    gint64    m_llAudioProgressValuePosition;
+    gint64    m_llAudioProgressValueStop;
+    gboolean  m_bAudioProgressEOS;
+
+    bool      IsCompanionAudioCushionOk(double streamTime, double duration);
 #endif // ENABLE_PROGRESS_BUFFER
 };
 

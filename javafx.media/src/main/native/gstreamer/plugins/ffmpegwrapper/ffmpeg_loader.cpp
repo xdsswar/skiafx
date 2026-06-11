@@ -46,30 +46,70 @@ const char* const DLLS_SWSCALE[]    = { "swscale-9.dll", "swscale-8.dll", NULL }
 
 #ifdef _WIN32
 
+// Load by ABSOLUTE path with the search-order flags. These DLLs run
+// in-process, so the resolution must be deterministic: never the
+// current working directory (classic planting vector), and a DLL's own
+// dependencies (avcodec → avutil) resolve from its OWN directory first.
+HMODULE load_absolute(const std::string& full) {
+    HMODULE h = LoadLibraryExA(full.c_str(), NULL,
+        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+        LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
+        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
+    if (h) return h;
+    // Fallback for older Windows that doesn't honour the flags —
+    // safe because the path is absolute.
+    return LoadLibraryA(full.c_str());
+}
+
+// Resolve dllName against the PATH entries EXPLICITLY. LoadLibrary's
+// own search would consult the working directory (planting vector) and
+// LOAD_LIBRARY_SEARCH_DEFAULT_DIRS never consults PATH at all — this
+// walk gives the documented "or the system PATH" behaviour without
+// either problem.
+HMODULE load_from_path_env(const char* dllName) {
+    const char* path = std::getenv("PATH");
+    if (!path) return NULL;
+    const char* p = path;
+    for (;;) {
+        const char* sep = std::strchr(p, ';');
+        size_t len = sep ? (size_t)(sep - p) : std::strlen(p);
+        if (len > 0 && len < MAX_PATH) {
+            std::string full(p, len);
+            if (full.back() != '\\' && full.back() != '/') full += '\\';
+            full += dllName;
+            DWORD attrs = GetFileAttributesA(full.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES &&
+                !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+                HMODULE h = load_absolute(full);
+                if (h) return h;
+            }
+        }
+        if (!sep) break;
+        p = sep + 1;
+    }
+    return NULL;
+}
+
 HMODULE try_load_one(const std::string& dir, const char* dllName) {
     if (!dir.empty()) {
         std::string full = dir;
         if (full.back() != '\\' && full.back() != '/') full += '\\';
         full += dllName;
-        // LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR makes Windows resolve THIS
-        // DLL's dependencies (e.g. avcodec → avutil) by looking in
-        // the DLL's own directory first. Without this flag, plain
-        // LoadLibraryA would search the EXE's directory + System32
-        // for avutil, miss it, and fail. The application directory
-        // search is also enabled so any system-installed deps still
-        // resolve.
-        HMODULE h = LoadLibraryExA(full.c_str(), NULL,
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
-            LOAD_LIBRARY_SEARCH_APPLICATION_DIR |
-            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
-        if (h) return h;
-        // Fallback for older Windows that doesn't honour the flags.
-        h = LoadLibraryA(full.c_str());
-        if (h) return h;
+        // Canonicalize: the LOAD_LIBRARY_SEARCH flags reject relative
+        // paths, and a relative fallback would resolve against the
+        // working directory. A configured dir must mean ONE directory,
+        // wherever the process happens to be cwd'd.
+        char abs[MAX_PATH] = {0};
+        DWORD n = GetFullPathNameA(full.c_str(), sizeof(abs), abs, NULL);
+        if (n == 0 || n >= sizeof(abs)) return NULL;
+        return load_absolute(abs);
     }
-    // No dir hint — pure PATH search.
-    return LoadLibraryExA(dllName, NULL,
+    // No dir hint: default search dirs (application dir, System32,
+    // AddDllDirectory entries) first, then an explicit PATH walk.
+    HMODULE h = LoadLibraryExA(dllName, NULL,
         LOAD_LIBRARY_SEARCH_DEFAULT_DIRS | LOAD_LIBRARY_SEARCH_USER_DIRS);
+    if (h) return h;
+    return load_from_path_env(dllName);
 }
 
 HMODULE try_load(const std::string& dir, const char* const* candidates) {
@@ -180,6 +220,46 @@ bool do_init(const char* user_dir) {
         return false;
     }
 
+    // --- avformat remux group (MediaMixer) — OPTIONAL. Decode paths
+    // never depend on these; remux_ok gates openjfx_ffmpeg_remux. ---
+    if (g_fns.hAvformat) {
+        bool rok = true;
+        rok &= resolve(g_fns.hAvformat, "avformat_open_input",            g_fns.avformat_open_input);
+        rok &= resolve(g_fns.hAvformat, "avformat_close_input",           g_fns.avformat_close_input);
+        rok &= resolve(g_fns.hAvformat, "avformat_find_stream_info",      g_fns.avformat_find_stream_info);
+        rok &= resolve(g_fns.hAvformat, "avformat_alloc_output_context2", g_fns.avformat_alloc_output_context2);
+        rok &= resolve(g_fns.hAvformat, "avformat_free_context",          g_fns.avformat_free_context);
+        rok &= resolve(g_fns.hAvformat, "avformat_new_stream",            g_fns.avformat_new_stream);
+        rok &= resolve(g_fns.hAvformat, "avformat_write_header",          g_fns.avformat_write_header);
+        rok &= resolve(g_fns.hAvformat, "av_write_trailer",               g_fns.av_write_trailer);
+        rok &= resolve(g_fns.hAvformat, "av_read_frame",                  g_fns.av_read_frame);
+        rok &= resolve(g_fns.hAvformat, "av_interleaved_write_frame",     g_fns.av_interleaved_write_frame);
+        rok &= resolve(g_fns.hAvformat, "avio_open",                      g_fns.avio_open);
+        rok &= resolve(g_fns.hAvformat, "avio_closep",                    g_fns.avio_closep);
+        rok &= resolve(g_fns.hAvcodec,  "avcodec_parameters_copy",        g_fns.avcodec_parameters_copy);
+        rok &= resolve(g_fns.hAvcodec,  "av_packet_rescale_ts",           g_fns.av_packet_rescale_ts);
+        rok &= resolve(g_fns.hAvutil,   "av_strerror",                    g_fns.av_strerror);
+        g_fns.remux_ok = rok ? 1 : 0;
+    }
+
+    // --- avformat demux group (ffmpegdemux catch-all) — OPTIONAL.
+    // Decode / remux paths never depend on these; demux_ok gates the
+    // ffmpegdemux GStreamer element. Resolved separately so a build with
+    // an older avformat that lacks one of these still does decode+remux. ---
+    if (g_fns.hAvformat) {
+        bool dok = true;
+        dok &= resolve(g_fns.hAvformat, "avformat_alloc_context", g_fns.avformat_alloc_context);
+        dok &= resolve(g_fns.hAvformat, "avio_alloc_context",     g_fns.avio_alloc_context);
+        dok &= resolve(g_fns.hAvformat, "avio_context_free",      g_fns.avio_context_free);
+        dok &= resolve(g_fns.hAvformat, "av_seek_frame",          g_fns.av_seek_frame);
+        dok &= resolve(g_fns.hAvformat, "avformat_seek_file",     g_fns.avformat_seek_file);
+        dok &= resolve(g_fns.hAvutil,   "av_freep",               g_fns.av_freep);
+        // av_read_frame / avformat_open_input / _close_input /
+        // _find_stream_info come from the remux group above; the element
+        // needs them too, so demux is usable only when both resolved.
+        g_fns.demux_ok = (dok && g_fns.remux_ok) ? 1 : 0;
+    }
+
     // Optional: query version symbols if present (best effort).
     typedef unsigned int (*VerFn)(void);
     auto codecVer = (VerFn)GetProcAddress(g_fns.hAvcodec, "avcodec_version");
@@ -193,6 +273,59 @@ bool do_init(const char* user_dir) {
         unsigned v = utilVer();
         g_fns.avutil_version_major = (v >> 16) & 0xff;
         g_fns.avutil_version_minor = (v >>  8) & 0xff;
+    }
+    unsigned avformatMajor = 0;
+    if (g_fns.hAvformat) {
+        auto fmtVer = (VerFn)GetProcAddress(g_fns.hAvformat, "avformat_version");
+        if (fmtVer) avformatMajor = (fmtVer() >> 16) & 0xff;
+    }
+
+    // ABI guard: the wrapper passes AVFrame/AVCodecContext structs
+    // across this boundary, so the loaded avcodec MAJOR must match the
+    // headers we compiled against. A drifted runtime doesn't fail
+    // loudly — deep struct fields silently read garbage (observed:
+    // AVFrame.ch_layout as 0 → mono audio packing → audio playing
+    // double-speed in chunks). Refusing the load degrades cleanly to
+    // "ffmpeg unavailable": mp4/AAC/H.264, mp3 and wav keep playing on
+    // the platform decoders; only ffmpeg-dependent codecs are lost.
+    if (g_fns.avcodec_version_major != 0 &&
+        g_fns.avcodec_version_major != (LIBAVCODEC_VERSION_MAJOR)) {
+        set_status("ffmpeg ABI mismatch: found avcodec %d.%d but this build "
+            "expects avcodec %d (ffmpeg %s) — refusing to load it. Point "
+            "Media.setFfmpegDirectory()/OPENJFX_MEDIA_FFMPEG_DIR at a "
+            "matching ffmpeg, or remove the stale one. webm/mkv "
+            "(Opus/Vorbis/VP9) and other ffmpeg-decoded formats are "
+            "disabled until then; mp4/AAC/H.264, mp3 and wav still play.",
+            g_fns.avcodec_version_major, g_fns.avcodec_version_minor,
+            (int)LIBAVCODEC_VERSION_MAJOR,
+            "matching the bundled headers");
+        rollback();
+        return false;
+    }
+    // The other two libs cross structs over this boundary too: AVFrame /
+    // AVChannelLayout live in avutil's ABI, AVFormatContext / AVStream in
+    // avformat's (the remux engine reads them directly). A PATH that
+    // mixes DLLs from different ffmpeg builds can pass the avcodec check
+    // and still skew these — validate all three majors.
+    if (g_fns.avutil_version_major != 0 &&
+        g_fns.avutil_version_major != (LIBAVUTIL_VERSION_MAJOR)) {
+        set_status("ffmpeg ABI mismatch: found avutil %d.%d but this build "
+            "expects avutil %d — the DLLs in the configured directory/PATH "
+            "mix ffmpeg builds. Refusing to load; provide one consistent "
+            "ffmpeg via Media.setFfmpegDirectory()/OPENJFX_MEDIA_FFMPEG_DIR.",
+            g_fns.avutil_version_major, g_fns.avutil_version_minor,
+            (int)LIBAVUTIL_VERSION_MAJOR);
+        rollback();
+        return false;
+    }
+    if (avformatMajor != 0 && avformatMajor != (LIBAVFORMAT_VERSION_MAJOR)) {
+        // avformat is optional (decode works without it) — but a DRIFTED
+        // avformat must not be used: disable the remux group instead of
+        // failing the whole load.
+        g_fns.remux_ok = 0;
+        std::fprintf(stderr, "[ffmpeg.loader] avformat %u does not match the "
+            "expected major %d - media mixing disabled (decode unaffected)\n",
+            avformatMajor, (int)LIBAVFORMAT_VERSION_MAJOR);
     }
 
     set_status("ffmpeg loaded from '%s' (avcodec %d.%d, avutil %d.%d)",
@@ -208,7 +341,14 @@ bool do_init(const char* user_dir) {
 extern "C" OPENJFX_FFMPEG_EXPORT bool
 openjfx_ffmpeg_loader_init(const char* user_dir) {
     std::lock_guard<std::mutex> lock(g_initMutex);
-    if (g_initTried.load()) return g_ready.load();
+    if (g_initTried.load()) {
+        // Success latches. A FAILED attempt is retryable when the caller
+        // provides an explicit directory (Media.setFfmpegDirectory after
+        // the first failure — the failure message tells users to do
+        // exactly that); do_init's rollback left no loaded DLLs behind.
+        if (g_ready.load() || user_dir == nullptr || *user_dir == '\0')
+            return g_ready.load();
+    }
     g_initTried.store(true);
     bool ok = do_init(user_dir);
     g_ready.store(ok);

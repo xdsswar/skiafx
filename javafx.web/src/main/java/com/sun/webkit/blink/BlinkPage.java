@@ -674,7 +674,9 @@ public final class BlinkPage {
         // stretch to the FRAME's own logical size, not the node's current size:
         // the engine may have downscaled the capture to fit a shared-memory slot
         // (large/HiDPI pages), and stretching to its captured DIP size undoes that
-        // without distortion AND keeps the whole page visible.
+        // without distortion AND keeps the whole page visible. (Stretching a
+        // stale frame to the node's size during a resize was tried and
+        // rejected — frames must never be distorted.)
         if (f != null) {
             int lw = f.logicalW() > 0 ? (int) Math.round(f.logicalW()) : dstLogicalW;
             int lh = f.logicalH() > 0 ? (int) Math.round(f.logicalH()) : dstLogicalH;

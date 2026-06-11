@@ -86,10 +86,22 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
         throw new MediaException(message, null, me);
     }
 
+    /**
+     * skia-fx: dispose() races events already queued on the FX thread
+     * (volume sync, duration queries from READY handling) — every
+     * player method must snapshot {@code gstMedia} and go inert when it
+     * is gone instead of throwing NullPointerException on the FX thread.
+     */
+    private GSTMedia mediaOrNull() {
+        return gstMedia;
+    }
+
     @Override
     protected long playerGetAudioSyncDelay() throws MediaException {
+        GSTMedia media = mediaOrNull();
+        if (media == null) return 0;
         long[] audioSyncDelay = new long[1];
-        int rc = gstGetAudioSyncDelay(gstMedia.getNativeMediaRef(), audioSyncDelay);
+        int rc = gstGetAudioSyncDelay(media.getNativeMediaRef(), audioSyncDelay);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -98,7 +110,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerSetAudioSyncDelay(long delay) throws MediaException {
-        int rc = gstSetAudioSyncDelay(gstMedia.getNativeMediaRef(), delay);
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstSetAudioSyncDelay(media.getNativeMediaRef(), delay);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -106,7 +120,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerPlay() throws MediaException {
-        int rc = gstPlay(gstMedia.getNativeMediaRef());
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstPlay(media.getNativeMediaRef());
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -114,7 +130,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerStop() throws MediaException {
-        int rc = gstStop(gstMedia.getNativeMediaRef());
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstStop(media.getNativeMediaRef());
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -122,7 +140,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerPause() throws MediaException {
-        int rc = gstPause(gstMedia.getNativeMediaRef());
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstPause(media.getNativeMediaRef());
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -130,7 +150,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerFinish() throws MediaException {
-        int rc = gstFinish(gstMedia.getNativeMediaRef());
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstFinish(media.getNativeMediaRef());
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -138,8 +160,10 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected float playerGetRate() throws MediaException {
+        GSTMedia media = mediaOrNull();
+        if (media == null) return 1.0f;
         float[] rate = new float[1];
-        int rc = gstGetRate(gstMedia.getNativeMediaRef(), rate);
+        int rc = gstGetRate(media.getNativeMediaRef(), rate);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -148,7 +172,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerSetRate(float rate) throws MediaException {
-        int rc = gstSetRate(gstMedia.getNativeMediaRef(), rate);
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstSetRate(media.getNativeMediaRef(), rate);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -156,8 +182,10 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected double playerGetPresentationTime() throws MediaException {
+        GSTMedia media = mediaOrNull();
+        if (media == null) return 0.0;
         double[] presentationTime = new double[1];
-        int rc = gstGetPresentationTime(gstMedia.getNativeMediaRef(), presentationTime);
+        int rc = gstGetPresentationTime(media.getNativeMediaRef(), presentationTime);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -205,8 +233,10 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
             if (muteEnabled)
                 return mutedVolume;
         }
+        GSTMedia media = mediaOrNull();
+        if (media == null) return 0.0f;
         float[] volume = new float[1];
-        int rc = gstGetVolume(gstMedia.getNativeMediaRef(), volume);
+        int rc = gstGetVolume(media.getNativeMediaRef(), volume);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -216,7 +246,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
     @Override
     protected synchronized void playerSetVolume(float volume) throws MediaException {
         if (!muteEnabled) {
-            int rc = gstSetVolume(gstMedia.getNativeMediaRef(), volume);
+            GSTMedia media = mediaOrNull();
+            if (media == null) return;
+            int rc = gstSetVolume(media.getNativeMediaRef(), volume);
             if (0 != rc) {
                 throwMediaErrorException(rc, null);
             } else {
@@ -229,8 +261,10 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected float playerGetBalance() throws MediaException {
+        GSTMedia media = mediaOrNull();
+        if (media == null) return 0.0f;
         float[] balance = new float[1];
-        int rc = gstGetBalance(gstMedia.getNativeMediaRef(), balance);
+        int rc = gstGetBalance(media.getNativeMediaRef(), balance);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -239,7 +273,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerSetBalance(float balance) throws MediaException {
-        int rc = gstSetBalance(gstMedia.getNativeMediaRef(), balance);
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstSetBalance(media.getNativeMediaRef(), balance);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -247,8 +283,10 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected double playerGetDuration() throws MediaException {
+        GSTMedia media = mediaOrNull();
+        if (media == null) return Double.POSITIVE_INFINITY;
         double[] duration = new double[1];
-        int rc = gstGetDuration(gstMedia.getNativeMediaRef(), duration);
+        int rc = gstGetDuration(media.getNativeMediaRef(), duration);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }
@@ -261,7 +299,9 @@ final class GSTMediaPlayer extends NativeMediaPlayer {
 
     @Override
     protected void playerSeek(double streamTime) throws MediaException {
-        int rc = gstSeek(gstMedia.getNativeMediaRef(), streamTime);
+        GSTMedia media = mediaOrNull();
+        if (media == null) return;
+        int rc = gstSeek(media.getNativeMediaRef(), streamTime);
         if (0 != rc) {
             throwMediaErrorException(rc, null);
         }

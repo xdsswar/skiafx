@@ -33,6 +33,33 @@ public final class SkiaGpu {
         return cached != null ? cached : probe();
     }
 
+    /**
+     * True only if the process has <em>already</em> resolved to the
+     * software-raster fallback. Reads the cached probe result with no
+     * side effects: it never triggers {@link #probe()} and so never
+     * issues a native GPU surface call. Safe to call from any thread —
+     * including the FX/toolkit thread, where forcing a probe (a
+     * render-thread operation) would be incorrect.
+     *
+     * <p>Returns {@code true} once {@code -Dprism.skia.gpu=false} has been
+     * observed, or once the render thread has run a failing probe; returns
+     * {@code false} while the decision is still pending or GPU is enabled.</p>
+     */
+    public static boolean isResolvedSoftware() {
+        return Boolean.FALSE.equals(enabled);
+    }
+
+    /**
+     * True only if the process has already resolved to GPU-backed
+     * surfaces. Side-effect-free counterpart to {@link #isResolvedSoftware()}
+     * (never triggers {@link #probe()}); lets callers cheaply short-circuit
+     * the GPU steady state with a single volatile read. The resolved GPU
+     * state never flips back to software for the lifetime of the process.
+     */
+    public static boolean isResolvedGpu() {
+        return Boolean.TRUE.equals(enabled);
+    }
+
     private static synchronized boolean probe() {
         Boolean cached = enabled;
         if (cached != null) return cached;

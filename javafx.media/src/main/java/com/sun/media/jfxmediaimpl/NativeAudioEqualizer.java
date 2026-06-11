@@ -66,9 +66,18 @@ final class NativeAudioEqualizer implements AudioEqualizer {
 
     @Override
     public EqualizerBand addBand(double centerFrequency, double bandwidth, double gain) {
-        return (nativeGetNumBands(nativeRef) >= MAX_NUM_BANDS &&
-                gain >= EqualizerBand.MIN_GAIN && gain <= EqualizerBand.MAX_GAIN) ?
-                null : nativeAddBand(nativeRef, centerFrequency, bandwidth, gain);
+        // skia-fx: upstream's condition was inverted — it returned null
+        // only when the equalizer was full AND the gain was in range, and
+        // happily added bands with out-of-range gain (GLib then warns and
+        // clamps on the property set). Enforce the documented band cap,
+        // and CLAMP the gain to the native property range instead of
+        // rejecting — a null here NPEs the public AudioEqualizer path.
+        if (nativeGetNumBands(nativeRef) >= MAX_NUM_BANDS) {
+            return null;
+        }
+        double clampedGain = Math.max(EqualizerBand.MIN_GAIN,
+                             Math.min(EqualizerBand.MAX_GAIN, gain));
+        return nativeAddBand(nativeRef, centerFrequency, bandwidth, clampedGain);
     }
 
     @Override

@@ -73,6 +73,18 @@ public class MediaUtils {
     // matroskademux; webm is matroska with a constrained codec set.
     public static final String CONTENT_TYPE_MATROSKA = "video/x-matroska";
     public static final String CONTENT_TYPE_WEBM     = "video/webm";
+    // skia-fx: raw ADTS AAC stream (no container). Routed through
+    // aacparse + the platform audio decoder on the native side.
+    public static final String CONTENT_TYPE_AAC      = "audio/aac";
+    // skia-fx format expansion: raw FLAC (flacparse + ffmpeg decode)
+    // and AVI (avidemux). FLV reuses the legacy CONTENT_TYPE_FLV
+    // constant, now routed to the real flvdemux on the native side.
+    public static final String CONTENT_TYPE_FLAC     = "audio/flac";
+    public static final String CONTENT_TYPE_AVI      = "video/x-msvideo";
+    // skia-fx catch-all: any container ffmpeg's libavformat can open.
+    // Assigned only when the ffmpeg runtime is loaded; the dedicated
+    // demuxers above stay preferred for known signatures (hybrid).
+    public static final String CONTENT_TYPE_FFMPEG   = "application/x-ffmpeg";
     private static final String FILE_TYPE_AIF = "aif";
     private static final String FILE_TYPE_AIFF = "aiff";
     private static final String FILE_TYPE_FLV = "flv";
@@ -89,6 +101,12 @@ public class MediaUtils {
     private static final String FILE_TYPE_MKA  = "mka";
     private static final String FILE_TYPE_MKS  = "mks";
     private static final String FILE_TYPE_WEBM = "webm";
+    // skia-fx: webm audio-only (YouTube "weba") + raw ADTS AAC
+    private static final String FILE_TYPE_WEBA = "weba";
+    private static final String FILE_TYPE_AAC  = "aac";
+    // skia-fx: format expansion
+    private static final String FILE_TYPE_FLAC = "flac";
+    private static final String FILE_TYPE_AVI  = "avi";
 
     /**
      * Attempt to determine the content type from the file signature.
@@ -107,7 +125,24 @@ public class MediaUtils {
         } else if ((buf[0] & 0xff) == 0x46
                 && (buf[1] & 0xff) == 0x4c
                 && (buf[2] & 0xff) == 0x56) { // "FLV"
-            contentType = CONTENT_TYPE_JFX;
+            // skia-fx: routed to the real flvdemux (the legacy
+            // video/x-javafx mapping pointed at a codec path that no
+            // longer exists; GSTPlatform never accepted it).
+            contentType = CONTENT_TYPE_FLV;
+        } else if ((buf[0] & 0xff) == 0x66
+                && (buf[1] & 0xff) == 0x4c
+                && (buf[2] & 0xff) == 0x61
+                && (buf[3] & 0xff) == 0x43) { // "fLaC"
+            contentType = CONTENT_TYPE_FLAC;
+        } else if ((((buf[0] & 0xff) << 24)
+                | ((buf[1] & 0xff) << 16)
+                | ((buf[2] & 0xff) << 8)
+                | (buf[3] & 0xff)) == 0x52494646 && // "RIFF"
+                (((buf[8] & 0xff) << 24)
+                | ((buf[9] & 0xff) << 16)
+                | ((buf[10] & 0xff) << 8)
+                | (buf[11] & 0xff)) == 0x41564920) { // "AVI "
+            contentType = CONTENT_TYPE_AVI;
         } else if ((((buf[0] & 0xff) << 24)
                 | ((buf[1] & 0xff) << 16)
                 | ((buf[2] & 0xff) << 8)
@@ -162,6 +197,25 @@ public class MediaUtils {
                 (buf[1] & 0x18) != 0x08 && // not reserved version
                 (buf[1] & 0x06) != 0x00) { // not reserved layer
             contentType = CONTENT_TYPE_MPA;
+        // skia-fx: ADTS AAC header - 12-bit sync (FFF) with layer == 00.
+        // AAAAAAAA AAAABCCD ...
+        // A - sync (all set), B - MPEG version (either), C - layer
+        // (always 00 for ADTS — which is exactly what the MP3 check
+        // above excludes, so the two patterns never overlap),
+        // D - protection absent flag (either).
+        // Sync+layer alone is only 14 bits — too loose for a sniffer
+        // that gates ALL media loading (a random stream starting FFFx
+        // would be committed to the AAC pipeline instead of falling
+        // back to extension/Content-Type). Also require the header's
+        // internal invariants: sampling_frequency_index != 15
+        // (forbidden value) and frame_length >= 7 (an ADTS frame can
+        // never be shorter than its own header).
+        } else if ((buf[0] & 0xff) == 0xff && (buf[1] & 0xf0) == 0xf0 &&
+                (buf[1] & 0x06) == 0x00 && // layer == 00 → ADTS
+                ((buf[2] >> 2) & 0x0f) != 0x0f && // valid sampling freq index
+                (((buf[3] & 0x03) << 11) | ((buf[4] & 0xff) << 3)
+                    | ((buf[5] >> 5) & 0x07)) >= 7) { // sane frame length
+            contentType = CONTENT_TYPE_AAC;
         } else if ((((buf[4] & 0xff) << 24)
                 | ((buf[5] & 0xff) << 16)
                 | ((buf[6] & 0xff) << 8)
@@ -210,11 +264,30 @@ public class MediaUtils {
             // bytes; the DocType often falls within that, but not always.
             // When not found, default to matroska (it's the superset).
             contentType = matroskaDocTypeFromSignature(buf, size);
+        } else if (isFfmpegDemuxAvailable()) {
+            // skia-fx catch-all: hand any other container to libavformat
+            // (ffmpegdemux) when the ffmpeg runtime is loaded. Every known
+            // signature above keeps its dedicated demuxer — this is the
+            // last resort for formats with no gst demuxer (hybrid).
+            contentType = CONTENT_TYPE_FFMPEG;
         } else {
             throw new MediaException("Unrecognized file signature!");
         }
 
         return contentType;
+    }
+
+    /**
+     * True when the ffmpeg runtime is loaded, so an unrecognized container
+     * can be routed to the libavformat catch-all demuxer on the native
+     * side. The result is cached by {@code MediaFfmpegConfig}; never throws.
+     */
+    private static boolean isFfmpegDemuxAvailable() {
+        try {
+            return MediaFfmpegConfig.initialize(null);
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     /**
@@ -284,7 +357,9 @@ public class MediaUtils {
                     return CONTENT_TYPE_AIFF;
                 case FILE_TYPE_FLV:
                 case FILE_TYPE_FXM:
-                    return CONTENT_TYPE_JFX;
+                    // skia-fx: .fxm is an FLV container — both route to
+                    // flvdemux now.
+                    return CONTENT_TYPE_FLV;
                 case FILE_TYPE_MPA:
                     return CONTENT_TYPE_MPA;
                 case FILE_TYPE_WAV:
@@ -304,7 +379,14 @@ public class MediaUtils {
                 case FILE_TYPE_MKS:
                     return CONTENT_TYPE_MATROSKA;
                 case FILE_TYPE_WEBM:
+                case FILE_TYPE_WEBA:
                     return CONTENT_TYPE_WEBM;
+                case FILE_TYPE_AAC:
+                    return CONTENT_TYPE_AAC;
+                case FILE_TYPE_FLAC:
+                    return CONTENT_TYPE_FLAC;
+                case FILE_TYPE_AVI:
+                    return CONTENT_TYPE_AVI;
                 default:
                     break;
             }

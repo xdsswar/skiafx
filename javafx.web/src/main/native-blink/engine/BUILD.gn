@@ -188,6 +188,13 @@ shared_library("jux_engine") {
     "//content/public/utility",
     "//media",
     "//net",
+
+    # skia-fx: viz-driven main-frame capture (JuxVideoConsumer in
+    # jux_engine_api.cc) — ClientFrameSinkVideoCapturer + VideoCaptureTarget
+    # + the FrameSinkVideoConsumer mojom.
+    "//components/viz/common",
+    "//components/viz/host",
+    "//services/viz/privileged/mojom/compositing",
     "//sandbox",
     "//services/network:network_service",
     "//third_party/blink/public:blink",

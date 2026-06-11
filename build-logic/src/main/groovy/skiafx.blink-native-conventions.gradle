@@ -1200,10 +1200,24 @@ def generateChecksums = tasks.register('generateChecksums') {
     }
 }
 
-// Pack engine artifacts + manifest at the jar root (NativeLibLoader extracts).
-tasks.withType(Jar).configureEach {
+// The engine runtime bundle ships INSIDE the module jar — ONE artifact per
+// module, with the host triple in its name since the contents are
+// platform-specific. A Windows host build produces:
+//
+//   javafx.web-<version>-win-x64.jar  (classes + module-info
+//                                       + Blink runtime bundle
+//                                       + checksums.properties)
+//
+// (Reverted from the earlier two-jar split — a separate natives-only
+// classifier jar — by request: one jar per module, binaries included.)
+// Everything sits at the jar root where BlinkBundle /
+// com.sun.glass.utils.NativeLibLoader extract it; with the bundle in the
+// SAME jar as the loading classes this works on both the classpath and the
+// JPMS module path. Each host builds only its own platform jar.
+tasks.named('jar', Jar) {
     dependsOn generateChecksums
-    from(distDir)  // pack the whole staged runtime bundle at the jar root
+    archiveClassifier.set("${hostPlatform}-${hostArch}")
+    from(distDir)  // the whole staged runtime bundle, at the jar root
     from(checksumsDir) { include 'checksums.properties' }
 }
 
@@ -1230,7 +1244,8 @@ if (!buildWebNative) {
 tasks.named('buildNatives').configure { dependsOn 'configureBuild'; mustRunAfter 'configureBuild' }
 copyNativeEngine.configure { mustRunAfter 'buildNatives' }
 tasks.named('assemble').configure { dependsOn buildNatives, copyNativeEngine }
-tasks.withType(Jar).configureEach { dependsOn copyNativeEngine }
+// The module jar packs the staged engine bundle — make sure it's current.
+tasks.named('jar').configure { dependsOn copyNativeEngine }
 generateChecksums.configure { dependsOn copyNativeEngine }
 
 logger.lifecycle "[skia-fx] javafx.web Blink engine build wired " +

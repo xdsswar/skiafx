@@ -23,6 +23,7 @@
 
 #ifdef _WIN32
 typedef bool (*OpenJfxFfmpegLoaderInitFn)(const char*);
+typedef const char* (*OpenJfxFfmpegLoaderStatusFn)(void);
 
 // Resolve the loader entry point from fxplugins.dll. Application.init()
 // runs BEFORE GStreamer loads fxplugins as a plugin (that happens at
@@ -61,6 +62,19 @@ static OpenJfxFfmpegLoaderInitFn resolve_loader_init() {
         GetProcAddress(mod, "openjfx_ffmpeg_loader_init");
     return cached;
 }
+
+// Status string resolver — only meaningful after an init attempt, so a
+// missing module just reports null (Java surfaces "never attempted").
+static OpenJfxFfmpegLoaderStatusFn resolve_loader_status() {
+    static OpenJfxFfmpegLoaderStatusFn cached = nullptr;
+    if (cached) return cached;
+    HMODULE mod = GetModuleHandleA("fxplugins.dll");
+    if (!mod) mod = GetModuleHandleA("fxplugins");
+    if (!mod) return nullptr;
+    cached = (OpenJfxFfmpegLoaderStatusFn)
+        GetProcAddress(mod, "openjfx_ffmpeg_loader_status");
+    return cached;
+}
 #endif
 
 extern "C" {
@@ -84,6 +98,24 @@ Java_com_sun_media_jfxmediaimpl_MediaFfmpegConfig_nativeInit(
 #else
     (void)env; (void)jUserDir;
     return JNI_FALSE;
+#endif
+}
+
+// Human-readable loader status (why ffmpeg did or didn't load), or null
+// when no init has been attempted / no ffmpeg-enabled build.
+JNIEXPORT jstring JNICALL
+Java_com_sun_media_jfxmediaimpl_MediaFfmpegConfig_nativeGetStatus(
+    JNIEnv* env, jclass cls)
+{
+    (void)cls;
+#ifdef _WIN32
+    OpenJfxFfmpegLoaderStatusFn statusFn = resolve_loader_status();
+    if (!statusFn) return nullptr;
+    const char* s = statusFn();
+    return s ? env->NewStringUTF(s) : nullptr;
+#else
+    (void)env;
+    return nullptr;
 #endif
 }
 

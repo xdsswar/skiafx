@@ -169,6 +169,47 @@ public final class DualStreamPlayer extends Application {
         stage.setMinHeight(540);
         stage.setOnHidden(e -> disposePlayer());
         stage.show();
+
+        prefillFromProperties();
+    }
+
+    /**
+     * Optional source prefill for scripted runs:
+     * {@code -Ddual.video=<url> -Ddual.audio=<url>} fills the fields and
+     * auto-loads the pair; {@code -Ddual.urlfile=<path>} reads the first
+     * URL line as the video source and the second as the audio source
+     * (non-URL lines are ignored). Explicit dual.video/dual.audio win
+     * over the file.
+     */
+    private void prefillFromProperties() {
+        String video = System.getProperty("dual.video");
+        String audio = System.getProperty("dual.audio");
+
+        String urlFile = System.getProperty("dual.urlfile");
+        if ((video == null || audio == null) && urlFile != null && !urlFile.isBlank()) {
+            try {
+                java.util.List<String> urls =
+                    java.nio.file.Files.readAllLines(java.nio.file.Path.of(urlFile))
+                        .stream()
+                        .map(String::trim)
+                        .filter(l -> l.startsWith("http://") || l.startsWith("https://")
+                                  || l.startsWith("file:"))
+                        .toList();
+                if (video == null && urls.size() >= 1) video = urls.get(0);
+                if (audio == null && urls.size() >= 2) audio = urls.get(1);
+            } catch (Exception e) {
+                System.err.println("[dual.player] could not read -Ddual.urlfile="
+                    + urlFile + ": " + e);
+            }
+        }
+
+        if (video != null && !video.isBlank()) {
+            videoSourceField.setText(video.trim());
+            if (audio != null && !audio.isBlank()) {
+                audioSourceField.setText(audio.trim());
+            }
+            Platform.runLater(this::loadSources);
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -290,13 +331,25 @@ public final class DualStreamPlayer extends Application {
     }
 
     private void reportLoadFailure(Throwable t) {
-        String msg = t.getMessage();
-        if (msg == null || msg.isBlank()) msg = t.getClass().getSimpleName();
-        errorLabel.setText("Couldn't open: " + msg);
-        statusLabel.setText("");
+        String raw = t.getMessage();
+        final String msg = (raw == null || raw.isBlank())
+            ? t.getClass().getSimpleName() : raw;
         t.printStackTrace(System.err);
-        welcome.setVisible(true);
-        setTransportEnabled(false);
+        // The media error listener fires on a non-FX thread; all UI
+        // mutation must hop to the FX thread. runLater from the FX thread
+        // (the load path) just defers harmlessly.
+        runOnFx(() -> {
+            errorLabel.setText("Couldn't open: " + msg);
+            statusLabel.setText("");
+            welcome.setVisible(true);
+            setTransportEnabled(false);
+        });
+    }
+
+    /** Run on the FX thread, whether the caller is on it or not. */
+    private static void runOnFx(Runnable r) {
+        if (Platform.isFxApplicationThread()) r.run();
+        else Platform.runLater(r);
     }
 
     private void disposePlayer() {
@@ -354,14 +407,169 @@ public final class DualStreamPlayer extends Application {
             }
             updateTimeLabel(player.getCurrentTime(), total);
             player.play();
+            runSeekScriptIfRequested();
         });
+    }
+
+    /**
+     * Opt-in headless seek exercise for the hardened seekTo() path:
+     * {@code -Ddual.seektest=true} fires a sequence of seeks once playback
+     * starts — mid-stream jumps plus the edge cases (negative, past-end,
+     * rapid duplicate) — logging the landed position after each so a dual-
+     * source seek that wedges or desyncs shows up in the run output.
+     */
+    private boolean seekScriptDone = false;
+    private void runSeekScriptIfRequested() {
+        if (seekScriptDone || !Boolean.getBoolean("dual.seektest")) return;
+        seekScriptDone = true;
+        Thread t = new Thread(() -> {
+            try {
+                MediaPlayer p = player;
+                if (p == null) return;
+                Duration dur = p.getMedia().getDuration();
+                double max = (dur != null && !dur.isUnknown() && !dur.isIndefinite())
+                    ? dur.toMillis() : 60000.0;
+                double[] targets = {
+                    max * 0.25, max * 0.50, max * 0.10,
+                    -3000.0,            // clamps to 0
+                    max + 10000.0,      // clamps to end
+                    max * 0.40, max * 0.40 // rapid duplicate → second de-duped
+                };
+                for (double tgt : targets) {
+                    Thread.sleep(2500);
+                    runOnFx(() -> seekTo(tgt));
+                    Thread.sleep(600);
+                    runOnFx(() -> System.err.println("[dual.seektest] requested="
+                        + (long) tgt + "ms landed=" + player.getCurrentTime()
+                        + " status=" + player.getStatus()));
+                }
+                runOnFx(() -> System.err.println("[dual.seektest] DONE — no wedge/crash"));
+
+                // Stress phase: many rapid back/forward seeks. The player must
+                // stay alive and keep playing in sync afterwards (the bar for
+                // "stable"). -Ddual.stresstest=true (implied by seektest) or
+                // standalone.
+                if (Boolean.getBoolean("dual.stresstest")
+                        || Boolean.getBoolean("dual.seektest")) {
+                    runStressSeeks(p, max);
+                }
+            } catch (InterruptedException ignored) {
+            } catch (Throwable ex) {
+                ex.printStackTrace(System.err);
+            }
+        }, "dual-seektest");
+        t.setDaemon(true);
+        t.start();
+    }
+
+    /**
+     * Hammer the seek path: alternating back/forward jumps at a fast cadence
+     * (faster than the native debounce window for part of it, to exercise
+     * coalescing), then settle and confirm playback resumes in sync. Any
+     * wedge/crash/permanent freeze fails the "stress back/forward" bar.
+     */
+    private void runStressSeeks(MediaPlayer p, double max) throws InterruptedException {
+        runOnFx(() -> System.err.println("[dual.stress] begin"));
+        java.util.Random rnd = new java.util.Random(12345);
+        // Burst 1: 40 rapid alternating seeks ~120ms apart (sub-debounce →
+        // coalescer should collapse most), random positions.
+        for (int i = 0; i < 40; i++) {
+            double tgt = max * (0.05 + 0.9 * rnd.nextDouble());
+            runOnFx(() -> seekTo(tgt));
+            Thread.sleep(120);
+        }
+        Thread.sleep(3000);
+        runOnFx(() -> System.err.println("[dual.stress] after burst1 status="
+            + p.getStatus() + " t=" + p.getCurrentTime()));
+        // Burst 2: 20 back/forward seeks ~400ms apart (each fires past the
+        // debounce → real seeks).
+        for (int i = 0; i < 20; i++) {
+            double tgt = (i % 2 == 0) ? max * 0.15 : max * 0.80;
+            runOnFx(() -> seekTo(tgt));
+            Thread.sleep(400);
+        }
+        Thread.sleep(4000);
+        runOnFx(() -> System.err.println("[dual.stress] DONE status="
+            + p.getStatus() + " t=" + p.getCurrentTime()));
+    }
+
+    /** Verbose position trace (≤1 line / 5 s, only with -Dskia.verbose=true). */
+    private long lastTraceMs = Long.MIN_VALUE;
+
+    // Seek de-duplication: a single slider gesture fires both
+    // mouseReleased and valueChanging→false with the same value; without
+    // this guard each scrub issues two redundant seeks back-to-back
+    // (extra flush/resync churn, worse on a dual-source pair).
+    private double lastSeekMillis   = Double.NaN;
+    private long   lastSeekAtNanos  = 0L;
+    private static final double SEEK_DEDUP_MS        = 200.0;
+    private static final long   SEEK_DEDUP_WINDOW_NS = 300_000_000L; // 300 ms
+
+    /**
+     * The single hardened entry point for every seek (slider + keyboard).
+     * Clamps the target to {@code [0, duration]}, refuses to seek when the
+     * player isn't in a seekable state, collapses the duplicate seek a
+     * drag gesture would otherwise emit, and never lets a seek failure
+     * escape as an uncaught exception.
+     */
+    private void seekTo(double millis) {
+        MediaPlayer p = player;
+        if (p == null) return;
+
+        MediaPlayer.Status s = p.getStatus();
+        if (s == null
+                || s == MediaPlayer.Status.DISPOSED
+                || s == MediaPlayer.Status.HALTED
+                || s == MediaPlayer.Status.UNKNOWN) {
+            return; // not seekable yet / anymore
+        }
+
+        double target = Math.max(0.0, millis);
+        Media media = p.getMedia();
+        Duration dur = (media != null) ? media.getDuration() : null;
+        if (dur != null && !dur.isUnknown() && !dur.isIndefinite()) {
+            double maxMs = dur.toMillis();
+            if (maxMs > 0.0) {
+                // Stay just shy of the end so a seek-to-end doesn't race
+                // straight into EOS before the frame shows.
+                target = Math.min(target, Math.max(0.0, maxMs - 100.0));
+            }
+        }
+
+        long now = System.nanoTime();
+        if (!Double.isNaN(lastSeekMillis)
+                && Math.abs(target - lastSeekMillis) < SEEK_DEDUP_MS
+                && (now - lastSeekAtNanos) < SEEK_DEDUP_WINDOW_NS) {
+            return; // duplicate from the same gesture
+        }
+        lastSeekMillis  = target;
+        lastSeekAtNanos = now;
+
+        final double tgt = target;
+        seekSlider.setValue(tgt);
+        try {
+            p.seek(Duration.millis(tgt));
+        } catch (Throwable t) {
+            String m = (t.getMessage() != null) ? t.getMessage()
+                : t.getClass().getSimpleName();
+            runOnFx(() -> errorLabel.setText("Seek failed: " + m));
+        }
     }
 
     private void wireSeekSlider() {
         seekSlider.setMin(0);
         seekSlider.setMax(1);
+        final boolean trace = Boolean.getBoolean("skia.verbose");
         currentTimeListener = (obs, oldV, newV) -> {
             if (newV == null) return;
+            if (trace) {
+                long now = System.currentTimeMillis();
+                if (now - lastTraceMs >= 5000) {
+                    lastTraceMs = now;
+                    System.err.println("[dual.player] position "
+                        + formatTime(newV) + " status=" + player.getStatus());
+                }
+            }
             if (!seekSlider.isValueChanging() && !seekSlider.isPressed()) {
                 seekSlider.setValue(newV.toMillis());
             }
@@ -375,13 +583,11 @@ public final class DualStreamPlayer extends Application {
                                 player.getMedia().getDuration());
             }
         });
-        seekSlider.setOnMouseReleased(e -> {
-            if (player != null) player.seek(Duration.millis(seekSlider.getValue()));
-        });
+        // Both triggers route through seekTo(), which de-dupes the
+        // double-fire a single drag produces and clamps/guards the target.
+        seekSlider.setOnMouseReleased(e -> seekTo(seekSlider.getValue()));
         seekSlider.valueChangingProperty().addListener((obs, was, isChanging) -> {
-            if (!isChanging && player != null) {
-                player.seek(Duration.millis(seekSlider.getValue()));
-            }
+            if (!isChanging) seekTo(seekSlider.getValue());
         });
     }
 
@@ -432,10 +638,8 @@ public final class DualStreamPlayer extends Application {
                 }
                 case F -> stage.setFullScreen(!stage.isFullScreen());
                 case ESCAPE -> stage.setFullScreen(false);
-                case LEFT  -> player.seek(player.getCurrentTime()
-                                .subtract(Duration.seconds(5)));
-                case RIGHT -> player.seek(player.getCurrentTime()
-                                .add(Duration.seconds(5)));
+                case LEFT  -> seekTo(player.getCurrentTime().toMillis() - 5000);
+                case RIGHT -> seekTo(player.getCurrentTime().toMillis() + 5000);
                 case UP    -> volumeSlider.setValue(
                                 Math.min(100, volumeSlider.getValue() + 5));
                 case DOWN  -> volumeSlider.setValue(
