@@ -138,7 +138,7 @@ public final class SoftwareGradientCache {
             int n = stops.size();
             if (n < 2 || n > MAX_STOPS) return bail(3, "stop count " + n);
 
-            Key key = Key.of(g, stops, x, y, devW, devH,
+            Key key = Key.of(g, stops, x, y, w, h, devW, devH,
                              arcW * psx, arcH * psy, psx, psy);
             if (key == null) return bail(4, "unsupported gradient type "
                 + g.getClass().getSimpleName());
@@ -187,7 +187,7 @@ public final class SoftwareGradientCache {
                 psx, 0, -x * psx, 0, psy, -y * psy,
                 0, 0, 0, 0, false,
                 NativeBridge.BLEND_SRC_OVER, 1f);
-            try (SkiaShaders.Handle s = SkiaShaders.forGradient(g)) {
+            try (SkiaShaders.Handle s = SkiaShaders.forGradient(g, x, y, w, h)) {
                 if (!s.isValid()) return null;
                 int rc = (arcW > 0 || arcH > 0)
                     ? NativeBridge.surfaceFillRoundRectShader(
@@ -240,27 +240,40 @@ public final class SoftwareGradientCache {
         }
 
         static Key of(Gradient g, List<Stop> stops,
-                      float x, float y, int devW, int devH,
+                      float x, float y, float w, float h, int devW, int devH,
                       float devArcW, float devArcH, float psx, float psy) {
             int n = stops.size();
-            float[] f = new float[11 + n];
+            float[] f = new float[19 + n];
             int[] colors = new int[n];
             int i = 0;
+            // Key on the RESOLVED geometry (proportional endpoints against the
+            // fill bounds + any gradientTransform/elliptical local matrix), not
+            // the raw getters — otherwise a proportional and an absolute
+            // gradient with identical fractions, stops and device size would
+            // collide on one cached image. Resolution is deterministic from
+            // the gradient + bounds, so the key never causes a false miss.
+            GradientResolver gr = GradientResolver.current();
+            f[i++] = g.isProportional() ? 1f : 0f;
             if (g instanceof LinearGradient lg) {
+                gr.resolveLinear(lg, x, y, w, h);
                 f[i++] = 1f;
-                f[i++] = lg.getX1() - x;
-                f[i++] = lg.getY1() - y;
-                f[i++] = lg.getX2() - x;
-                f[i++] = lg.getY2() - y;
+                f[i++] = gr.x1 - x;
+                f[i++] = gr.y1 - y;
+                f[i++] = gr.x2 - x;
+                f[i++] = gr.y2 - y;
             } else if (g instanceof RadialGradient rg) {
+                gr.resolveRadial(rg, x, y, w, h);
                 f[i++] = 2f;
-                f[i++] = rg.getCenterX() - x;
-                f[i++] = rg.getCenterY() - y;
-                f[i++] = rg.getRadius();
+                f[i++] = gr.cx - x;
+                f[i++] = gr.cy - y;
+                f[i++] = gr.radius;
                 f[i++] = rg.getFocusAngle() * 4096f + rg.getFocusDistance();
             } else {
                 return null;
             }
+            f[i++] = gr.hasLocalMatrix ? 1f : 0f;
+            f[i++] = gr.m00; f[i++] = gr.m01; f[i++] = gr.m02;
+            f[i++] = gr.m10; f[i++] = gr.m11; f[i++] = gr.m12;
             f[i++] = g.getSpreadMethod();
             f[i++] = devW;
             f[i++] = devH;

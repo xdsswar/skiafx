@@ -917,6 +917,15 @@ inline HDC bindWindowGlContext(HWND hwnd) {
 enum class GpuBackend { None, GL, D3D };
 static GpuBackend gGpuBackend = GpuBackend::None;
 
+// Caller-requested backend preference, set from Java before the GrDirectContext
+// is first built (openjfx_skia_set_gpu_backend). 0 = AUTO (env var / platform
+// default), 1 = force GL, 2 = force D3D12. Read live by d3dOptedIn(); the
+// context is built once so this is read exactly once in practice.
+constexpr int kBackendAuto      = 0;
+constexpr int kBackendForceGL   = 1;
+constexpr int kBackendForceD3D  = 2;
+static std::atomic<int> gBackendPref{ kBackendAuto };
+
 // Lazily-built per-process GrDirectContext. On Windows we try
 // D3D12/Ganesh first (no DWM windowed-vsync cap when paired with the
 // DXGI flip-model + ALLOW_TEARING swap chain); on D3D init failure we
@@ -945,15 +954,20 @@ static GpuBackend gGpuBackend = GpuBackend::None;
 // known issues are resolved, flipping the default below is the
 // single-line change.
 inline bool d3dOptedIn() {
-    static const bool on = [] {
-        // OPT-IN: GL is the default backend. D3D12 (which enables 3D via
-        // bgfx — see docs/3D.md) turns on with OPENJFX_SKIA_D3D=1. Kept
-        // opt-in until the 3D path is verified stable across GPUs
-        // (an AMD multi-GPU driver crash showed up under default-on).
+    // Explicit caller preference wins (Application.setGpuBackend /
+    // -Dprism.skia.gpu.backend, plumbed through openjfx_skia_set_gpu_backend).
+    int pref = gBackendPref.load(std::memory_order_relaxed);
+    if (pref == kBackendForceD3D) return true;
+    if (pref == kBackendForceGL)  return false;
+    // AUTO: GL is the default backend. D3D12 (which enables 3D via bgfx — see
+    // docs/3D.md) turns on with OPENJFX_SKIA_D3D=1. Kept opt-in under AUTO until
+    // the 3D path is verified stable across GPUs (an AMD multi-GPU driver crash
+    // showed up under default-on).
+    static const bool envOn = [] {
         const char* v = std::getenv("OPENJFX_SKIA_D3D");
         return v && v[0] && v[0] != '0';
     }();
-    return on;
+    return envOn;
 }
 
 inline const sk_sp<GrDirectContext>& gpuDirectContext() {
@@ -4745,6 +4759,23 @@ extern "C" OPENJFX_API int32_t openjfx_skia_device_lost(void) {
 #else
     return 0;
 #endif
+}
+
+// Set the requested GPU backend BEFORE the GrDirectContext is first built
+// (i.e. before any GPU surface is allocated). 0 = AUTO (env / platform default),
+// 1 = force OpenGL, 2 = force Direct3D 12. No effect once the context exists.
+extern "C" OPENJFX_API void openjfx_skia_set_gpu_backend(int32_t pref) {
+    gBackendPref.store(pref, std::memory_order_relaxed);
+}
+
+// Report the backend actually backing the GrDirectContext:
+// 0 = none/not yet created, 1 = OpenGL (Ganesh GL), 2 = Direct3D 12.
+extern "C" OPENJFX_API int32_t openjfx_skia_get_active_backend(void) {
+    switch (gGpuBackend) {
+        case GpuBackend::GL:  return 1;
+        case GpuBackend::D3D: return 2;
+        default:              return 0;
+    }
 }
 
 #endif // OPENJFX_WITH_SKIA

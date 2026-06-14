@@ -310,26 +310,46 @@ public final class WebPage {
             // The page's JS is suspended by the engine until we answer. Route to
             // the existing UIClient handlers (WebEngine.onAlert/confirmHandler/
             // promptHandler) and send the response — public API is unchanged.
-            if (blink == null) {
-                return;
+            //
+            // Two hazards make the response easy to lose, which leaves the renderer
+            // suspended forever (frozen page): (1) confirm/prompt/alert run a nested
+            // FX modal loop (showAndWait), during which an engine-death event can run
+            // respawnEngine() and null/replace `blink`; (2) a user-supplied
+            // confirm/prompt handler can throw. Capture `blink` once, compute the
+            // answer inside a try, and always send exactly one response with safe
+            // defaults so the engine is never left hanging.
+            final BlinkPage b = blink;
+            if (b == null) {
+                return; // old page already gone — its engine reply is moot
             }
-            switch (dialogType) {
-                case 0 -> { // alert
-                    if (uiClient != null) {
-                        uiClient.alert(message);
+            boolean accepted = false;
+            String text = null;
+            try {
+                switch (dialogType) {
+                    case 0 -> { // alert
+                        if (uiClient != null) {
+                            uiClient.alert(message);
+                        }
+                        accepted = true;
                     }
-                    blink.respondDialog(dialogId, true, null);
+                    case 1, 3 -> // confirm / beforeunload
+                        accepted = uiClient != null && uiClient.confirm(message);
+                    case 2 -> { // prompt
+                        text = uiClient != null ? uiClient.prompt(message, defaultText) : null;
+                        accepted = text != null;
+                    }
+                    default -> { /* unknown dialog type → deny */ }
                 }
-                case 1, 3 -> { // confirm / beforeunload
-                    boolean ok = uiClient != null && uiClient.confirm(message);
-                    blink.respondDialog(dialogId, ok, null);
-                }
-                case 2 -> { // prompt
-                    String r = uiClient != null ? uiClient.prompt(message, defaultText) : null;
-                    blink.respondDialog(dialogId, r != null, r);
-                }
-                default -> blink.respondDialog(dialogId, false, null);
+            } catch (Throwable t) {
+                // A user dialog handler threw — never leave the renderer suspended.
+                accepted = false;
+                text = null;
+                log.warning("WebView dialog handler threw; answering with the "
+                          + "default (cancelled): " + t, t);
             }
+            // b.respondDialog() no-ops if its page was disposed during the nested
+            // modal loop, so this is safe even after a respawn. Exactly one response.
+            b.respondDialog(dialogId, accepted, text);
         }
         @Override public void onColorChooser(int chooserId, int initialRgba, int[] suggestionsRgba) {
             if (uiClient != null) {

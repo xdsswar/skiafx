@@ -243,7 +243,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                             grad, x, y, width, height, 0, 0)) {
                     return;
                 }
-                try (SkiaShaders.Handle s = shaderFor(p)) {
+                try (SkiaShaders.Handle s = shaderFor(p, x, y, width, height)) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillRectShader(handle(), x, y, width, height,
                         s.shader, 0xFF);
@@ -276,7 +276,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                             grad, x, y, w, h, arcw, arch)) {
                     return;
                 }
-                try (SkiaShaders.Handle s = shaderFor(p)) {
+                try (SkiaShaders.Handle s = shaderFor(p, x, y, w, h)) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillRoundRectShader(
                         handle(), x, y, w, h, arcw, arch, s.shader, 0xFF);
@@ -294,7 +294,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 NativeBridge.surfaceFillOval(handle(), x, y, w, h,
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle s = shaderFor(p)) {
+                try (SkiaShaders.Handle s = shaderFor(p, x, y, w, h)) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillOvalShader(
                         handle(), x, y, w, h, s.shader, 0xFF);
@@ -315,7 +315,8 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     path.fillRule,
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle s = shaderFor(p)) {
+                float[] b = boundsOf(path);
+                try (SkiaShaders.Handle s = shaderFor(p, b[0], b[1], b[2], b[3])) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillPathShader(handle(),
                         path.verbs, path.verbCount,
@@ -368,7 +369,8 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     st.getLineWidth(), st.getEndCap(), st.getLineJoin(), st.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle s = shaderFor(paint)) {
+                float[] b = boundsOf(path);
+                try (SkiaShaders.Handle s = shaderFor(paint, b[0], b[1], b[2], b[3])) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceStrokePathShader(handle(),
                         path.verbs, path.verbCount,
@@ -391,7 +393,9 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle sh = shaderFor(paint)) {
+                try (SkiaShaders.Handle sh = shaderFor(paint,
+                        Math.min(x1, x2), Math.min(y1, y2),
+                        Math.abs(x2 - x1), Math.abs(y2 - y1))) {
                     if (!sh.isValid()) return;
                     NativeBridge.surfaceStrokeLineShader(handle(), x1, y1, x2, y2,
                         s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
@@ -411,7 +415,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle sh = shaderFor(paint)) {
+                try (SkiaShaders.Handle sh = shaderFor(paint, x, y, w, h)) {
                     if (!sh.isValid()) return;
                     NativeBridge.surfaceStrokeRectShader(handle(), x, y, w, h,
                         s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
@@ -431,7 +435,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle sh = shaderFor(paint)) {
+                try (SkiaShaders.Handle sh = shaderFor(paint, x, y, w, h)) {
                     if (!sh.isValid()) return;
                     NativeBridge.surfaceStrokeRoundRectShader(
                         handle(), x, y, w, h, arcw, arch,
@@ -452,7 +456,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                try (SkiaShaders.Handle sh = shaderFor(paint)) {
+                try (SkiaShaders.Handle sh = shaderFor(paint, x, y, w, h)) {
                     if (!sh.isValid()) return;
                     NativeBridge.surfaceStrokeOvalShader(handle(), x, y, w, h,
                         s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
@@ -556,8 +560,30 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         // representative solid colour. Never throws on the render thread.
         SkiaShaders.Handle fillShader = null;
         if (paint instanceof Gradient || paint instanceof ImagePattern) {
+            // Proportional gradient text resolves against the glyph-run bbox.
+            // gys are baselines, so approximate the vertical extent with the
+            // strike size (ascent above baseline + a little descent).
+            float tminx = Float.POSITIVE_INFINITY, tmaxx = Float.NEGATIVE_INFINITY;
+            float tminy = Float.POSITIVE_INFINITY, tmaxy = Float.NEGATIVE_INFINITY;
+            for (int k = 0; k < n; k++) {
+                if (skip[k]) continue;
+                float gx = gxs[k], gy = gys[k];
+                if (gx < tminx) tminx = gx;
+                if (gx > tmaxx) tmaxx = gx;
+                if (gy < tminy) tminy = gy;
+                if (gy > tmaxy) tmaxy = gy;
+            }
+            float rbx, rby, rbw, rbh;
+            if (tminx <= tmaxx) {
+                rbx = tminx;
+                rby = tminy - size;
+                rbw = (tmaxx - tminx) + size;
+                rbh = (tmaxy - tminy) + size;
+            } else {
+                rbx = x; rby = y; rbw = 0f; rbh = 0f;
+            }
             try {
-                SkiaShaders.Handle h = shaderFor(paint);
+                SkiaShaders.Handle h = shaderFor(paint, rbx, rby, rbw, rbh);
                 if (h != null && h.isValid()) {
                     fillShader = h;
                 } else if (h != null) {
@@ -1168,9 +1194,15 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
 
     private BasicStroke currentStroke() { return getStroke(); }
 
-    private SkiaShaders.Handle shaderFor(Paint p) {
+    /**
+     * Build the SkShader for a non-Color paint. The {@code (rx,ry,rw,rh)}
+     * fill-shape bounds (node-local) let a proportional gradient resolve its
+     * endpoints against the shape, mirroring stock PaintHelper; image patterns
+     * ignore them.
+     */
+    private SkiaShaders.Handle shaderFor(Paint p, float rx, float ry, float rw, float rh) {
         if (p instanceof Gradient g) {
-            return SkiaShaders.forGradient(g);
+            return SkiaShaders.forGradient(g, rx, ry, rw, rh);
         }
         if (p instanceof ImagePattern ip) {
             return SkiaShaders.forImagePattern(ip);
@@ -1178,6 +1210,34 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         throw new UnsupportedOperationException(
             "Unsupported Paint subtype: " + p.getClass().getSimpleName());
     }
+
+    /**
+     * Local-space bounding box of an encoded path, written into a per-thread
+     * scratch {@code float[4]} ({x, y, w, h}) so gradient fills/strokes of a
+     * Shape can resolve proportional gradients without allocating. Uses the
+     * encoded coordinates already in hand (a superset of the tight bounds for
+     * curves — acceptable for gradient resolution).
+     */
+    private static float[] boundsOf(PathEncoder.Encoded path) {
+        float[] b = BBOX_SCRATCH.get();
+        int cc = path.coordCount;
+        if (cc < 2) { b[0] = 0f; b[1] = 0f; b[2] = 0f; b[3] = 0f; return b; }
+        float minx = Float.POSITIVE_INFINITY, miny = Float.POSITIVE_INFINITY;
+        float maxx = Float.NEGATIVE_INFINITY, maxy = Float.NEGATIVE_INFINITY;
+        for (int i = 0; i + 1 < cc; i += 2) {
+            float px = path.coords.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, i);
+            float py = path.coords.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, i + 1);
+            if (px < minx) minx = px;
+            if (px > maxx) maxx = px;
+            if (py < miny) miny = py;
+            if (py > maxy) maxy = py;
+        }
+        b[0] = minx; b[1] = miny; b[2] = maxx - minx; b[3] = maxy - miny;
+        return b;
+    }
+
+    private static final ThreadLocal<float[]> BBOX_SCRATCH =
+        ThreadLocal.withInitial(() -> new float[4]);
 
     /** Map Prism's {@link CompositeMode} → Skia blend mode int. */
     private static int mapBlendMode(CompositeMode m) {

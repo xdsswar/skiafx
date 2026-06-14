@@ -946,6 +946,12 @@ public class WebViewDemo extends Application<Stage> {
             + URLEncoder.encode(t, StandardCharsets.UTF_8);
     }
 
+    @Override
+    public void init() throws Exception {
+        super.init();
+        setGpuBackend(GpuBackend.DIRECT3D12);
+    }
+
     public static void main(String[] args) {
         launch(args);
     }

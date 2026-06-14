@@ -66,7 +66,7 @@ public final class SkiaShaders {
      * so we fall back to a solid-colour shader of the last stop instead of
      * letting the fill go black.</p>
      */
-    public static Handle forGradient(Gradient g) {
+    public static Handle forGradient(Gradient g, float rx, float ry, float rw, float rh) {
         List<Stop> stops = g.getStops();
         int n = stops.size();
         if (n < 1) return new Handle(MemorySegment.NULL, null);
@@ -85,14 +85,35 @@ public final class SkiaShaders {
                 colors.setAtIndex(ValueLayout.JAVA_INT, i, packRgba(s.getColor()));
             }
             int tile = mapSpread(g.getSpreadMethod());
+            // Resolve proportional endpoints against the fill-shape bounds and
+            // fold the gradient transform (+ elliptical radial) into a local
+            // matrix, mirroring stock PaintHelper. Without this a proportional
+            // gradient was drawn with a ~1px gradient line and kClamp smeared a
+            // single stop across the whole shape.
+            GradientResolver gr = GradientResolver.current();
+            boolean lm = false;
             if (g instanceof LinearGradient lg) {
-                shader = NativeBridge.shaderLinearGradient(
-                    lg.getX1(), lg.getY1(), lg.getX2(), lg.getY2(),
-                    n, positions, colors, tile);
+                gr.resolveLinear(lg, rx, ry, rw, rh);
+                lm = gr.hasLocalMatrix && NativeBridge.lmShadersAvailable();
+                if (lm) {
+                    shader = NativeBridge.shaderLinearGradientLm(
+                        gr.x1, gr.y1, gr.x2, gr.y2, n, positions, colors, tile,
+                        gr.m00, gr.m01, gr.m02, gr.m10, gr.m11, gr.m12);
+                } else {
+                    shader = NativeBridge.shaderLinearGradient(
+                        gr.x1, gr.y1, gr.x2, gr.y2, n, positions, colors, tile);
+                }
             } else if (g instanceof RadialGradient rg) {
-                shader = NativeBridge.shaderRadialGradient(
-                    rg.getCenterX(), rg.getCenterY(), rg.getRadius(),
-                    n, positions, colors, tile);
+                gr.resolveRadial(rg, rx, ry, rw, rh);
+                lm = gr.hasLocalMatrix && NativeBridge.lmShadersAvailable();
+                if (lm) {
+                    shader = NativeBridge.shaderRadialGradientLm(
+                        gr.cx, gr.cy, gr.radius, n, positions, colors, tile,
+                        gr.m00, gr.m01, gr.m02, gr.m10, gr.m11, gr.m12);
+                } else {
+                    shader = NativeBridge.shaderRadialGradient(
+                        gr.cx, gr.cy, gr.radius, n, positions, colors, tile);
+                }
             } else {
                 return new Handle(MemorySegment.NULL, null);
             }

@@ -76,6 +76,7 @@ foresight of the foundation they built. **Thank you.**
 |---|---|
 | **Skia-backed rendering** — `SkCanvas`/`SkSurface` instead of Prism, via our own native bridge | Working |
 | **GPU pipeline** — OpenGL (Ganesh) + **Direct3D 12** backends, GPU context per render thread | Working |
+| **Selectable GPU backend** — `Application.setGpuBackend(...)` / `-Dprism.skia.gpu.backend`, default `AUTO`, graceful fallback when unavailable | Working |
 | **Uncapped frame rate** — render at the display's *actual* refresh (120/144/240Hz+), not a hardcoded 60 | Working |
 | **Runtime VSync toggle** — `Application.setVsyncEnabled(...)` / `vsyncEnabledProperty()`, global, on by default | Working |
 | **Wall-clock animation** — animations driven by real time, correct at any cadence | Working |
@@ -395,6 +396,81 @@ background, and an "Open SVG..." file chooser).
 One `GrDirectContext` per render thread, never per-window or per-frame; torn down only on
 shutdown or hard device loss, with cache rebuild on recovery.
 
+### Selecting a GPU backend
+
+By default skia-fx picks the best backend for the platform (**`AUTO`**). You can request
+a specific one through a small additive API on `Application`:
+
+```java
+public enum GpuBackend { AUTO, OPENGL, DIRECT3D12, METAL, VULKAN }
+```
+
+The backend is chosen **once**, early in startup (the GPU context is built lazily on the
+first window), so set it **before the first stage is shown**. The cleanest place is your
+`Application`'s `init()` — it runs before `start()`, ahead of any window:
+
+```java
+public class MyApp extends Application {
+
+    @Override
+    public void init() {
+        // Force Direct3D 12 on Windows. AUTO (the default) would also pick it
+        // up when appropriate; an unavailable choice falls back automatically.
+        Application.setGpuBackend(GpuBackend.DIRECT3D12);
+    }
+
+    @Override
+    public void start(Stage stage) {
+        // ... build your scene as usual ...
+        stage.show();
+    }
+
+    public static void main(String[] args) {
+        launch(args);
+    }
+}
+```
+
+Setting it in `main()` before `launch(...)` works too:
+
+```java
+public static void main(String[] args) {
+    Application.setGpuBackend(GpuBackend.OPENGL);
+    launch(args);
+}
+```
+
+Equivalent ways to choose, without code (precedence: **API call > system property > env
+var > AUTO**):
+
+```bash
+# System property (accepts: auto, opengl/gl, direct3d12/d3d12/d3d, metal, vulkan/vk)
+java -Dprism.skia.gpu.backend=d3d12 --module-path sdk/lib --add-modules javafx.controls -jar your-app.jar
+
+# Legacy env var (D3D12 opt-in under AUTO)
+set OPENJFX_SKIA_D3D=1
+```
+
+**Graceful fallback.** Requesting a backend that isn't available on the current
+platform/build — `METAL` on Windows, `VULKAN` before its path lands, or `DIRECT3D12` when
+device init fails — degrades to the most suitable backend instead of failing. The startup
+log reports the backend that is **actually** active (and notes any fallback), for example:
+
+```
+INFO: Skia GPU enabled: Direct3D 12.
+INFO: Requested GPU backend METAL was not available; using OpenGL (Ganesh GL) instead.
+```
+
+`METAL` (macOS) and `VULKAN` (Linux/Windows) are reserved for the per-platform backends
+on the roadmap; until those native paths land they resolve to `AUTO`.
+
+Try it from the Gradle panel:
+
+```bash
+./gradlew :samples:gradient:run                            # AUTO
+./gradlew :samples:gradient:run -Pdemo.backend=DIRECT3D12  # force a backend
+```
+
 ### Frame rate — yours, not 60
 Stock JavaFX caps at vsync (~60Hz). skia-fx doesn't. Pulse cadence is driven by the
 display's real refresh rate; an **uncapped** mode (`-Djavafx.animation.fullspeed=true`)
@@ -451,6 +527,7 @@ Skia for you) and a C++ toolchain. The Chromium/Blink WebView engine is opt-in
 ./gradlew :samples:ensemble:runWebView    # drive the Blink WebView
 ./gradlew :samples:ensemble:runDualPlayer # dual-source player (separate audio + video URLs)
 ./gradlew :samples:ensemble:runMixerDemo  # MediaMixer: audio + video files -> one MP4
+./gradlew :samples:gradient:run           # gradient render test + GPU-backend selector (-Pdemo.backend=...)
 
 # Compile a single module / just the native Skia bridge
 ./gradlew :javafx.graphics:assemble
@@ -482,6 +559,8 @@ java --module-path sdk/lib --add-modules javafx.controls,javafx.fxml -jar your-a
   ffmpeg), dual-source `Media(audio, video)` with accurate fragmented-MP4 seeking,
   `MediaMixer` muxing
 - Uncapped / display-rate frame pacing, wall-clock animations, runtime VSync toggle
+- Selectable GPU backend (`Application.setGpuBackend` / `-Dprism.skia.gpu.backend`,
+  default `AUTO`) with graceful fallback and a truthful active-backend log
 - Memory budgets + render-thread-safe native lifecycles
 - Custom primary stage, signed native-lib manifest
 

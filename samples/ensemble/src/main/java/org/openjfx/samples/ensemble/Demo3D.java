@@ -797,6 +797,12 @@ public final class Demo3D extends Application<Stage> {
         }.start();
     }
 
+    @Override
+    public void init() throws Exception {
+        super.init();
+        setGpuBackend(GpuBackend.DIRECT3D12);
+    }
+
     static void main(String[] args) {
         launch(args);
     }

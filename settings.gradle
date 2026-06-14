@@ -42,6 +42,7 @@ include(
     'samples:ensemble',
     'samples:perf',
     'samples:swinginterop',
+    'samples:gradient',
 )
 
 // No project-side dependencyResolutionManagement. We don't pull any

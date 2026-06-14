@@ -48,6 +48,28 @@ public final class NativeBridge {
         .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
         .orElse(null);
 
+    // Optional: GPU backend selection. find() so an older native lib without these
+    // symbols still loads (the selector then degrades to env-var/AUTO behaviour).
+    private static final MethodHandle MH_SET_GPU_BACKEND = LOOKUP.find("openjfx_skia_set_gpu_backend")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT)))
+        .orElse(null);
+
+    private static final MethodHandle MH_GET_ACTIVE_BACKEND = LOOKUP.find("openjfx_skia_get_active_backend")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+        .orElse(null);
+
+    /**
+     * Backend preference / active-backend codes for {@link #setGpuBackend(int)}
+     * and {@link #activeBackend()}. METAL and VULKAN are reserved for the
+     * per-platform backends on the roadmap; until their native paths land the
+     * selector treats them as {@link #BACKEND_AUTO}.
+     */
+    public static final int BACKEND_AUTO   = 0;
+    public static final int BACKEND_GL     = 1;
+    public static final int BACKEND_D3D12  = 2;
+    public static final int BACKEND_METAL  = 3;
+    public static final int BACKEND_VULKAN = 4;
+
     private static final MethodHandle MH_CLEAR_BUFFER = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_clear_buffer"),
         FunctionDescriptor.of(
@@ -581,6 +603,37 @@ public final class NativeBridge {
             ValueLayout.ADDRESS, ValueLayout.ADDRESS,
             ValueLayout.JAVA_INT));
 
+    // Local-matrix gradient variants. Bound optionally: a native library
+    // predating these symbols must not break class init — when absent the
+    // shader path falls back to the no-matrix call (correct for the common
+    // proportional + identity-transform case; only a non-identity
+    // gradientTransform / non-square elliptical radial is degraded).
+    private static final MethodHandle MH_SHADER_LINEAR_LM =
+        LOOKUP.find("openjfx_skia_shader_create_linear_gradient_lm")
+            .map(sym -> LINKER.downcallHandle(sym, FunctionDescriptor.of(
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // x0,y0
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // x1,y1
+                ValueLayout.JAVA_INT,                              // nStops
+                ValueLayout.ADDRESS, ValueLayout.ADDRESS,          // positions, colors
+                ValueLayout.JAVA_INT,                             // tileMode
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,  // m00,m01,m02
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT))) // m10,m11,m12
+            .orElse(null);
+
+    private static final MethodHandle MH_SHADER_RADIAL_LM =
+        LOOKUP.find("openjfx_skia_shader_create_radial_gradient_lm")
+            .map(sym -> LINKER.downcallHandle(sym, FunctionDescriptor.of(
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // cx,cy
+                ValueLayout.JAVA_FLOAT,                            // radius
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT)))
+            .orElse(null);
+
     private static final MethodHandle MH_SHADER_IMAGE = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_shader_create_image"),
         FunctionDescriptor.of(
@@ -1080,6 +1133,34 @@ public final class NativeBridge {
     }
 
     /**
+     * Request a GPU backend BEFORE the GrDirectContext is first built (i.e. before
+     * the first GPU surface is allocated). {@code pref} is one of {@link #BACKEND_AUTO},
+     * {@link #BACKEND_GL}, {@link #BACKEND_D3D12}. No-op on builds without the selector
+     * (the env var / platform default still applies).
+     */
+    public static void setGpuBackend(int pref) {
+        if (MH_SET_GPU_BACKEND == null) return;
+        try {
+            MH_SET_GPU_BACKEND.invokeExact(pref);
+        } catch (Throwable t) {
+            // best-effort; selection falls back to AUTO/env
+        }
+    }
+
+    /**
+     * The backend actually backing the GrDirectContext: {@link #BACKEND_AUTO} (0) when
+     * not yet created or unknown, {@link #BACKEND_GL} (1), or {@link #BACKEND_D3D12} (2).
+     */
+    public static int activeBackend() {
+        if (MH_GET_ACTIVE_BACKEND == null) return BACKEND_AUTO;
+        try {
+            return (int) MH_GET_ACTIVE_BACKEND.invokeExact();
+        } catch (Throwable t) {
+            return BACKEND_AUTO;
+        }
+    }
+
+    /**
      * Clears a raster pixel buffer to the given premultiplied RGBA color.
      * Smoke test for the FFM bridge. Returns 0 on success.
      */
@@ -1524,6 +1605,44 @@ public final class NativeBridge {
                 cx, cy, radius, nStops, positions, colorsRGBA, tileMode);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_shader_create_radial_gradient failed", t);
+        }
+    }
+
+    /** Whether the local-matrix gradient variants are present in the loaded
+     *  native library (older libraries omit them). */
+    public static boolean lmShadersAvailable() {
+        return MH_SHADER_LINEAR_LM != null && MH_SHADER_RADIAL_LM != null;
+    }
+
+    public static MemorySegment shaderLinearGradientLm(float x0, float y0, float x1, float y1,
+                                                       int nStops,
+                                                       MemorySegment positions,
+                                                       MemorySegment colorsRGBA,
+                                                       int tileMode,
+                                                       float m00, float m01, float m02,
+                                                       float m10, float m11, float m12) {
+        try {
+            return (MemorySegment) MH_SHADER_LINEAR_LM.invokeExact(
+                x0, y0, x1, y1, nStops, positions, colorsRGBA, tileMode,
+                m00, m01, m02, m10, m11, m12);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_shader_create_linear_gradient_lm failed", t);
+        }
+    }
+
+    public static MemorySegment shaderRadialGradientLm(float cx, float cy, float radius,
+                                                       int nStops,
+                                                       MemorySegment positions,
+                                                       MemorySegment colorsRGBA,
+                                                       int tileMode,
+                                                       float m00, float m01, float m02,
+                                                       float m10, float m11, float m12) {
+        try {
+            return (MemorySegment) MH_SHADER_RADIAL_LM.invokeExact(
+                cx, cy, radius, nStops, positions, colorsRGBA, tileMode,
+                m00, m01, m02, m10, m11, m12);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_shader_create_radial_gradient_lm failed", t);
         }
     }
 

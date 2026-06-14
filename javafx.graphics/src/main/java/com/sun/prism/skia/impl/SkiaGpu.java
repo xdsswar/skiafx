@@ -3,6 +3,10 @@ package com.sun.prism.skia.impl;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
 import java.lang.foreign.MemorySegment;
+import java.util.Locale;
+
+import javafx.application.Application;
+import javafx.application.Application.GpuBackend;
 
 /**
  * Phase-2 GPU mode toggle.
@@ -73,6 +77,12 @@ public final class SkiaGpu {
             return false;
         }
 
+        // Select the GPU backend BEFORE the first GPU surface triggers the
+        // GrDirectContext build. An unavailable/unsupported request degrades to
+        // the most suitable backend for the platform (see resolveBackendPref).
+        GpuBackend requested = resolveRequestedBackend();
+        NativeBridge.setGpuBackend(toNativePref(requested));
+
         MemorySegment h;
         try {
             h = NativeBridge.surfaceCreateGpu(1, 1);
@@ -85,14 +95,90 @@ public final class SkiaGpu {
         if (h == null || h.equals(MemorySegment.NULL)) {
             LOG.log(Level.WARNING,
                 "Skia GPU surface creation returned NULL; falling back to "
-                + "software raster (prism.skia.gpu=true requested but the "
-                + "Ganesh GL backend is unavailable on this platform/build).");
+                + "software raster (prism.skia.gpu=true requested but no GPU "
+                + "backend is available on this platform/build).");
             enabled = Boolean.FALSE;
             return false;
         }
         NativeBridge.surfaceDestroy(h);
-        LOG.log(Level.INFO, "Skia GPU (Ganesh GL) enabled.");
+
+        // Report the backend that is ACTUALLY active (queried from native), not a
+        // hardcoded name — D3D init can fall back to GL, and AUTO is resolved natively.
+        int active = NativeBridge.activeBackend();
+        String activeName = backendName(active);
+        LOG.log(Level.INFO, "Skia GPU enabled: " + activeName + ".");
+        if (requested != GpuBackend.AUTO && !matchesActive(requested, active)) {
+            LOG.log(Level.INFO, "Requested GPU backend " + requested
+                + " was not available; using " + activeName + " instead.");
+        }
         enabled = Boolean.TRUE;
         return true;
+    }
+
+    /**
+     * The backend the app asked for: the explicit {@link Application#getGpuBackend()}
+     * choice, else the {@code -Dprism.skia.gpu.backend} system property, else AUTO.
+     */
+    private static GpuBackend resolveRequestedBackend() {
+        GpuBackend req = Application.getGpuBackend();
+        if (req == null) req = GpuBackend.AUTO;
+        if (req == GpuBackend.AUTO) {
+            String p = System.getProperty("prism.skia.gpu.backend");
+            if (p != null) req = parseBackend(p);
+        }
+        return req;
+    }
+
+    private static GpuBackend parseBackend(String s) {
+        return switch (s.trim().toLowerCase(Locale.ROOT)) {
+            case "gl", "opengl", "ganesh"            -> GpuBackend.OPENGL;
+            case "d3d", "d3d12", "direct3d",
+                 "direct3d12", "dx12"                -> GpuBackend.DIRECT3D12;
+            case "metal", "mtl"                      -> GpuBackend.METAL;
+            case "vulkan", "vk"                      -> GpuBackend.VULKAN;
+            default                                  -> GpuBackend.AUTO;
+        };
+    }
+
+    /**
+     * Map a requested backend to a native preference code, degrading to the most
+     * suitable backend when the request is not supported on this platform/build.
+     * Backends without a native path yet (Metal, Vulkan) resolve to AUTO so the
+     * native side picks the platform default rather than failing.
+     */
+    private static int toNativePref(GpuBackend req) {
+        boolean windows = osIs("win");
+        return switch (req) {
+            case OPENGL     -> NativeBridge.BACKEND_GL;
+            case DIRECT3D12 -> windows ? NativeBridge.BACKEND_D3D12 : NativeBridge.BACKEND_AUTO;
+            case METAL      -> NativeBridge.BACKEND_AUTO;   // roadmap → most suitable
+            case VULKAN     -> NativeBridge.BACKEND_AUTO;   // roadmap → most suitable
+            case AUTO       -> NativeBridge.BACKEND_AUTO;
+        };
+    }
+
+    private static boolean matchesActive(GpuBackend req, int active) {
+        return switch (req) {
+            case OPENGL     -> active == NativeBridge.BACKEND_GL;
+            case DIRECT3D12 -> active == NativeBridge.BACKEND_D3D12;
+            case METAL      -> active == NativeBridge.BACKEND_METAL;
+            case VULKAN     -> active == NativeBridge.BACKEND_VULKAN;
+            case AUTO       -> true;
+        };
+    }
+
+    private static String backendName(int code) {
+        return switch (code) {
+            case NativeBridge.BACKEND_GL     -> "OpenGL (Ganesh GL)";
+            case NativeBridge.BACKEND_D3D12  -> "Direct3D 12";
+            case NativeBridge.BACKEND_METAL  -> "Metal";
+            case NativeBridge.BACKEND_VULKAN -> "Vulkan";
+            default                          -> "GPU";
+        };
+    }
+
+    private static boolean osIs(String token) {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        return os.contains(token);
     }
 }

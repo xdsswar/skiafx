@@ -1,0 +1,44 @@
+/*
+ * samples/gradient — proportional-gradient render test + GPU-backend selector demo.
+ *
+ * Verifies that proportional LinearGradient/RadialGradient fills render correctly
+ * on the Skia pipeline (the coloured→transparent fade bug), and demonstrates
+ * Application.setGpuBackend(...).
+ *
+ * Tasks:
+ *   :samples:gradient:run                           — launch the demo (AUTO backend)
+ *   :samples:gradient:run -Pdemo.backend=DIRECT3D12 — force a backend (AUTO|OPENGL|
+ *                                                     DIRECT3D12|METAL|VULKAN;
+ *                                                     unsupported → most suitable)
+ *
+ * The javafx.graphics jar bundles its native libs and self-extracts them to
+ * ~/.skia-fx/cache via NativeLibLoader, so no java.library.path wiring is needed.
+ */
+
+plugins {
+    id 'skiafx.java-conventions'
+    id 'application'
+}
+
+dependencies {
+    implementation project(':javafx.base')
+    implementation project(':javafx.graphics')
+    implementation project(':javafx.controls')
+}
+
+application {
+    mainClass  = 'dev.skiafx.samples.gradient.GradientDemo'
+    mainModule = 'openjfx.samples.gradient'
+    applicationDefaultJvmArgs = ['--enable-preview', '--enable-native-access=javafx.graphics']
+}
+
+tasks.named('run') {
+    group = 'application'
+    description = 'Launch the proportional-gradient demo (-Pdemo.backend to pick a GPU backend).'
+    jvmArgs '--enable-native-access=javafx.graphics'
+    // Resolve at CONFIGURATION time — touching `project` in doFirst breaks the
+    // Gradle configuration cache. JavaExec does NOT inherit the daemon's -D
+    // system properties, so forward -Pdemo.backend (or -Ddemo.backend) here.
+    def demoBackend = project.findProperty('demo.backend') ?: System.getProperty('demo.backend')
+    if (demoBackend != null) systemProperty 'demo.backend', demoBackend.toString()
+}

@@ -30,6 +30,7 @@ import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 import javafx.application.Preloader.PreloaderNotification;
 import javafx.beans.property.BooleanProperty;
@@ -305,6 +306,65 @@ public abstract class Application<W extends Stage> {
      */
     public static boolean isVsyncEnabled() {
         return vsyncEnabledFlag;
+    }
+
+    // ------------------------------------------------------------------------
+    //  GPU backend selection (skia-fx extension)
+    //
+    //  The Skia pipeline can render on more than one GPU backend. AUTO lets the
+    //  pipeline pick the best available backend for the host platform; the other
+    //  values request a specific one and fall back to AUTO when that backend is
+    //  not available on the platform/build. The backend is chosen ONCE, early in
+    //  startup (the GPU context is built lazily on the first window), so this
+    //  must be set before the first stage is shown — e.g. from main() before
+    //  launch(), or from the application's init(). Existing JavaFX code is
+    //  unaffected (AUTO behaves exactly as before).
+    // ------------------------------------------------------------------------
+
+    /**
+     * GPU rendering backends selectable via {@link #setGpuBackend(GpuBackend)}
+     * (skia-fx extension). Availability is platform-dependent; requesting an
+     * unavailable backend falls back to {@link #AUTO}.
+     */
+    public enum GpuBackend {
+        /** Pick the best available backend for the host platform (default). */
+        AUTO,
+        /** OpenGL (Ganesh GL) — available on all desktop platforms. */
+        OPENGL,
+        /** Direct3D 12 — Windows only. */
+        DIRECT3D12,
+        /** Metal — macOS only (roadmap; falls back to {@code AUTO} until available). */
+        METAL,
+        /** Vulkan — Linux/Windows (roadmap; falls back to {@code AUTO} until available). */
+        VULKAN
+    }
+
+    private static volatile GpuBackend gpuBackend = GpuBackend.AUTO;
+
+    /**
+     * Requests the GPU backend the Skia pipeline should use (skia-fx extension).
+     * Must be called before the first {@link Stage} is shown — the GPU context is
+     * created once, early in startup. Requesting a backend not available on the
+     * current platform/build falls back to {@link GpuBackend#AUTO}.
+     *
+     * <p>Equivalent to the {@code -Dprism.skia.gpu.backend=<name>} system property;
+     * an explicit call here takes precedence over the property.</p>
+     *
+     * @param backend the requested backend, never {@code null}
+     */
+    public static void setGpuBackend(GpuBackend backend) {
+        gpuBackend = Objects.requireNonNull(backend, "backend");
+    }
+
+    /**
+     * Returns the currently requested GPU backend (skia-fx extension); this is the
+     * <em>request</em>, which defaults to {@link GpuBackend#AUTO}, not necessarily
+     * the backend that ended up active (an unavailable request falls back).
+     *
+     * @return the requested GPU backend (default {@link GpuBackend#AUTO})
+     */
+    public static GpuBackend getGpuBackend() {
+        return gpuBackend;
     }
 
     /**
