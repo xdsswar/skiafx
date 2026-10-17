@@ -5,8 +5,9 @@
 
   Layout: a full-height sidebar (brand + SVG nav rail + user cell) beside a
   content column (custom-titlebar top strip + content stack + status bar).
-  Caption buttons and nav items carry fx:ids so DashboardController can wire
-  the Stage hit regions, the collapse animation and section switching.
+  The brand header and top strip sit in HeaderBars (StageStyle.EXTENDED);
+  caption buttons carry HeaderBar.buttonType. Nav items carry fx:ids so
+  DashboardController can wire the collapse animation and section switching.
 -->
 
 <?import javafx.geometry.Insets?>
@@ -14,6 +15,7 @@
 <?import javafx.scene.control.TextField?>
 <?import javafx.scene.control.ToggleButton?>
 <?import javafx.scene.layout.HBox?>
+<?import javafx.scene.layout.HeaderBar?>
 <?import javafx.scene.layout.Priority?>
 <?import javafx.scene.layout.Region?>
 <?import javafx.scene.layout.StackPane?>
@@ -28,10 +30,15 @@
     <VBox fx:id="sidebar" styleClass="sidebar" minWidth="252" prefWidth="252" maxWidth="252">
 
         <!-- brand / logo -->
-        <HBox fx:id="sidebarHeader" styleClass="sidebar-header" alignment="CENTER_LEFT" spacing="12">
-            <Region styleClass="app-mark"/>
-            <Label fx:id="brandLabel" styleClass="brand-name" text="Numa"/>
-        </HBox>
+        <HeaderBar minHeight="-Infinity" leftSystemPadding="false" rightSystemPadding="false">
+          <center>
+            <HBox fx:id="sidebarHeader" styleClass="sidebar-header" alignment="CENTER_LEFT" spacing="12"
+                  HeaderBar.alignment="CENTER_LEFT" HeaderBar.dragType="DRAGGABLE_SUBTREE">
+                <Region styleClass="app-mark"/>
+                <Label fx:id="brandLabel" styleClass="brand-name" text="Numa"/>
+            </HBox>
+          </center>
+        </HeaderBar>
 
         <Label fx:id="navSectionPages" styleClass="nav-section" text="PAGES"/>
 
@@ -85,7 +92,10 @@
     <VBox fx:id="contentColumn" styleClass="content-column" HBox.hgrow="ALWAYS">
 
         <!-- top strip: collapse + title · drag region · search + profile + window buttons -->
-        <HBox fx:id="topStrip" styleClass="top-strip" alignment="CENTER_LEFT" minHeight="58" prefHeight="58">
+        <HeaderBar minHeight="-Infinity" leftSystemPadding="false" rightSystemPadding="false">
+         <center>
+        <HBox fx:id="topStrip" styleClass="top-strip" alignment="CENTER_LEFT" minHeight="58" prefHeight="58"
+              HeaderBar.alignment="CENTER_LEFT">
 
             <HBox alignment="CENTER_LEFT" spacing="12">
                 <padding><Insets left="10"/></padding>
@@ -95,7 +105,7 @@
                 <Label fx:id="pageTitle" styleClass="page-title" text="Dashboard"/>
             </HBox>
 
-            <Region fx:id="captionRegion" HBox.hgrow="ALWAYS"/>
+            <Region fx:id="captionRegion" HBox.hgrow="ALWAYS" HeaderBar.dragType="DRAGGABLE"/>
 
             <HBox alignment="CENTER_RIGHT" spacing="12">
                 <padding><Insets right="6"/></padding>
@@ -119,20 +129,22 @@
             </HBox>
 
             <HBox fx:id="winButtons" styleClass="win-buttons" alignment="TOP_RIGHT">
-                <StackPane fx:id="minBtn" styleClass="win-btn, win-btn-min"
+                <StackPane fx:id="minBtn" styleClass="win-btn, win-btn-min" HeaderBar.buttonType="ICONIFY"
                            minWidth="44" prefWidth="44" maxWidth="44" minHeight="58" prefHeight="58">
                     <SVGPath styleClass="ctb-icon" content="M0,5 H10"/>
                 </StackPane>
-                <StackPane fx:id="maxBtn" styleClass="win-btn, win-btn-max"
+                <StackPane fx:id="maxBtn" styleClass="win-btn, win-btn-max" HeaderBar.buttonType="MAXIMIZE"
                            minWidth="44" prefWidth="44" maxWidth="44" minHeight="58" prefHeight="58">
                     <SVGPath fx:id="maxIcon" styleClass="ctb-icon" content="M0.5,0.5 H9.5 V9.5 H0.5 Z"/>
                 </StackPane>
-                <StackPane fx:id="closeBtn" styleClass="win-btn, win-btn-close"
+                <StackPane fx:id="closeBtn" styleClass="win-btn, win-btn-close" HeaderBar.buttonType="CLOSE"
                            minWidth="44" prefWidth="44" maxWidth="44" minHeight="58" prefHeight="58">
                     <SVGPath styleClass="ctb-icon" content="M0,0 L10,10 M10,0 L0,10"/>
                 </StackPane>
             </HBox>
         </HBox>
+         </center>
+        </HeaderBar>
 
         <!-- the section bodies live here -->
         <StackPane fx:id="contentStack" styleClass="content-area" VBox.vgrow="ALWAYS"/>

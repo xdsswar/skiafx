@@ -155,6 +155,17 @@ public final class SkiaEffectRenderer extends PrRenderer {
 
     @Override
     public SkiaPrDrawable getCompatibleImage(int w, int h) {
+        // A non-positive request size is degenerate — e.g. a blend-mode or
+        // clip node whose bounds, intersected with the graphics clip, produced
+        // an empty/negative rect because the node is scrolled off-screen.
+        // Stock JFX returns null here, and callers (NGNode.renderNodeBlendMode)
+        // skip via their `contentImg == null` guard. Returning a drawable
+        // instead drove that path into readBack() with a negative-height view,
+        // which yields a null RTTexture and a per-frame "Texture must be
+        // non-null" abort (blank window). Match upstream: null for empty sizes.
+        if (w <= 0 || h <= 0) {
+            return null;
+        }
         CHECKOUT_COUNT.incrementAndGet();
         SkiaPrDrawable im = (SkiaPrDrawable) super.getCompatibleImage(w, h);
         // Reset to transparent on checkout. The ImagePool reuses SkiaRTTextures

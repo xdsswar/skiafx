@@ -45,16 +45,16 @@
     -fx-stroke-line-join: round;
 }
 
-.win-btn-min:ht-min,
-.win-btn-max:ht-max {
+.win-btn-min:hover,
+.win-btn-max:hover {
     -fx-background-color: #1c2330;
 }
 
-.win-btn-close:ht-close {
+.win-btn-close:hover {
     -fx-background-color: #e81123;
 }
 
-.win-btn-close:ht-close .ctb-icon {
+.win-btn-close:hover .ctb-icon {
     -fx-stroke: #ffffff;
 }
 

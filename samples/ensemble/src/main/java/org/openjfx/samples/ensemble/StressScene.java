@@ -4,7 +4,7 @@
  * metrics).
  *
  * IMPORTANT: this file is intentionally 100% stock JavaFX API — no
- * StageStyle.CUSTOM, no caption-region calls, no skia-fx-only types. That
+ * custom window decorations, no skia-fx-only types. That
  * keeps it byte-for-byte runnable against a vanilla OpenJFX 25 SDK, which
  * is what makes the A/B comparison (skia-fx vs. stock) honest: the exact
  * same scene and metering code runs on both pipelines.

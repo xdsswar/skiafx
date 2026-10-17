@@ -215,6 +215,16 @@ OPENJFX_API int32_t openjfx_skia_surface_clear(
     uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
 /** Fills an axis-aligned rectangle with anti-aliased Skia drawing. */
+OPENJFX_API int32_t openjfx_skia_surface_push_clip_path(
+    uintptr_t handle,
+    float m00, float m01, float m02,
+    float m10, float m11, float m12,
+    const uint8_t* verbs,  int32_t verbCount,
+    const float*   coords, int32_t coordCount,
+    int32_t fillRule);
+OPENJFX_API int32_t openjfx_skia_surface_pop_clip(uintptr_t handle);
+OPENJFX_API int32_t openjfx_skia_surface_set_image_filter(uintptr_t handle, int32_t nearest);
+
 OPENJFX_API int32_t openjfx_skia_surface_fill_rect(
     uintptr_t handle,
     int32_t   x,
@@ -554,6 +564,16 @@ OPENJFX_API void openjfx_skia_svg_destroy(uintptr_t svgHandle);
  */
 OPENJFX_API int32_t openjfx_skia_surface_save_layer_with_filter(
     uintptr_t handle, uintptr_t filterHandle);
+
+/*
+ * Sets (or clears) the sticky stroke dash pattern on the surface state.
+ * `intervals` holds on/off lengths in user space; `count` must be >= 2 (a
+ * count < 2 or null pointer clears the dash → solid strokes). The pattern is
+ * applied by configureStroke / configureStrokeShader to subsequent strokes
+ * and persists until changed. Fills are unaffected.
+ */
+OPENJFX_API int32_t openjfx_skia_surface_set_stroke_dash(
+    uintptr_t handle, const float* intervals, int32_t count, float phase);
 
 /* ===========================================================================
  * SkShader lifecycle.
@@ -1084,7 +1104,7 @@ OPENJFX_API int32_t openjfx_skia_surface_read_pixels_argb_stride(
 /**
  * Paint-before-show: GDI-blit the window surface's just-rendered frame onto the
  * window's DWM redirection bitmap (the surface the OS show animation reveals),
- * so a StageStyle.CUSTOM window appears already showing real UI. Call once, on
+ * so a decorated or EXTENDED window appears already showing real UI. Call once, on
  * the render thread, AFTER the pre-show paint and BEFORE Present + ShowWindow.
  * Returns 0 on success, non-zero on failure (caller degrades to prior behavior);
  * -1 off-Windows / without Skia.

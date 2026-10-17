@@ -34,10 +34,21 @@ struct OpenJfxD3DSwapChain;
  * needed to populate {@code GrD3DBackendContext}) does not leak into
  * the main Skia bridge.
  */
-sk_sp<GrDirectContext> openjfxD3DMakeContext();
+/** Which D3D12 adapters openjfxD3DMakeContext may use. */
+enum class D3DAdapterPolicy {
+    HardwareOnly,      // AUTO, first attempt: real GPUs only
+    HardwareThenWarp,  // D3D12 explicitly requested: GPU, else WARP
+    WarpOnly           // AUTO, after hardware D3D12 and GL both failed
+};
+
+sk_sp<GrDirectContext> openjfxD3DMakeContext(
+    D3DAdapterPolicy policy = D3DAdapterPolicy::HardwareThenWarp);
 
 /** True if DXGI_FEATURE_PRESENT_ALLOW_TEARING was detected at init. */
 bool openjfxD3DAllowTearing();
+
+/** True when the D3D12 device is the WARP software rasterizer (no usable GPU). */
+bool openjfxD3DIsWarp();
 
 /**
  * Creates a DXGI flip-model swap chain attached to `hwnd`, wraps each
@@ -92,7 +103,15 @@ int32_t openjfxD3DResize(OpenJfxD3DSwapChain* sc,
                          int32_t width, int32_t height,
                          GrDirectContext* grCtx);
 
-/** Releases the swap chain + per-buffer surfaces. */
-void openjfxD3DDestroySwapChain(OpenJfxD3DSwapChain* sc);
+/**
+ * Releases the swap chain + per-buffer surfaces. When {@code grCtx} is given,
+ * Skia is flushed synchronously after the back-buffer SkSurfaces are dropped so
+ * it releases its own refs on the buffers' ID3D12Resources BEFORE the swap
+ * chain is released. Without that the DXGI swap chain outlives Release() and a
+ * new CreateSwapChainForHwnd on the same HWND fails (one flip-model swap chain
+ * per HWND) — e.g. on every Stage.setScene.
+ */
+void openjfxD3DDestroySwapChain(OpenJfxD3DSwapChain* sc,
+                                GrDirectContext* grCtx = nullptr);
 
 #endif /* OPENJFX_SKIA_D3D_WIN_H */

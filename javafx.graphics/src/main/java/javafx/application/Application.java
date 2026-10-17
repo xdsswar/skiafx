@@ -181,8 +181,8 @@ public class MyApp extends Application {
  * {@code Application} is parameterized on the stage type {@code W}, which
  * must be a {@link Stage} or a subclass of it. This lets an application
  * use a <em>custom window class</em> as its primary stage — for example a
- * {@code Stage} subclass that draws its own title bar (see
- * {@code StageStyle.CUSTOM}) or adds app-specific window API. The
+ * {@code Stage} subclass that builds its own title bar with
+ * {@code StageStyle.EXTENDED} and {@code HeaderBar}, or adds app-specific window API. The
  * {@link #start(Stage) start} method then receives that exact type:
  * </p>
  * <pre>{@code

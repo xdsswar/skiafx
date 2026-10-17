@@ -57,7 +57,7 @@ class WinWindow extends Window {
         super(owner, screen, styleMask);
 
         if (isExtendedWindow()) {
-            prefHeaderButtonHeightProperty().subscribe(this::onPrefHeaderButtonHeightChanged);
+            headerButtonHeightProperty().subscribe(this::onPrefHeaderButtonHeightChanged);
         }
     }
 
@@ -290,18 +290,6 @@ class WinWindow extends Window {
     native private long _getInsets(long ptr);
     native private long _getAnchor(long ptr);
     native private void _showSystemMenu(long ptr, int x, int y);
-
-    // ---- skia-fx DWM accent setters for StageStyle.CUSTOM windows ----
-    // argb = -1 means "platform default" (resets the attribute).
-    native private void _setDwmCaptionColor(long ptr, int argb);
-    native private void _setDwmTextColor(long ptr, int argb);
-    native private void _setDwmBorderColor(long ptr, int argb);
-    native private void _setDwmCornerPreference(long ptr, int pref);
-
-    @Override public void setDwmCaptionColor(int argb)     { _setDwmCaptionColor(getRawHandle(), argb); }
-    @Override public void setDwmTextColor(int argb)        { _setDwmTextColor(getRawHandle(), argb); }
-    @Override public void setDwmBorderColor(int argb)      { _setDwmBorderColor(getRawHandle(), argb); }
-    @Override public void setDwmCornerPreference(int pref) { _setDwmCornerPreference(getRawHandle(), pref); }
     @Override native protected long _createWindow(long ownerPtr, long screenPtr, int mask);
     @Override native protected boolean _close(long ptr);
     @Override native protected boolean _setView(long ptr, View view);
@@ -415,47 +403,9 @@ class WinWindow extends Window {
             isModal() || getOwner() != null, isUtilityWindow(),
             (getStyleMask() & RIGHT_TO_LEFT) != 0);
 
-        overlay.prefButtonHeightProperty().bind(prefHeaderButtonHeightProperty());
+        overlay.buttonPrefHeightProperty().bind(headerButtonHeightProperty());
+        overlay.buttonDarkStyleProperty().bind(headerButtonDarkStyleProperty());
         return overlay;
-    }
-
-    /**
-     * skia-fx: WM_NCHITTEST callback for the custom-decorations
-     * WindowProc (see native-glass/win/custom/CustomWinProc.cpp).
-     * Returns a Win32 HT_* code given a DIP-coordinate hit point on
-     * the scene. Delegates to the {@link HitTestProvider} installed
-     * by {@code WindowStage} when the stage's style is
-     * {@code StageStyle.CUSTOM}; falls
-     * back to {@code HTCLIENT} or {@code HTTOP} for windows without
-     * a provider (custom-decoration mode would normally not be active
-     * for those, but the callback is a no-op if it ever fires).
-     *
-     * <p>Called from the platform message thread on every
-     * WM_NCHITTEST. Implementations must be thread-safe — the
-     * standard provider reads an immutable volatile snapshot built
-     * on the FX thread.</p>
-     *
-     * @param x the scene-coordinate X in DIP
-     * @param y the scene-coordinate Y in DIP
-     * @param onResizeBorder true if the native side flagged the cursor
-     *                       as being inside the top resize-handle band
-     */
-    @SuppressWarnings("unused")
-    private int jniHitTest(int x, int y, boolean onResizeBorder) {
-        return notifyHitTest(x, y, onResizeBorder);
-    }
-
-    /**
-     * skia-fx: WM_NCMOUSELEAVE callback. Fired by the custom-
-     * decorations WindowProc when the cursor has been verified to
-     * have left the window AND the OS modal sizing/moving loop is
-     * not active. Clears any sticky {@code :ht-*} pseudo-class so a
-     * close/min/max button doesn't stay in its hover state after the
-     * mouse is gone.
-     */
-    @SuppressWarnings("unused")
-    private void jniClearHitRegions() {
-        notifyHitRegionsCleared();
     }
 
     /**

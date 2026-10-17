@@ -30,6 +30,22 @@ public final class NativeBridge {
 
     private static final SymbolLookup LOOKUP = loadLibrary();
 
+    /**
+     * Linker option for short, non-blocking leaf downcalls on the per-draw hot
+     * path (begin/end bracket, rect/oval/rrect fills + strokes). These never
+     * call back into Java and never block, so skipping the Java-to-native
+     * thread-state transition is safe and removes a fixed per-call cost that
+     * is paid thousands of times per frame (three crossings per shape). Heap
+     * access stays disallowed: arguments are primitives / native addresses.
+     * {@code -Dskia.ffm.critical=false} turns it off — profilers (JFR native
+     * method sampling) only attribute time to these natives when they make the
+     * normal thread-state transition.
+     */
+    private static final Linker.Option[] CRITICAL =
+        Boolean.parseBoolean(System.getProperty("skia.ffm.critical", "true"))
+            ? new Linker.Option[] { Linker.Option.critical(false) }
+            : new Linker.Option[0];
+
     private static final MethodHandle MH_VERSION = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_version"),
         FunctionDescriptor.of(ValueLayout.ADDRESS));
@@ -55,6 +71,47 @@ public final class NativeBridge {
         .orElse(null);
 
     private static final MethodHandle MH_GET_ACTIVE_BACKEND = LOOKUP.find("openjfx_skia_get_active_backend")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+        .orElse(null);
+
+    // Optional GPU memory management (find(): absent on older native libs).
+    private static final MethodHandle MH_SET_RESOURCE_CACHE_LIMIT = LOOKUP.find("openjfx_skia_set_resource_cache_limit")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.ofVoid(ValueLayout.JAVA_LONG)))
+        .orElse(null);
+
+    private static final MethodHandle MH_GPU_HOUSEKEEPING = LOOKUP.find("openjfx_skia_gpu_housekeeping")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.ofVoid()))
+        .orElse(null);
+
+    private static final MethodHandle MH_GPU_PURGE = LOOKUP.find("openjfx_skia_gpu_purge")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.ofVoid()))
+        .orElse(null);
+
+    private static final MethodHandle MH_GPU_CACHE_USAGE = LOOKUP.find("openjfx_skia_gpu_cache_usage")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.ofVoid(ValueLayout.ADDRESS, ValueLayout.ADDRESS)))
+        .orElse(null);
+
+    private static final MethodHandle MH_SURFACE_SET_IMAGE_FILTER = LOOKUP.find("openjfx_skia_surface_set_image_filter")
+        .map(s -> LINKER.downcallHandle(s,
+            FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS, ValueLayout.JAVA_INT), CRITICAL))
+        .orElse(null);
+
+    private static final MethodHandle MH_SURFACE_PUSH_CLIP_PATH = LOOKUP.find("openjfx_skia_surface_push_clip_path")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
+            ValueLayout.JAVA_INT,
+            ValueLayout.ADDRESS,
+            ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+            ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+            ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+            ValueLayout.ADDRESS, ValueLayout.JAVA_INT,
+            ValueLayout.JAVA_INT)))
+        .orElse(null);
+
+    private static final MethodHandle MH_SURFACE_POP_CLIP = LOOKUP.find("openjfx_skia_surface_pop_clip")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS)))
+        .orElse(null);
+
+    private static final MethodHandle MH_IS_SOFTWARE_DEVICE = LOOKUP.find("openjfx_skia_is_software_device")
         .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
         .orElse(null);
 
@@ -198,7 +255,7 @@ public final class NativeBridge {
             ValueLayout.JAVA_INT,
             ValueLayout.ADDRESS,
             ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE,
-            ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE));
+            ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE), CRITICAL);
 
     private static final MethodHandle MH_SURFACE_FILL_RECT = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_fill_rect"),
@@ -208,7 +265,7 @@ public final class NativeBridge {
             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,
             ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE,
-            ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE));
+            ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE), CRITICAL);
 
     // ---- Filled shape primitives -------------------------------------------
 
@@ -262,16 +319,16 @@ public final class NativeBridge {
         ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE);
 
     private static final MethodHandle MH_SURFACE_FILL_ROUND_RECT = LINKER.downcallHandle(
-        LOOKUP.findOrThrow("openjfx_skia_surface_fill_round_rect"), FD_FILLED_RRECT);
+        LOOKUP.findOrThrow("openjfx_skia_surface_fill_round_rect"), FD_FILLED_RRECT, CRITICAL);
 
     private static final MethodHandle MH_SURFACE_FILL_OVAL = LINKER.downcallHandle(
-        LOOKUP.findOrThrow("openjfx_skia_surface_fill_oval"), FD_FILLED_OVAL);
+        LOOKUP.findOrThrow("openjfx_skia_surface_fill_oval"), FD_FILLED_OVAL, CRITICAL);
 
     private static final MethodHandle MH_SURFACE_STROKE_RECT = LINKER.downcallHandle(
-        LOOKUP.findOrThrow("openjfx_skia_surface_stroke_rect"), FD_STROKE_RECT);
+        LOOKUP.findOrThrow("openjfx_skia_surface_stroke_rect"), FD_STROKE_RECT, CRITICAL);
 
     private static final MethodHandle MH_SURFACE_STROKE_ROUND_RECT = LINKER.downcallHandle(
-        LOOKUP.findOrThrow("openjfx_skia_surface_stroke_round_rect"), FD_STROKE_RRECT);
+        LOOKUP.findOrThrow("openjfx_skia_surface_stroke_round_rect"), FD_STROKE_RRECT, CRITICAL);
 
     private static final MethodHandle MH_SURFACE_STROKE_OVAL = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_stroke_oval"),
@@ -283,10 +340,10 @@ public final class NativeBridge {
             ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_INT,
             ValueLayout.JAVA_INT,   ValueLayout.JAVA_FLOAT,
             ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE,
-            ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE));
+            ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE), CRITICAL);
 
     private static final MethodHandle MH_SURFACE_STROKE_LINE = LINKER.downcallHandle(
-        LOOKUP.findOrThrow("openjfx_skia_surface_stroke_line"), FD_STROKE_LINE);
+        LOOKUP.findOrThrow("openjfx_skia_surface_stroke_line"), FD_STROKE_LINE, CRITICAL);
 
     // ---- Arbitrary path ----------------------------------------------------
 
@@ -520,11 +577,11 @@ public final class NativeBridge {
             ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,           // clipX,Y,W,H
             ValueLayout.JAVA_INT,                                 // hasClip
             ValueLayout.JAVA_INT,                                 // blendMode
-            ValueLayout.JAVA_FLOAT));                             // extraAlpha
+            ValueLayout.JAVA_FLOAT), CRITICAL);                             // extraAlpha
 
     private static final MethodHandle MH_SURFACE_END_DRAW = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_end_draw"),
-        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS));
+        FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.ADDRESS), CRITICAL);
 
     private static final MethodHandle MH_SURFACE_TRANSLATE = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_translate"),
@@ -981,6 +1038,18 @@ public final class NativeBridge {
             ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE,
             ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE));
 
+    // Optional: sticky stroke dash pattern. find() so an older native lib
+    // (without the symbol) degrades to solid strokes instead of failing load.
+    private static final MethodHandle MH_SURFACE_SET_STROKE_DASH =
+        LOOKUP.find("openjfx_skia_surface_set_stroke_dash")
+            .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS,                 // surface handle
+                ValueLayout.ADDRESS,                 // intervals (float*)
+                ValueLayout.JAVA_INT,                // count
+                ValueLayout.JAVA_FLOAT)))            // phase
+            .orElse(null);
+
     private static final MethodHandle MH_SURFACE_REPLACE_BACKING_ARGB = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_replace_backing_argb"),
         FunctionDescriptor.of(
@@ -1151,6 +1220,124 @@ public final class NativeBridge {
      * The backend actually backing the GrDirectContext: {@link #BACKEND_AUTO} (0) when
      * not yet created or unknown, {@link #BACKEND_GL} (1), or {@link #BACKEND_D3D12} (2).
      */
+    /** True when this native build supports {@link #surfacePushClipPath}. */
+    public static boolean hasPathClip() {
+        return MH_SURFACE_PUSH_CLIP_PATH != null && MH_SURFACE_POP_CLIP != null;
+    }
+
+    /**
+     * Pushes an anti-aliased path clip (path in local space, matrix maps it to
+     * device pixels) that stays active until {@link #surfacePopClip}. Returns 0
+     * on success; on any non-zero result nothing was pushed.
+     */
+    public static int surfacePushClipPath(MemorySegment handle,
+                                          float m00, float m01, float m02,
+                                          float m10, float m11, float m12,
+                                          MemorySegment verbs, int verbCount,
+                                          MemorySegment coords, int coordCount,
+                                          int fillRule) {
+        if (MH_SURFACE_PUSH_CLIP_PATH == null) return -1;
+        try {
+            return (int) MH_SURFACE_PUSH_CLIP_PATH.invokeExact(handle,
+                m00, m01, m02, m10, m11, m12,
+                verbs, verbCount, coords, coordCount, fillRule);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /** Pops a clip pushed by {@link #surfacePushClipPath}. */
+    public static int surfacePopClip(MemorySegment handle) {
+        if (MH_SURFACE_POP_CLIP == null) return -1;
+        try {
+            return (int) MH_SURFACE_POP_CLIP.invokeExact(handle);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    /**
+     * Sets the sticky image sampling mode of a surface for subsequent image /
+     * surface draws: {@code true} = nearest-neighbour (unsmoothed), {@code
+     * false} = bilinear. No-op on builds without the entry point.
+     */
+    public static void surfaceSetImageFilter(MemorySegment handle, boolean nearest) {
+        if (MH_SURFACE_SET_IMAGE_FILTER == null) return;
+        try {
+            int rc = (int) MH_SURFACE_SET_IMAGE_FILTER.invokeExact(handle, nearest ? 1 : 0);
+        } catch (Throwable t) {
+            // optional
+        }
+    }
+
+    /**
+     * Sets Skia's GPU resource-cache budget (bytes). Takes effect when the GPU
+     * context is built, and immediately if it already exists. {@code <= 0}
+     * keeps Skia's default. No-op on builds without the entry point.
+     */
+    public static void setResourceCacheLimit(long bytes) {
+        if (MH_SET_RESOURCE_CACHE_LIMIT == null) return;
+        try {
+            MH_SET_RESOURCE_CACHE_LIMIT.invokeExact(bytes);
+        } catch (Throwable t) {
+            // optional
+        }
+    }
+
+    /**
+     * Per-present GPU housekeeping (rate-limited natively to about once a
+     * second): releases Skia GPU resources unused for 5 s. Render thread only.
+     */
+    public static void gpuHousekeeping() {
+        if (MH_GPU_HOUSEKEEPING == null) return;
+        try {
+            MH_GPU_HOUSEKEEPING.invokeExact();
+        } catch (Throwable t) {
+            // optional
+        }
+    }
+
+    /** Frees every unlocked Skia GPU resource now. Render thread only. */
+    public static void gpuPurge() {
+        if (MH_GPU_PURGE == null) return;
+        try {
+            MH_GPU_PURGE.invokeExact();
+        } catch (Throwable t) {
+            // optional
+        }
+    }
+
+    /**
+     * Skia GPU resource-cache usage as {@code {totalBytes, purgeableBytes}};
+     * zeros when no GPU context exists or the entry point is absent. Render
+     * thread only. Diagnostic path — allocates a small confined arena.
+     */
+    public static long[] gpuCacheUsage() {
+        if (MH_GPU_CACHE_USAGE == null) return new long[2];
+        try (Arena a = Arena.ofConfined()) {
+            MemorySegment used = a.allocate(ValueLayout.JAVA_LONG);
+            MemorySegment purge = a.allocate(ValueLayout.JAVA_LONG);
+            MH_GPU_CACHE_USAGE.invokeExact(used, purge);
+            return new long[] { used.get(ValueLayout.JAVA_LONG, 0), purge.get(ValueLayout.JAVA_LONG, 0) };
+        } catch (Throwable t) {
+            return new long[2];
+        }
+    }
+
+    /**
+     * True when the active GPU backend runs on a software rasterizer (D3D12
+     * WARP, auto-selected when no usable GPU or driver exists). {@code false}
+     * on hardware devices and on builds without the query.
+     */
+    public static boolean isSoftwareDevice() {
+        if (MH_IS_SOFTWARE_DEVICE == null) return false;
+        try {
+            return ((int) MH_IS_SOFTWARE_DEVICE.invokeExact()) != 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
     public static int activeBackend() {
         if (MH_GET_ACTIVE_BACKEND == null) return BACKEND_AUTO;
         try {
@@ -2493,6 +2680,31 @@ public final class NativeBridge {
                 (byte) r, (byte) g, (byte) b, (byte) a);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_surface_stroke_path failed", t);
+        }
+    }
+
+    /**
+     * Sets (or clears) the sticky stroke dash on the surface. {@code dash} of
+     * null or length &lt; 2 clears it (solid strokes). No-op on an older native
+     * lib that lacks the symbol. The dash is consumed by subsequent strokes
+     * until changed; fills are unaffected.
+     */
+    public static void surfaceSetStrokeDash(MemorySegment handle, float[] dash, float phase) {
+        if (MH_SURFACE_SET_STROKE_DASH == null) return;
+        try {
+            if (dash == null || dash.length < 2) {
+                int ignored = (int) MH_SURFACE_SET_STROKE_DASH.invokeExact(
+                    handle, MemorySegment.NULL, 0, 0f);
+                return;
+            }
+            try (Arena arena = Arena.ofConfined()) {
+                MemorySegment seg = arena.allocate(ValueLayout.JAVA_FLOAT, dash.length);
+                MemorySegment.copy(dash, 0, seg, ValueLayout.JAVA_FLOAT, 0, dash.length);
+                int ignored = (int) MH_SURFACE_SET_STROKE_DASH.invokeExact(
+                    handle, seg, dash.length, phase);
+            }
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_set_stroke_dash failed", t);
         }
     }
 

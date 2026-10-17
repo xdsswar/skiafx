@@ -80,6 +80,15 @@ if (hasNative) {
         doFirst { nativeBuildDir.get().asFile.mkdirs() }
 
         executable 'cmake'
+        // JNI headers come from the project's Java toolchain, not the
+        // caller's environment. IDE-launched Gradle (IntelliJ) has no
+        // JAVA_HOME, which broke jfxmedia's configure and left FindJNI
+        // probing the registry/PATH for whatever JDK it could find.
+        if (pluginManager.hasPlugin('java')) {
+            def toolchainJdk = javaToolchains.compilerFor(java.toolchain)
+                .get().metadata.installationPath.asFile.absolutePath
+            environment 'JAVA_HOME', toolchainJdk
+        }
         def cmakeArgs = [
             '-S', nativeRoot.absolutePath,
             '-B', nativeBuildDir.get().asFile.absolutePath,

@@ -204,17 +204,13 @@ public final class ShowcaseController {
         selectNav("overview");
     }
 
-    /** Called by ShowcaseApp once the Stage exists: wire custom chrome. */
+    /**
+     * Called by ShowcaseApp once the Stage exists. Drag area and caption
+     * button actions are declared on the HeaderBar in showcase.fxml; this
+     * only keeps the maximize glyph and size readout in sync.
+     */
     void installStage(Stage stage) {
         this.stage = stage;
-        stage.setCaptionRegions(captionRegion);
-        stage.setMinRegion(minBtn);
-        stage.setMaxRegion(maxBtn);
-        stage.setCloseRegion(closeBtn);
-
-        minBtn.setOnMouseClicked(e -> stage.setIconified(true));
-        maxBtn.setOnMouseClicked(e -> stage.setMaximized(!stage.isMaximized()));
-        closeBtn.setOnMouseClicked(e -> stage.close());
 
         maxIcon.setContent(stage.isMaximized() ? SVG_RESTORE : SVG_MAX);
         stage.maximizedProperty().addListener((o, was, isMax) ->

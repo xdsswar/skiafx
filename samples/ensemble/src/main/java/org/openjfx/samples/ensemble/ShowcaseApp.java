@@ -1,9 +1,9 @@
 /*
  * ShowcaseApp — entry point for the skia-fx Showcase Dashboard.
  *
- * Loads the FXML shell, attaches the light stylesheet, opens a custom-
- * decorated (StageStyle.CUSTOM) window and lets the controller register
- * the caption / min / max / close hit regions.
+ * Loads the FXML shell, attaches the light stylesheet and opens a
+ * StageStyle.EXTENDED window whose title bar (a HeaderBar declared in
+ * the FXML) draws its own caption buttons.
  *
  * Run: ./gradlew :samples:ensemble:runShowcase
  */
@@ -16,6 +16,7 @@ import javafx.application.Application;
 import javafx.fxml.FXMLLoader;
 import javafx.scene.Parent;
 import javafx.scene.Scene;
+import javafx.scene.layout.HeaderBar;
 import javafx.stage.Stage;
 import javafx.stage.StageStyle;
 
@@ -40,7 +41,9 @@ public final class ShowcaseApp extends Application<Stage> {
         URL css = locate("showcase.css");
         if (css != null) scene.getStylesheets().add(css.toExternalForm());
 
-        stage.initStyle(StageStyle.CUSTOM);
+        stage.initStyle(StageStyle.EXTENDED);
+        // The title bar draws its own caption buttons; hide the system ones.
+        HeaderBar.setSystemButtonHeight(stage, 0);
         stage.setTitle("skia-fx · Showcase Dashboard");
         stage.setMinWidth(720);
         stage.setMinHeight(520);

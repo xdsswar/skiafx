@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2008, 2025, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2008, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -31,6 +31,7 @@ import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
 
+import javafx.application.Platform;
 import javafx.scene.input.KeyCombination;
 import javafx.stage.Modality;
 import javafx.stage.Stage;
@@ -105,8 +106,8 @@ public class WindowStage extends GlassStage {
     // (platformWindow.setVisible first, render later).
     private volatile boolean paintBeforeShow = false;
     private volatile CountDownLatch firstPresentLatch;
-    // 500 ms covers first-paint latency for the CUSTOM-decorated
-    // case where the subclassed CustomWinProc + initial pulse +
+    // 500 ms covers first-paint latency for the slow case where the
+    // initial pulse +
     // SkiaPresentable creation + paint + present can take ~200-300
     // ms cold. Stock windows usually finish in ~150 ms but the
     // common cap is sized for the slower path.
@@ -227,15 +228,6 @@ public class WindowStage extends GlassStage {
                     case UTILITY:
                         windowMask |=  Window.TITLED | Window.UTILITY | Window.CLOSABLE;
                         break;
-                    case CUSTOM:
-                        // skia-fx: no platform decorations at all — application owns the
-                        // title bar via the scene graph. CLOSABLE / MINIMIZABLE /
-                        // MAXIMIZABLE are still set so the system menu (right-click on
-                        // a caption region) shows the correct enabled actions.
-                        windowMask |= Window.UNTITLED
-                                    | Window.CUSTOM_DECORATIONS
-                                    | Window.CLOSABLE | Window.MINIMIZABLE | Window.MAXIMIZABLE;
-                        break;
                     default:
                         windowMask |= (transparent ? Window.TRANSPARENT : Window.UNTITLED) | Window.CLOSABLE;
                         break;
@@ -257,17 +249,6 @@ public class WindowStage extends GlassStage {
             platformWindow = app.createWindow(ownerWindow, Screen.getMainScreen(), windowMask);
             platformWindow.setResizable(resizable);
             platformWindow.setFocusable(focusable);
-
-            // skia-fx: install the per-window hit-test provider for
-            // StageStyle.CUSTOM. The native WM_NCHITTEST handler
-            // invokes Window.notifyHitTest → provider.hitTest(...)
-            // on every non-client hit; the provider walks the
-            // volatile snapshot maintained by the application via
-            // Stage.set*Region(...).
-            if (style == StageStyle.CUSTOM) {
-                installCustomDecorationsHitTestProvider();
-                applyDwmAccentsFromStage();
-            }
 
             if (platformWindow.isExtendedWindow()) {
                 platformWindow.headerButtonOverlayProperty().subscribe(overlay -> {
@@ -320,134 +301,6 @@ public class WindowStage extends GlassStage {
             listener.changedHeaderButtonMetrics(
                 new HeaderButtonMetrics(metrics.leftInset(), metrics.rightInset(), metrics.minHeight()));
         }
-    }
-
-    /**
-     * skia-fx: installs a {@link Window.HitTestProvider} on the
-     * platform window that resolves WM_NCHITTEST (or platform
-     * equivalent) hits to {@link Window#HT_CAPTION}, HT_CLOSE, etc.
-     * by walking the immutable snapshot held by the Stage's
-     * {@link com.sun.javafx.stage.custom.CustomDecorations}.
-     *
-     * <p>The provider re-reads the snapshot reference on every
-     * call, so application code can mutate the regions at any time
-     * (from the FX thread) and the next non-client mouse event
-     * will see the new layout.</p>
-     */
-    /**
-     * skia-fx: push the application-set DWM accent values
-     * (titlebar color, caption text color, border color, corner
-     * preference) from the Stage's {@link com.sun.javafx.stage.custom.CustomDecorations}
-     * to the platform window. Called from
-     * {@link #initPlatformWindow} once the {@code platformWindow}
-     * exists and again from {@code Stage.set*Color(...)} setters
-     * so live updates are visible.
-     *
-     * <p>No-op on platforms whose Glass {@code Window} doesn't
-     * implement the DWM-accent setters (currently Windows only).</p>
-     */
-    public void applyDwmAccentsFromStage() {
-        if (fxStage == null || platformWindow == null) return;
-        var accessor = com.sun.javafx.stage.StageHelper.getStageAccessor();
-        if (accessor == null) return;
-        var decorations = accessor.getCustomDecorations(fxStage);
-        if (decorations == null) return;
-
-        // Setters are no-ops on platforms whose Glass Window doesn't
-        // implement DWM accents (currently Windows only); passing
-        // -1 = "platform default" leaves the OS-painted accent
-        // alone when the user hasn't customised the colour.
-        platformWindow.setDwmCaptionColor(toArgb(decorations.getTitleBarColor()));
-        platformWindow.setDwmTextColor(toArgb(decorations.getCaptionTextColor()));
-        platformWindow.setDwmBorderColor(toArgb(decorations.getBorderColor()));
-        platformWindow.setDwmCornerPreference(cornerPrefToInt(decorations.getCornerPreference()));
-
-        // Also push the title-bar colour to the HWND class background
-        // brush so transient OS-driven erases (resize / maximize /
-        // restore where the OS reallocates the redirection bitmap)
-        // fill with the application's accent colour instead of the
-        // default white. CustomWinProc's WM_ERASEBKGND uses this
-        // brush. No-op if the user didn't customise the colour.
-        var bg = decorations.getTitleBarColor();
-        if (bg != null) {
-            platformWindow.setBackground((float) bg.getRed(),
-                                         (float) bg.getGreen(),
-                                         (float) bg.getBlue());
-        }
-    }
-
-    private static int toArgb(javafx.scene.paint.Color c) {
-        if (c == null) return -1;  // DWM "default" sentinel
-        int a = (int) Math.round(c.getOpacity() * 255.0);
-        int r = (int) Math.round(c.getRed()     * 255.0);
-        int g = (int) Math.round(c.getGreen()   * 255.0);
-        int b = (int) Math.round(c.getBlue()    * 255.0);
-        return (a << 24) | (r << 16) | (g << 8) | b;
-    }
-
-    private static int cornerPrefToInt(javafx.stage.WindowCornerPreference p) {
-        if (p == null) return 0; // DEFAULT
-        return switch (p) {
-            case DEFAULT     -> 0;
-            case SQUARE      -> 1; // DWMWCP_DONOTROUND
-            case ROUND       -> 2; // DWMWCP_ROUND
-            case ROUND_SMALL -> 3; // DWMWCP_ROUNDSMALL
-        };
-    }
-
-    private void installCustomDecorationsHitTestProvider() {
-        if (fxStage == null || platformWindow == null) return;
-        platformWindow.setHitTestProvider(new Window.HitTestProvider() {
-            @Override
-            public int hitTest(int sceneX, int sceneY, boolean onResizeBorder) {
-                var accessor = com.sun.javafx.stage.StageHelper.getStageAccessor();
-                if (accessor == null) return Window.HT_CLIENT;
-                var decorations = accessor.getCustomDecorations(fxStage);
-                if (decorations == null) {
-                    return onResizeBorder ? Window.HT_TOP : Window.HT_CLIENT;
-                }
-
-                // Find the matching hit region (if any) and route the
-                // hover pseudo-class through the same call. updateHovered
-                // is a no-op when the hovered region didn't change, so
-                // it's cheap to invoke on every WM_NCHITTEST.
-                var match = decorations.findRegionAt(sceneX, sceneY);
-                decorations.updateHovered(match);
-                if (match != null) {
-                    int code = match.htCode();
-                    // When the cursor sits inside the implicit top
-                    // resize band, the band wins over a caption hit
-                    // so OS resize engages on the top edge of the
-                    // application's drawn title bar. Button hits
-                    // (close / min / max / fullscreen / sysmenu)
-                    // still win — they sit visually on the caption
-                    // but should always click, not resize.
-                    if (onResizeBorder && code == com.sun.javafx.stage.custom.HitRegion.HT_CAPTION) {
-                        return Window.HT_TOP;
-                    }
-                    return code;
-                }
-                // No region matched — caller is over the bare client
-                // area. Promote to HT_TOP when the cursor lies in the
-                // implicit top resize border so OS resize still works
-                // through the application's drawn title bar.
-                return onResizeBorder ? Window.HT_TOP : Window.HT_CLIENT;
-            }
-
-            @Override
-            public void clear() {
-                // Native fired WM_NCMOUSELEAVE (cursor verified outside
-                // the window, no modal sizing/moving loop active).
-                // Drop the hovered region so any sticky :ht-*
-                // pseudo-class is removed.
-                var accessor = com.sun.javafx.stage.StageHelper.getStageAccessor();
-                if (accessor == null) return;
-                var decorations = accessor.getCustomDecorations(fxStage);
-                if (decorations != null) {
-                    decorations.updateHovered(null);
-                }
-            }
-        });
     }
 
     public final Window getPlatformWindow() {
@@ -760,14 +613,12 @@ public class WindowStage extends GlassStage {
         // iconified state already have a populated redirection
         // bitmap and go through the stock path.
         //
-        // StageStyle.CUSTOM: WS_OVERLAPPEDWINDOW windows have a DWM
-        // redirection bitmap separate from the Skia swap chain, and the
-        // OS show animation reveals that bitmap — which a flip-model
-        // swap-chain Present alone cannot reach. We still paint-before-
-        // show them: PresentingPainter calls SkiaPresentable
+        // Decorated / EXTENDED windows have a DWM redirection bitmap
+        // separate from the Skia swap chain, and the OS show animation
+        // reveals that bitmap — which a flip-model swap-chain Present
+        // alone cannot reach. PresentingPainter calls SkiaPresentable
         // .primeWindowForShow() (native GDI blit of the rendered frame
-        // onto the redirection bitmap, the same surface CustomWinProc's
-        // WM_ERASEBKGND fills) just before Present, so the OS-native show
+        // onto the redirection bitmap) just before Present, so the OS-native show
         // animation reveals the real first frame instead of a flash.
         //
         // Disabled for popup stages (ComboBox/Menu/ColorPicker/DatePicker
@@ -856,6 +707,23 @@ public class WindowStage extends GlassStage {
             GlassScene gs = getScene();
             if (gs != null) {
                 gs.entireSceneNeedsRepaint();
+                // The synchronous repaint above runs while still inside this
+                // setVisible call — before the OS has finished realizing the
+                // window (WM_SHOWWINDOW handled, swap chain / redirection
+                // bitmap live). On a heavy first frame that present can race
+                // ShowWindow and miss the live window, and a static scene
+                // (no animation) then never gets another pulse until an
+                // external event such as a resize — the "blank until I resize"
+                // symptom. Re-assert the repaint on the next FX cycle, after
+                // the window is fully up (this is effectively what a resize
+                // does). One-shot per show, async, harmless if redundant; only
+                // the decorated, non-popup show path reaches here.
+                Platform.runLater(() -> {
+                    GlassScene s = getScene();
+                    if (s != null) {
+                        s.entireSceneNeedsRepaint();
+                    }
+                });
             }
         } else {
             QuantumToolkit.runWithRenderLock(() -> {
@@ -1226,9 +1094,16 @@ public class WindowStage extends GlassStage {
     }
 
     @Override
-    public void setPrefHeaderButtonHeight(double height) {
+    public void setHeaderButtonHeight(double height) {
         if (platformWindow != null) {
-            platformWindow.setPrefHeaderButtonHeight(height);
+            platformWindow.setHeaderButtonHeight(height);
+        }
+    }
+
+    @Override
+    public void setHeaderButtonDarkStyle(boolean darkStyle) {
+        if (platformWindow != null) {
+            platformWindow.setHeaderButtonDarkStyle(darkStyle);
         }
     }
 

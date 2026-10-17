@@ -4,15 +4,16 @@
   showcase.fxml — shell for the skia-fx Showcase Dashboard.
 
   The shell is declared in FXML; ShowcaseController fills the sidebar nav
-  and builds each section in code. The custom title bar nodes carry fx:ids
-  so the controller can register them as the Stage's caption / min / max /
-  close hit regions (StageStyle.CUSTOM).
+  and builds each section in code. The custom title bar sits in a HeaderBar
+  (StageStyle.EXTENDED): the caption area is draggable and the min / max /
+  close buttons carry a HeaderBar.buttonType.
 -->
 
 <?import javafx.geometry.Insets?>
 <?import javafx.scene.control.Label?>
 <?import javafx.scene.layout.BorderPane?>
 <?import javafx.scene.layout.HBox?>
+<?import javafx.scene.layout.HeaderBar?>
 <?import javafx.scene.layout.Region?>
 <?import javafx.scene.layout.StackPane?>
 <?import javafx.scene.layout.VBox?>
@@ -24,11 +25,13 @@
 
     <!-- ============================================ custom title bar -->
     <top>
-        <HBox fx:id="titleBar" styleClass="title-bar"
+      <HeaderBar minHeight="-Infinity">
+       <center>
+        <HBox fx:id="titleBar" styleClass="title-bar" HeaderBar.alignment="CENTER_LEFT"
               alignment="CENTER" minHeight="40" prefHeight="40">
             <children>
                 <HBox fx:id="captionRegion" alignment="CENTER_LEFT" spacing="10"
-                      HBox.hgrow="ALWAYS">
+                      HBox.hgrow="ALWAYS" HeaderBar.dragType="DRAGGABLE_SUBTREE">
                     <padding><Insets left="14"/></padding>
                     <children>
                         <Region styleClass="app-mark"/>
@@ -37,7 +40,7 @@
                     </children>
                 </HBox>
 
-                <StackPane fx:id="minBtn" styleClass="win-btn, win-btn-min"
+                <StackPane fx:id="minBtn" styleClass="win-btn, win-btn-min" HeaderBar.buttonType="ICONIFY"
                            minWidth="46" prefWidth="46" maxWidth="46"
                            minHeight="40" prefHeight="40" maxHeight="40">
                     <children>
@@ -45,7 +48,7 @@
                     </children>
                 </StackPane>
 
-                <StackPane fx:id="maxBtn" styleClass="win-btn, win-btn-max"
+                <StackPane fx:id="maxBtn" styleClass="win-btn, win-btn-max" HeaderBar.buttonType="MAXIMIZE"
                            minWidth="46" prefWidth="46" maxWidth="46"
                            minHeight="40" prefHeight="40" maxHeight="40">
                     <children>
@@ -54,7 +57,7 @@
                     </children>
                 </StackPane>
 
-                <StackPane fx:id="closeBtn" styleClass="win-btn, win-btn-close"
+                <StackPane fx:id="closeBtn" styleClass="win-btn, win-btn-close" HeaderBar.buttonType="CLOSE"
                            minWidth="46" prefWidth="46" maxWidth="46"
                            minHeight="40" prefHeight="40" maxHeight="40">
                     <children>
@@ -63,6 +66,8 @@
                 </StackPane>
             </children>
         </HBox>
+       </center>
+      </HeaderBar>
     </top>
 
     <!-- ============================================ sidebar -->

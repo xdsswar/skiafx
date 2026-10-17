@@ -18,6 +18,7 @@
 #endif
 
 #include <cstring>
+#include <chrono>
 #include <vector>
 
 #ifdef OPENJFX_WITH_SKIA
@@ -47,6 +48,7 @@
   #include "include/effects/SkImageFilters.h"
   #include "include/effects/SkColorMatrix.h"
   #include "include/effects/SkRuntimeEffect.h"
+  #include "include/effects/SkDashPathEffect.h"
   #include "include/core/SkRect.h"
   #include "include/core/SkPicture.h"
   #include "include/core/SkPictureRecorder.h"
@@ -114,6 +116,32 @@
 #include <mutex>
 
 #ifdef OPENJFX_WITH_SKIA
+constexpr float kTextContrast = 1.0f;              // tuned vs Prism (ClarityShot diff)
+constexpr float kTextGamma    = SK_GAMMA_EXPONENT; // sRGB
+
+// Surface props for every scene surface (window, offscreen RT, raster):
+// carries the text contrast / gamma Skia applies to grayscale glyph masks.
+// Skia's compile-time defaults (contrast 0.5, gamma sRGB) render visibly
+// thinner, lighter text than Prism; the values below were tuned by
+// pixel-diffing against stock JavaFX (ClarityShot). Overridable for tuning:
+// OPENJFX_SKIA_TEXT_CONTRAST / OPENJFX_SKIA_TEXT_GAMMA. Pixel geometry stays
+// unknown (grayscale AA; LCD text is off — see draw_glyphs).
+const SkSurfaceProps* openjfxTextSurfaceProps() {
+    static const SkSurfaceProps props = [] {
+        auto envf = [](const char* k, float def) {
+            const char* v = std::getenv(k);
+            if (!v || !*v) return def;
+            char* end = nullptr;
+            float f = std::strtof(v, &end);
+            return (end && end != v && std::isfinite(f)) ? f : def;
+        };
+        float contrast = envf("OPENJFX_SKIA_TEXT_CONTRAST", kTextContrast);
+        float gamma    = envf("OPENJFX_SKIA_TEXT_GAMMA", kTextGamma);
+        return SkSurfaceProps(0, kUnknown_SkPixelGeometry, contrast, gamma);
+    }();
+    return &props;
+}
+
 namespace {
 
 /**
@@ -132,6 +160,15 @@ struct OpenJfxSurface {
                                   // the back-buffer surfaces live inside `d3d`.
     SkBlendMode      blendMode  = SkBlendMode::kSrcOver;
     float            extraAlpha = 1.0f;
+    // Sticky stroke dash pattern (on/off interval lengths in user space) +
+    // phase, set by surface_set_stroke_dash and consumed by configureStroke /
+    // configureStrokeShader. Empty == solid stroke. Fills never read it.
+    std::vector<float> strokeDash;
+    float              strokeDashPhase = 0.0f;
+    // Sticky image sampling for draw_image / draw_image_rect / draw_surface:
+    // true = nearest (Texture.getLinearFiltering()==false, e.g.
+    // GraphicsContext.setImageSmoothing(false) / ImageView.setSmooth(false)).
+    bool               imageNearest = false;
     // skia-fx: tracks surface_save vs surface_restore from
     // WCGraphicsPrismContext.SkiaClipLayer (NOT begin_draw/end_draw —
     // those are always-balanced per-draw brackets). An imbalance would
@@ -389,25 +426,42 @@ inline void applyState(SkPaint& paint, const OpenJfxSurface& st) {
     }
 }
 
-// True when an image blit is pixel-aligned and unscaled: source and
-// destination rects are the same size with integer coordinates, and the
-// canvas CTM is at most an integer translation. In that case kNearest
+// True when an image blit is pixel-aligned and unscaled IN DEVICE SPACE: the
+// integer source rect maps (through the CTM, incl. the HiDPI scale) onto a
+// same-size rect at an integer device origin; *deviceDst gets that rect. In
+// that case kNearest
 // sampling is pixel-for-pixel identical to kLinear but hits Skia's
 // specialized raster blitters instead of the general bilinear pipeline —
 // measured ~25 ms -> sub-ms for a 780x420 cached-node blit on the
 // software path (~73 ns/px down the slow path).
 inline bool isPixelAlignedBlit(SkCanvas* cv,
                                float sx, float sy, float sw, float sh,
-                               float dx, float dy, float dw, float dh) {
-    if (sw != dw || sh != dh) return false;
-    auto isInt = [](float v) { return v == floorf(v); };
-    if (!isInt(sx) || !isInt(sy) || !isInt(dx) || !isInt(dy)
-        || !isInt(sw) || !isInt(sh)) return false;
+                               float dx, float dy, float dw, float dh,
+                               SkRect* deviceDst) {
+    // Tested in DEVICE space: the CTM carries the HiDPI pixel scale (and any
+    // integer/fractional translate), so a 1:1 blit at 125% has dw != sw in
+    // local units but maps to exactly sw device pixels. Tolerances absorb the
+    // float error of logical<->device round trips (e.g. 13/1.25*1.25).
+    constexpr float kEps = 1e-3f;
+    auto nearInt = [](float v) { return std::fabs(v - std::round(v)) <= kEps; };
+    if (!nearInt(sx) || !nearInt(sy) || !nearInt(sw) || !nearInt(sh)) return false;
     const SkMatrix& m = cv->getTotalMatrix();
-    if (!m.isTranslate()) return false;
-    SkScalar tx = m.getTranslateX();
-    SkScalar ty = m.getTranslateY();
-    return tx == SkScalarFloorToScalar(tx) && ty == SkScalarFloorToScalar(ty);
+    if (!m.isScaleTranslate() || m.getScaleX() <= 0 || m.getScaleY() <= 0) return false;
+    SkRect d = m.mapRect(SkRect::MakeXYWH(dx, dy, dw, dh));
+    if (std::fabs(d.width() - sw) > kEps || std::fabs(d.height() - sh) > kEps) return false;
+    if (!nearInt(d.fLeft) || !nearInt(d.fTop)) return false;
+    if (deviceDst) {
+        *deviceDst = SkRect::MakeXYWH(std::round(d.fLeft), std::round(d.fTop),
+                                      std::round(sw), std::round(sh));
+    }
+    return true;
+}
+
+// Sampling for an image/surface draw: nearest when the caller asked for
+// unsmoothed sampling or the blit is pixel-aligned, bilinear otherwise.
+inline SkSamplingOptions imageSampling(const OpenJfxSurface* st, bool aligned = false) {
+    return SkSamplingOptions((aligned || (st && st->imageNearest))
+        ? SkFilterMode::kNearest : SkFilterMode::kLinear);
 }
 
 // Decode RGBA-packed colors[] (low byte = R) into SkColor4f for
@@ -434,6 +488,24 @@ inline void configureFillShader(SkPaint& paint, const OpenJfxSurface& st,
     applyState(paint, st);
 }
 
+// Apply the sticky dash pattern (if any) to a stroke paint. SkDashPathEffect
+// needs an even interval count; JavaFX/AWT semantics double an odd pattern.
+inline void applyStrokeDash(SkPaint& paint, const OpenJfxSurface& st) {
+    const std::vector<float>& d = st.strokeDash;
+    if (d.size() < 2) return;
+    sk_sp<SkPathEffect> fx;
+    if (d.size() & 1u) {
+        std::vector<float> dd(d);
+        dd.insert(dd.end(), d.begin(), d.end());
+        fx = SkDashPathEffect::Make(
+            SkSpan<const SkScalar>(dd.data(), dd.size()), st.strokeDashPhase);
+    } else {
+        fx = SkDashPathEffect::Make(
+            SkSpan<const SkScalar>(d.data(), d.size()), st.strokeDashPhase);
+    }
+    if (fx) paint.setPathEffect(std::move(fx));
+}
+
 inline void configureStrokeShader(SkPaint& paint, const OpenJfxSurface& st,
                                   SkShader* shader, uint8_t alpha,
                                   float width, int32_t cap, int32_t join, float miter) {
@@ -452,6 +524,7 @@ inline void configureStrokeShader(SkPaint& paint, const OpenJfxSurface& st,
       : join == 2 ? SkPaint::kBevel_Join
       :             SkPaint::kMiter_Join);
     applyState(paint, st);
+    applyStrokeDash(paint, st);
 }
 
 inline SkColorType mapColorType(int32_t v) {
@@ -575,6 +648,7 @@ inline void configureStroke(SkPaint& paint, const OpenJfxSurface& st,
       : join == 2 ? SkPaint::kBevel_Join
       :             SkPaint::kMiter_Join);
     applyState(paint, st);
+    applyStrokeDash(paint, st);
 }
 
 // ---- Ganesh GL backend -----------------------------------------------------
@@ -919,12 +993,16 @@ static GpuBackend gGpuBackend = GpuBackend::None;
 
 // Caller-requested backend preference, set from Java before the GrDirectContext
 // is first built (openjfx_skia_set_gpu_backend). 0 = AUTO (env var / platform
-// default), 1 = force GL, 2 = force D3D12. Read live by d3dOptedIn(); the
+// default), 1 = force GL, 2 = force D3D12. Read by gpuDirectContext(); the
 // context is built once so this is read exactly once in practice.
 constexpr int kBackendAuto      = 0;
 constexpr int kBackendForceGL   = 1;
 constexpr int kBackendForceD3D  = 2;
 static std::atomic<int> gBackendPref{ kBackendAuto };
+
+// Skia GPU resource-cache budget in bytes (set from Java before the context
+// is built: -Djavafx.gpu.skiaCacheBudget). <= 0 keeps Skia's default (256 MB).
+static std::atomic<int64_t> gResourceCacheLimit{ 0 };
 
 // Lazily-built per-process GrDirectContext. On Windows we try
 // D3D12/Ganesh first (no DWM windowed-vsync cap when paired with the
@@ -934,67 +1012,76 @@ static std::atomic<int> gBackendPref{ kBackendAuto };
 // freed, because at process exit the GL context / D3D device are
 // torn down by the OS and the destructor would crash inside the
 // driver. The OS reclaims everything on exit.
-// Backend selection on Windows.
+// Backend selection on Windows (other platforms keep their own paths).
 //
-//   - default: GL Ganesh + direct-present via SwapBuffers. The
-//     functional, validated production path. Known cost: the
-//     documented invariant-#3 back-buffer-size lag during drag-
-//     resize (Windows defers FBO 0 reallocation to next SwapBuffers
-//     → 1-frame DWM stretch artifact during a fast drag).
-//   - opt-in: D3D12 (set OPENJFX_SKIA_D3D=1). DXGI flip-model swap
-//     chain + ALLOW_TEARING; would give artifact-free drag-resize
-//     and bypass DWM's vsync cap. Parked as opt-in pending Task #34
-//     (rendering issues observed on at least one host).
+//   AUTO (default): D3D12 on a hardware adapter -> OpenGL on hardware ->
+//     D3D12 on WARP (software, no GPU/driver) -> (Java) CPU raster tier.
+//     Measured on the reference box (docs/PERF_MEMORY_CLARITY.md) D3D12 is
+//     faster than GL and stock Prism and uses about half the GPU memory of
+//     GL. Hardware GL is tried BEFORE WARP so a GPU whose driver lacks
+//     D3D12 still renders on the GPU. OPENJFX_SKIA_D3D=0 restores the old
+//     GL-first order.
+//   Forced D3D12 (Application.setGpuBackend / -Dprism.skia.gpu.backend):
+//     hardware D3D12 -> WARP -> GL.
+//   Forced OpenGL: GL only (then the CPU raster tier).
 //
-// Hardware-adaptive principle: the multi-tier probe in
-// SkiaPresentable.allocate already covers the spectrum (D3D12 swap
-// chain → GL direct-present → GPU FBO + readback → software raster).
-// Each tier is opt-in at the C++ level; the Java side picks the
-// highest-tier surface that succeeds at allocation. When D3D12's
-// known issues are resolved, flipping the default below is the
-// single-line change.
-inline bool d3dOptedIn() {
-    // Explicit caller preference wins (Application.setGpuBackend /
-    // -Dprism.skia.gpu.backend, plumbed through openjfx_skia_set_gpu_backend).
-    int pref = gBackendPref.load(std::memory_order_relaxed);
-    if (pref == kBackendForceD3D) return true;
-    if (pref == kBackendForceGL)  return false;
-    // AUTO: GL is the default backend. D3D12 (which enables 3D via bgfx — see
-    // docs/3D.md) turns on with OPENJFX_SKIA_D3D=1. Kept opt-in under AUTO until
-    // the 3D path is verified stable across GPUs (an AMD multi-GPU driver crash
-    // showed up under default-on).
-    static const bool envOn = [] {
+// Device loss on D3D12 is guarded (d3d12_device_lost); errors degrade to a
+// lower tier, never abort.
+inline bool d3dPreferredUnderAuto() {
+    static const bool on = [] {
         const char* v = std::getenv("OPENJFX_SKIA_D3D");
-        return v && v[0] && v[0] != '0';
+        return !(v && v[0] == '0');   // unset or "1" -> D3D12 first
     }();
-    return envOn;
+    return on;
 }
+
+inline sk_sp<GrDirectContext> makeGlContext() {
+    if (!ensureWindowsGlContext()) return nullptr;
+    sk_sp<const GrGLInterface> iface = GrGLMakeNativeInterface();
+    return iface ? GrDirectContexts::MakeGL(iface) : nullptr;
+}
+
+void applyResourceCacheLimit(GrDirectContext* ctx);
 
 inline const sk_sp<GrDirectContext>& gpuDirectContext() {
     static const sk_sp<GrDirectContext>* ctx = [] {
         auto* p = new sk_sp<GrDirectContext>();
+        struct ApplyLimit {           // runs on every return path below
+            sk_sp<GrDirectContext>* p;
+            ~ApplyLimit() { if (*p) applyResourceCacheLimit(p->get()); }
+        } applyLimit{ p };
 #ifdef _WIN32
-        // D3D12 — only when opted in. The d3d12.h macro pollution
-        // stays confined to openjfx_skia_d3d_win.cpp.
-        if (d3dOptedIn()) {
-            *p = openjfxD3DMakeContext();
-            if (*p) {
-                gGpuBackend = GpuBackend::D3D;
-                return p;
-            }
-        }
-        // Default: GL Ganesh + direct-present via SwapBuffers.
-        if (ensureWindowsGlContext()) {
-            sk_sp<const GrGLInterface> iface = GrGLMakeNativeInterface();
-            if (iface) {
-                *p = GrDirectContexts::MakeGL(iface);
-                if (*p) gGpuBackend = GpuBackend::GL;
-            }
+        // The d3d12.h macro pollution stays confined to openjfx_skia_d3d_win.cpp.
+        const int pref = gBackendPref.load(std::memory_order_relaxed);
+        auto useD3D = [&](D3DAdapterPolicy policy) {
+            *p = openjfxD3DMakeContext(policy);
+            if (*p) gGpuBackend = GpuBackend::D3D;
+            return static_cast<bool>(*p);
+        };
+        auto useGL = [&] {
+            *p = makeGlContext();
+            if (*p) gGpuBackend = GpuBackend::GL;
+            return static_cast<bool>(*p);
+        };
+        if (pref == kBackendForceGL) {
+            useGL();
+        } else if (pref == kBackendForceD3D) {
+            useD3D(D3DAdapterPolicy::HardwareThenWarp) || useGL();
+        } else if (d3dPreferredUnderAuto()) {
+            useD3D(D3DAdapterPolicy::HardwareOnly) || useGL()
+                || useD3D(D3DAdapterPolicy::WarpOnly);
+        } else {
+            useGL() || useD3D(D3DAdapterPolicy::HardwareThenWarp);
         }
 #endif
         return p;
     }();
     return *ctx;
+}
+
+void applyResourceCacheLimit(GrDirectContext* ctx) {
+    int64_t limit = gResourceCacheLimit.load(std::memory_order_relaxed);
+    if (ctx && limit > 0) ctx->setResourceCacheLimit(static_cast<size_t>(limit));
 }
 
 } // namespace
@@ -1051,7 +1138,7 @@ OPENJFX_API uintptr_t openjfx_skia_surface_create_raster(int32_t width, int32_t 
     // readback (BGRA request) becomes a straight row copy as a bonus.
     SkImageInfo info = SkImageInfo::Make(
         width, height, kN32_SkColorType, kPremul_SkAlphaType);
-    sk_sp<SkSurface> surface = SkSurfaces::Raster(info);
+    sk_sp<SkSurface> surface = SkSurfaces::Raster(info, openjfxTextSurfaceProps());
     if (!surface) return 0;
     auto* st = new OpenJfxSurface();
     st->surface = std::move(surface);
@@ -1072,7 +1159,7 @@ OPENJFX_API uintptr_t openjfx_skia_surface_create_raster_bgra(int32_t width, int
     // The plain create_raster above stays RGBA for every other caller.
     SkImageInfo info = SkImageInfo::Make(
         width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
-    sk_sp<SkSurface> surface = SkSurfaces::Raster(info);
+    sk_sp<SkSurface> surface = SkSurfaces::Raster(info, openjfxTextSurfaceProps());
     if (!surface) return 0;
     auto* st = new OpenJfxSurface();
     st->surface = std::move(surface);
@@ -1090,7 +1177,8 @@ OPENJFX_API uintptr_t openjfx_skia_surface_create_gpu(int32_t width, int32_t hei
     SkImageInfo info = SkImageInfo::Make(
         width, height, kRGBA_8888_SkColorType, kPremul_SkAlphaType);
     sk_sp<SkSurface> surface = SkSurfaces::RenderTarget(
-        grCtx.get(), skgpu::Budgeted::kNo, info);
+        grCtx.get(), skgpu::Budgeted::kNo, info,
+        /*sampleCount*/ 0, kBottomLeft_GrSurfaceOrigin, openjfxTextSurfaceProps());
     if (!surface) return 0;
     // GPU render targets are NOT zeroed by the driver — the backing VRAM
     // starts as uninitialized garbage. Any region a later draw leaves
@@ -1194,7 +1282,7 @@ OPENJFX_API uintptr_t openjfx_skia_surface_create_window_gpu(
         kBottomLeft_GrSurfaceOrigin,
         kRGBA_8888_SkColorType,
         /* colorSpace */ nullptr,
-        /* surfaceProps */ nullptr,
+        openjfxTextSurfaceProps(),
         /* releaseProc */ nullptr,
         /* releaseContext */ nullptr);
     if (!surface) {
@@ -1227,6 +1315,7 @@ static void setGlSwapInterval(int interval) {
         last = interval;
     }
 }
+
 #endif
 
 OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_t vsync) {
@@ -1295,6 +1384,9 @@ OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_
         if (grCtx) grCtx->resetContext();
     }
     // Runtime vsync toggle on the GL tier (best-effort; see setGlSwapInterval).
+    // Interval 1 blocks once per vblank, which is what paces the render loop:
+    // the Java side must not add a wall-clock cap on top (see
+    // SkiaPresentable.pacesToDisplay).
     setGlSwapInterval(vsync ? 1 : 0);
     // A failed blit means the back buffer holds stale/garbage content, but a
     // stale frame beats a black one — still SwapBuffers, then report failure
@@ -1413,7 +1505,7 @@ OPENJFX_API int32_t openjfx_skia_surface_resize_gl(
         kBottomLeft_GrSurfaceOrigin,
         kRGBA_8888_SkColorType,
         /* colorSpace */ nullptr,
-        /* surfaceProps */ nullptr,
+        openjfxTextSurfaceProps(),
         /* releaseProc */ nullptr,
         /* releaseContext */ nullptr);
     if (!newSurface) return 5;
@@ -1724,7 +1816,7 @@ OPENJFX_API void openjfx_skia_surface_destroy(uintptr_t handle) {
         }
         // Tear down the D3D swap chain + per-buffer SkSurfaces.
         if (st->d3d) {
-            openjfxD3DDestroySwapChain(st->d3d);
+            openjfxD3DDestroySwapChain(st->d3d, gpuDirectContext().get());
             st->d3d = nullptr;
         }
 #endif
@@ -1993,14 +2085,22 @@ OPENJFX_API int32_t openjfx_skia_surface_begin_draw(
     if (extraAlpha > 1.0f) extraAlpha = 1.0f;
     st->extraAlpha = extraAlpha;
 
-    // Per-draw surface diag, retained as a regression hook. Off by
-    // default; flip OPENJFX_SKIA_DRAW_DIAG=1 to enable. Prints
+    // Env-gated draw diag (OPENJFX_SKIA_DRAW_DIAG=1). The env lookup is
+    // cached once: this is the hottest entry point (one call per draw),
+    // and a per-call getenv takes the CRT environment lock and scans the
+    // whole block — it showed up as the #1 render-thread cost in JFR.
+    static const bool bdDiag = []() {
+        const char* e = std::getenv("OPENJFX_SKIA_DRAW_DIAG");
+        return e && *e && *e != '0';
+    }();
+
+    // Per-draw surface diag, retained as a regression hook. Prints
     // surface dimensions + isWindow flag so we can immediately tell
     // when scene rendering routes to an off-screen drawable instead
     // of the main window surface (the signature of RESIZE_INVARIANT
     // #8 if the contentWidth/Height callback ever regresses).
     static int matrixDiagCount = 0;
-    if (matrixDiagCount < 20 && getenv("OPENJFX_SKIA_DRAW_DIAG")) {
+    if (bdDiag && matrixDiagCount < 20) {
         std::fprintf(stderr,
             "[skia.matrix] handle=%p surface=%dx%d (isWindow=%d isD3D=%d)\n",
             (void*) st,
@@ -2010,13 +2110,8 @@ OPENJFX_API int32_t openjfx_skia_surface_begin_draw(
         matrixDiagCount++;
     }
 
-    // TEMP DIAG (env-gated): log every begin_draw with its incoming
-    // transform + clipBounds. Tells us exactly what GraphicsContextJava
-    // pushed for each draw, including the cards' fillRect. Cap at 200.
-    static const bool bdDiag = []() {
-        const char* e = std::getenv("OPENJFX_SKIA_DRAW_DIAG");
-        return e && *e && *e != '0';
-    }();
+    // Log every begin_draw with its incoming transform + clipBounds
+    // (same OPENJFX_SKIA_DRAW_DIAG gate). Cap at 200.
     if (bdDiag) {
         static std::atomic<int> bn { 0 };
         int v = bn.fetch_add(1);
@@ -2799,6 +2894,24 @@ OPENJFX_API void openjfx_skia_filter_destroy(uintptr_t handle) {
     if (!handle) return;
 #ifdef OPENJFX_WITH_SKIA
     freeFilterHandle(handle);
+#endif
+}
+
+OPENJFX_API int32_t openjfx_skia_surface_set_stroke_dash(
+    uintptr_t handle, const float* intervals, int32_t count, float phase) {
+#ifdef OPENJFX_WITH_SKIA
+    OpenJfxSurface* st = asState(handle);
+    if (!st) return -1;
+    st->strokeDash.clear();
+    st->strokeDashPhase = 0.0f;
+    if (intervals && count >= 2) {
+        st->strokeDash.assign(intervals, intervals + count);
+        st->strokeDashPhase = phase;
+    }
+    return 0;
+#else
+    (void)handle; (void)intervals; (void)count; (void)phase;
+    return -1;
 #endif
 }
 
@@ -3851,6 +3964,20 @@ OPENJFX_API void openjfx_skia_buffer_free(uintptr_t ptr) {
 // Drawing images
 // ===========================================================================
 
+// Sets the sticky image sampling mode used by draw_image / draw_image_rect /
+// draw_surface on this surface: 0 = bilinear (default), 1 = nearest.
+OPENJFX_API int32_t openjfx_skia_surface_set_image_filter(uintptr_t handle, int32_t nearest) {
+#ifdef OPENJFX_WITH_SKIA
+    OpenJfxSurface* st = asState(handle);
+    if (!st) return 1;
+    st->imageNearest = nearest != 0;
+    return 0;
+#else
+    (void)handle; (void)nearest;
+    return -1;
+#endif
+}
+
 OPENJFX_API int32_t openjfx_skia_surface_draw_image(
     uintptr_t surfaceHandle,
     uintptr_t imageHandle,
@@ -3860,8 +3987,8 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_image(
     SkImage*  img = asImage(imageHandle);
     if (!cv || !img) return 1;
     SkRect dst = SkRect::MakeXYWH(dx, dy, dw, dh);
-    SkSamplingOptions sampling(SkFilterMode::kLinear);
     const OpenJfxSurface* st = asState(surfaceHandle);
+    SkSamplingOptions sampling = imageSampling(st);
     SkPaint p;
     if (st) applyState(p, *st);
     p.setAntiAlias(false);
@@ -3898,25 +4025,48 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_surface(
     if (!img) return 2;
     auto t1 = dsDiag ? std::chrono::steady_clock::now()
                      : std::chrono::steady_clock::time_point{};
-    SkRect srcR = SkRect::MakeXYWH(sx, sy, sw, sh);
+    // Negative source extent = mirror along that axis (see
+    // surface_draw_image_rect for the rationale: reversed tex coords from
+    // EffectUtil's rect drop-shadow corners).
+    const bool flipX = sw < 0.f;
+    const bool flipY = sh < 0.f;
+    SkRect srcR = SkRect::MakeXYWH(flipX ? sx + sw : sx, flipY ? sy + sh : sy,
+                                   flipX ? -sw : sw,     flipY ? -sh : sh);
     SkRect dstR = SkRect::MakeXYWH(dx, dy, dw, dh);
     SkCanvas* cv = dst->getCanvas();
     // Pixel-aligned unscaled blits take nearest sampling (pixel-identical
     // to linear here) AND the fast constraint (nearest never samples
     // neighboring texels, so strict edge clamping buys nothing) — both are
     // required to reach Skia's specialized raster blitters instead of the
-    // general per-pixel pipeline.
-    const bool aligned = isPixelAlignedBlit(cv, sx, sy, sw, sh, dx, dy, dw, dh);
-    SkSamplingOptions sampling(
-        aligned ? SkFilterMode::kNearest : SkFilterMode::kLinear);
+    // general per-pixel pipeline. A mirrored draw is never treated as aligned.
+    SkRect deviceDst;
+    const bool aligned = !flipX && !flipY
+        && isPixelAlignedBlit(cv, sx, sy, sw, sh, dx, dy, dw, dh, &deviceDst);
     const OpenJfxSurface* st = asState(dstSurfaceHandle);
+    SkSamplingOptions sampling = imageSampling(st, aligned);
     SkPaint p;
     if (st) applyState(p, *st);
     p.setAntiAlias(false);
-    cv->drawImageRect(
-        img, srcR, dstR, sampling, &p,
-        aligned ? SkCanvas::kFast_SrcRectConstraint
-                : SkCanvas::kStrict_SrcRectConstraint);
+    if (flipX || flipY) {
+        cv->save();
+        const SkScalar cx = dx + dw * 0.5f, cy = dy + dh * 0.5f;
+        cv->translate(cx, cy);
+        cv->scale(flipX ? -1.f : 1.f, flipY ? -1.f : 1.f);
+        cv->translate(-cx, -cy);
+    }
+    if (aligned) {
+        // Exact 1:1 copy onto whole device pixels: draw in device space at the
+        // snapped rect (the clip is already device-space, unaffected).
+        cv->save();
+        cv->resetMatrix();
+        cv->drawImageRect(img, srcR, deviceDst, sampling, &p,
+                          SkCanvas::kFast_SrcRectConstraint);
+        cv->restore();
+    } else {
+        cv->drawImageRect(img, srcR, dstR, sampling, &p,
+                          SkCanvas::kStrict_SrcRectConstraint);
+    }
+    if (flipX || flipY) cv->restore();
     if (dsDiag) {
         auto t2 = std::chrono::steady_clock::now();
         static std::atomic<int> n { 0 };
@@ -4022,16 +4172,33 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_image_rect(
     SkCanvas* cv = asCanvas(surfaceHandle);
     SkImage*  img = asImage(imageHandle);
     if (!cv || !img) return 1;
-    SkRect src = SkRect::MakeXYWH(sx, sy, sw, sh);
+    // A negative source extent means the caller wants the sampled region
+    // MIRRORED along that axis (e.g. EffectUtil's rect drop-shadow draws the
+    // gaussian corner texture with reversed coords for the right/bottom
+    // corners). Prism's GPU samplers mirror reversed tex coords natively;
+    // SkRect needs a positive src, so we normalise the source and mirror the
+    // destination about its centre — same visual result.
+    const bool flipX = sw < 0.f;
+    const bool flipY = sh < 0.f;
+    SkRect src = SkRect::MakeXYWH(flipX ? sx + sw : sx, flipY ? sy + sh : sy,
+                                  flipX ? -sw : sw,     flipY ? -sh : sh);
     SkRect dst = SkRect::MakeXYWH(dx, dy, dw, dh);
-    SkSamplingOptions sampling(SkFilterMode::kLinear);
     const OpenJfxSurface* st = asState(surfaceHandle);
+    SkSamplingOptions sampling = imageSampling(st);
     SkPaint p;
     if (st) applyState(p, *st);
     p.setAntiAlias(false);
+    if (flipX || flipY) cv->save();
+    if (flipX || flipY) {
+        const SkScalar cx = dx + dw * 0.5f, cy = dy + dh * 0.5f;
+        cv->translate(cx, cy);
+        cv->scale(flipX ? -1.f : 1.f, flipY ? -1.f : 1.f);
+        cv->translate(-cx, -cy);
+    }
     cv->drawImageRect(
         img, src, dst, sampling, &p,
         SkCanvas::kStrict_SrcRectConstraint);
+    if (flipX || flipY) cv->restore();
     return 0;
 #else
     (void)surfaceHandle; (void)imageHandle;
@@ -4094,6 +4261,57 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_bgra(
 }
 
 // ---- Arbitrary path --------------------------------------------------------
+
+// Push an anti-aliased PATH clip (e.g. a node clipped by a rounded Rectangle
+// or Circle) that stays active until the matching surface_pop_clip. The path
+// is in the clip node's local space; (m00..m12) maps it to DEVICE pixels
+// (pixel scale included). The clip is captured in device space and the
+// canvas matrix is restored, so the per-draw begin_draw brackets (save +
+// device clipRect + setMatrix) nest inside it unchanged. Replaces Prism's
+// two-offscreen mask+SRC_IN composite for this case: no intermediate
+// surfaces, exact at any DPI. Counted in bridgeSaveCount like surface_save.
+OPENJFX_API int32_t openjfx_skia_surface_push_clip_path(
+    uintptr_t handle,
+    float m00, float m01, float m02,
+    float m10, float m11, float m12,
+    const uint8_t* verbs,  int32_t verbCount,
+    const float*   coords, int32_t coordCount,
+    int32_t fillRule) {
+#ifdef OPENJFX_WITH_SKIA
+    OpenJfxSurface* st = asState(handle);
+    if (!st) return -1;
+    SkCanvas* canvas = asCanvas(handle);
+    if (!canvas) return 1;
+    if (!(coordFinite(m00) && coordFinite(m01) && coordFinite(m02)
+          && coordFinite(m10) && coordFinite(m11) && coordFinite(m12))) {
+        return 2;
+    }
+    SkPath path;
+    if (!buildPath(path, verbs, verbCount, coords, coordCount, fillRule)) return 3;
+    SkMatrix m;
+    m.setAll(m00, m01, m02, m10, m11, m12, 0, 0, 1);
+    path = path.makeTransform(m);
+    st->bridgeSaveCount++;
+    canvas->save();
+    // Clip in device space: the CTM outside a draw bracket is identity
+    // (begin_draw/end_draw restore it), so apply the already-transformed
+    // path under identity and leave the matrix as found.
+    const SkMatrix prev = canvas->getTotalMatrix();
+    canvas->resetMatrix();
+    canvas->clipPath(path, SkClipOp::kIntersect, /*doAntiAlias*/ true);
+    canvas->setMatrix(prev);
+    return 0;
+#else
+    (void)handle; (void)m00; (void)m01; (void)m02; (void)m10; (void)m11; (void)m12;
+    (void)verbs; (void)verbCount; (void)coords; (void)coordCount; (void)fillRule;
+    return -1;
+#endif
+}
+
+// Pop the clip pushed by surface_push_clip_path.
+OPENJFX_API int32_t openjfx_skia_surface_pop_clip(uintptr_t handle) {
+    return openjfx_skia_surface_restore(handle);
+}
 
 OPENJFX_API int32_t openjfx_skia_surface_fill_path(
     uintptr_t handle,
@@ -4248,15 +4466,15 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_glyphs(
     // ghost stripes on top of the text. kAntiAlias renders symmetric
     // coverage and looks identical on every surface.
     //
-    // setSubpixel(false): snap glyph baselines to integer pixel positions.
-    // With subpixel positioning ON, glyphs land at fractional Y, so each
-    // line's AA edges spill across two pixel rows; on a gradient or
-    // translucent background that vertical splay reads as a faint stripe
-    // through the text. Snapping to whole pixels removes that artifact at
-    // the cost of ~half a pixel of horizontal placement precision —
-    // imperceptible at body-text sizes.
+    // Subpixel positioning ON + baseline snap: for horizontal text Skia keeps
+    // the fractional X advance (JavaFX layout positions glyphs with fractional
+    // advances; rounding each glyph to a whole pixel made spacing visibly
+    // uneven — "over the" squeezing at body sizes) while still snapping the
+    // baseline (Y) to whole device pixels, so lines never straddle two pixel
+    // rows (the vertical-stripe artifact the old integer snapping avoided).
     font.setEdging(SkFont::Edging::kAntiAlias);
-    font.setSubpixel(false);
+    font.setSubpixel(true);
+    font.setBaselineSnap(true);
     font.setHinting(SkFontHinting::kSlight);
     SkTextBlobBuilder builder;
     const SkTextBlobBuilder::RunBuffer& run = builder.allocRunPos(font, count);
@@ -4308,11 +4526,13 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_glyphs_shader(
             return 4;
         }
     }
-    // Same font configuration as the solid path: greyscale AA, integer
-    // baseline snap, slight hinting (see openjfx_skia_surface_draw_glyphs).
+    // Same font configuration as the solid path: greyscale AA, subpixel X
+    // positioning with baseline snap, slight hinting (see
+    // openjfx_skia_surface_draw_glyphs).
     SkFont font(*tfSp, fontSize);
     font.setEdging(SkFont::Edging::kAntiAlias);
-    font.setSubpixel(false);
+    font.setSubpixel(true);
+    font.setBaselineSnap(true);
     font.setHinting(SkFontHinting::kSlight);
     SkTextBlobBuilder builder;
     const SkTextBlobBuilder::RunBuffer& run = builder.allocRunPos(font, count);
@@ -4366,7 +4586,7 @@ OPENJFX_API int32_t openjfx_skia_surface_replace_backing_argb(
     SkImageInfo info = SkImageInfo::Make(
         width, height, kBGRA_8888_SkColorType, kPremul_SkAlphaType);
     sk_sp<SkSurface> wrapped = SkSurfaces::WrapPixels(
-        info, pixels, static_cast<size_t>(rowBytes));
+        info, pixels, static_cast<size_t>(rowBytes), openjfxTextSurfaceProps());
     if (!wrapped) return 2;
     st->surface = std::move(wrapped);
     return 0;
@@ -4423,7 +4643,7 @@ OPENJFX_API int32_t openjfx_skia_surface_read_pixels_argb_stride(
 // redirection bitmap via GDI, so the OS show animation reveals the real UI
 // instead of the default white/black bitmap. Called ONCE, on the render thread,
 // AFTER the pre-show paint and BEFORE Present + the FX thread's ShowWindow. GDI
-// reaches the same redirection surface CustomWinProc's WM_ERASEBKGND fills,
+// reaches the window's DWM redirection surface,
 // which is what the show animation captures (a flip-model swap-chain Present
 // does not). Returns non-zero on any failure so the caller degrades to the
 // prior behavior. No-op (-1) off-Windows / without Skia.
@@ -4722,6 +4942,13 @@ SKIA_FX_API GrDirectContext* shared_gr_context() {
     return gpuDirectContext().get();
 }
 
+// The shared context only if something already built it — never triggers the
+// lazy backend selection (housekeeping must not create a GPU context on the
+// software-raster tier).
+GrDirectContext* shared_gr_context_if_built() {
+    return gGpuBackend == GpuBackend::None ? nullptr : gpuDirectContext().get();
+}
+
 SKIA_FX_API uintptr_t register_surface(sk_sp<SkSurface> surface) {
     if (!surface) return 0;
     auto* st = new OpenJfxSurface();
@@ -4766,6 +4993,63 @@ extern "C" OPENJFX_API int32_t openjfx_skia_device_lost(void) {
 // 1 = force OpenGL, 2 = force Direct3D 12. No effect once the context exists.
 extern "C" OPENJFX_API void openjfx_skia_set_gpu_backend(int32_t pref) {
     gBackendPref.store(pref, std::memory_order_relaxed);
+}
+
+// Skia GPU resource-cache budget in bytes. Call before the first GPU surface
+// (applied when the context is built); also applied live if it already exists.
+// Render thread (or before rendering starts) only.
+extern "C" OPENJFX_API void openjfx_skia_set_resource_cache_limit(int64_t bytes) {
+    gResourceCacheLimit.store(bytes, std::memory_order_relaxed);
+}
+
+// Per-present GPU housekeeping, rate-limited to ~1/s: frees GPU resources
+// Skia has not used for 5 s (scratch textures from effects, old glyph/path
+// atlases, uploaded images no longer drawn). Without it the cache only ever
+// shrinks when it hits its budget. Render thread only.
+extern "C" OPENJFX_API void openjfx_skia_gpu_housekeeping(void) {
+    static auto last = std::chrono::steady_clock::time_point{};
+    auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::seconds(1)) return;
+    last = now;
+#if defined(_WIN32)
+    if (skia_fx::d3d12_device_lost()) return;
+#endif
+    GrDirectContext* ctx = skia_fx::shared_gr_context_if_built();
+    if (ctx) ctx->performDeferredCleanup(std::chrono::seconds(5));
+}
+
+// Current Skia GPU resource-cache usage: total bytes and purgeable bytes.
+// Both 0 when no GPU context exists. Render thread only.
+extern "C" OPENJFX_API void openjfx_skia_gpu_cache_usage(int64_t* bytes, int64_t* purgeable) {
+    GrDirectContext* ctx = skia_fx::shared_gr_context_if_built();
+    size_t used = 0, purge = 0;
+    if (ctx) {
+        int count = 0;
+        ctx->getResourceCacheUsage(&count, &used);
+        purge = ctx->getResourceCachePurgeableBytes();
+    }
+    if (bytes) *bytes = static_cast<int64_t>(used);
+    if (purgeable) *purgeable = static_cast<int64_t>(purge);
+}
+
+// Free every unlocked GPU resource now (window minimized/closed, memory
+// pressure). Render thread only.
+extern "C" OPENJFX_API void openjfx_skia_gpu_purge(void) {
+#if defined(_WIN32)
+    if (skia_fx::d3d12_device_lost()) return;
+#endif
+    GrDirectContext* ctx = skia_fx::shared_gr_context_if_built();
+    if (ctx) ctx->purgeUnlockedResources(GrPurgeResourceOptions::kAllResources);
+}
+
+// 1 when the active GPU device is a software rasterizer (D3D12 WARP — chosen
+// automatically when no usable GPU/driver exists), else 0.
+extern "C" OPENJFX_API int32_t openjfx_skia_is_software_device(void) {
+#if defined(_WIN32)
+    return (gGpuBackend == GpuBackend::D3D && openjfxD3DIsWarp()) ? 1 : 0;
+#else
+    return 0;
+#endif
 }
 
 // Report the backend actually backing the GrDirectContext:

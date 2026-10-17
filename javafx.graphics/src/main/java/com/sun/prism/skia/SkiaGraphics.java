@@ -226,10 +226,14 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         syncBeforeDraw();
         try {
             if (p instanceof Color c) {
-                NativeBridge.surfaceFillRect(
-                    handle(),
-                    (int) Math.floor(x), (int) Math.floor(y),
-                    (int) Math.ceil(width), (int) Math.ceil(height),
+                // Float geometry (zero-radius rrect == Skia drawRect). JavaFX
+                // snaps layout to DEVICE pixels, so at 125/150/175% a Region
+                // background or 1px border sits at fractional LOGICAL coords
+                // (e.g. x=10.4 -> 13 device px). Rounding those to whole logical
+                // units — what the int fill did — moved edges between device
+                // pixels: soft, uneven borders and 1-unit gaps/overlaps. Prism
+                // fills with float coords too.
+                NativeBridge.surfaceFillRoundRect(handle(), x, y, width, height, 0f, 0f,
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
                 // Software tier: large gradient fills run Skia's scalar
@@ -851,6 +855,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 // for symmetry with blit()/imageHandleOf(). (bugs.md H1)
                 return;
             }
+            syncImageFilter(tex);
             syncBeforeDraw();
             try {
                 NativeBridge.surfaceDrawSurface(handle(),
@@ -861,11 +866,56 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
             return;
         }
         long imgHandle = imageHandleOf(tex);
+        syncImageFilter(tex);
         syncBeforeDraw();
         try {
             NativeBridge.surfaceDrawImage(handle(),
                 MemorySegment.ofAddress(imgHandle), x, y, w, h);
         } finally { restoreAfterDraw(); }
+    }
+
+    /**
+     * Pushes an anti-aliased clip to {@code shape} (in the space described by
+     * the LOGICAL transform {@code xform}; the pixel scale is applied here) on
+     * this Graphics' surface. Every following draw is clipped until the
+     * matching {@link #popClip()}. Returns {@code false} — with nothing pushed —
+     * when the native build lacks path clips or the geometry is unusable, so
+     * callers fall back to their generic path.
+     */
+    public boolean pushClipShape(Shape shape, BaseTransform xform) {
+        if (!NativeBridge.hasPathClip()) return false;
+        float sx = getPixelScaleFactorX();
+        float sy = getPixelScaleFactorY();
+        try (PathEncoder.Encoded path = PathEncoder.encode(shape)) {
+            return NativeBridge.surfacePushClipPath(handle(),
+                (float) xform.getMxx() * sx, (float) xform.getMxy() * sx, (float) xform.getMxt() * sx,
+                (float) xform.getMyx() * sy, (float) xform.getMyy() * sy, (float) xform.getMyt() * sy,
+                path.verbs, path.verbCount, path.coords, path.coordCount,
+                path.fillRule) == 0;
+        }
+    }
+
+    /** Pops a clip pushed by {@link #pushClipShape}. */
+    public void popClip() {
+        NativeBridge.surfacePopClip(handle());
+    }
+
+    /** Last sampling mode pushed to this surface; -1 = unknown (always push). */
+    private int lastImageNearest = -1;
+
+    /**
+     * Pushes {@code tex}'s filtering choice ({@link Texture#getLinearFiltering})
+     * to the surface's sticky sampling mode, only when it changes. This is how
+     * {@code GraphicsContext.setImageSmoothing(false)} and {@code
+     * ImageView.setSmooth(false)} reach Skia (nearest-neighbour instead of a
+     * bilinear blur of pixel art).
+     */
+    private void syncImageFilter(Texture tex) {
+        int nearest = tex.getLinearFiltering() ? 0 : 1;
+        if (nearest != lastImageNearest) {
+            NativeBridge.surfaceSetImageFilter(handle(), nearest == 1);
+            lastImageNearest = nearest;
+        }
     }
 
     @Override
@@ -892,16 +942,24 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         // src rects when the source is an RTT snapshot — see memory
         // note ngregion-3slice-zero-source / webview-open-followups
         // #12 for the recursive surface_draw_surface crash signature).
+        // A genuinely INVERTED source rect (sx1 > sx2 / sy1 > sy2) is a
+        // mirror request — EffectUtil's rect drop-shadow draws the gaussian
+        // corner texture with reversed coords for the right/bottom corners,
+        // exactly as Prism's GPU samplers mirror reversed tex coords. Pass the
+        // negative extent through; the native draw normalises the source and
+        // mirrors the destination. Only a near-zero extent is the degenerate
+        // NGRegion middle-strip case (sx1 == sx2) that must be clamped to a
+        // 1-px sample so Skia's strict-src draw doesn't drop the strip.
         float sw = sx2 - sx1;
         float sh = sy2 - sy1;
-        if (sw <= 0) {
+        if (sw <= 0 && sw > -1f) {
             sw = 1f;
             int tw = tex.getContentWidth();
             if (tw > 0 && sx1 + sw > tw) {
                 sx1 = tw - 1;
             }
         }
-        if (sh <= 0) {
+        if (sh <= 0 && sh > -1f) {
             sh = 1f;
             int th = tex.getContentHeight();
             if (th > 0 && sy1 + sh > th) {
@@ -918,6 +976,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
             if (srcHandle == 0L) {
                 return; // disposed RTTexture source — drop the draw (H1)
             }
+            syncImageFilter(tex);
             syncBeforeDraw();
             try {
                 NativeBridge.surfaceDrawSurface(handle(),
@@ -928,6 +987,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
             return;
         }
         long imgHandle = imageHandleOf(tex);
+        syncImageFilter(tex);
         syncBeforeDraw();
         try {
             NativeBridge.surfaceDrawImageRect(handle(),
@@ -1193,6 +1253,25 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     }
 
     private BasicStroke currentStroke() { return getStroke(); }
+
+    /**
+     * Mirror the active stroke's dash pattern into the native surface state so
+     * the next strokes are dashed. Prism passes width/cap/join/miter per draw
+     * but the dash array isn't a stroke-call parameter — without this every
+     * dashed stroke (CSS dashed borders, focus rings, chart gridlines) renders
+     * solid. Synced once per stroke change rather than per draw; clearing on a
+     * solid stroke is required because the native dash state is sticky.
+     */
+    @Override
+    public void setStroke(BasicStroke stroke) {
+        super.setStroke(stroke);
+        float[] dash = (stroke == null) ? null : stroke.getDashArray();
+        if (dash != null && dash.length >= 2) {
+            NativeBridge.surfaceSetStrokeDash(handle(), dash, stroke.getDashPhase());
+        } else {
+            NativeBridge.surfaceSetStrokeDash(handle(), null, 0f);
+        }
+    }
 
     /**
      * Build the SkShader for a non-Color paint. The {@code (rx,ry,rw,rh)}

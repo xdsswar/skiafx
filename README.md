@@ -75,13 +75,16 @@ foresight of the foundation they built. **Thank you.**
 | Feature | Status |
 |---|---|
 | **Skia-backed rendering** — `SkCanvas`/`SkSurface` instead of Prism, via our own native bridge | Working |
-| **GPU pipeline** — OpenGL (Ganesh) + **Direct3D 12** backends, GPU context per render thread | Working |
+| **GPU pipeline** — **Direct3D 12** (Windows default) + OpenGL (Ganesh) backends, GPU context per render thread | Working |
 | **Selectable GPU backend** — `Application.setGpuBackend(...)` / `-Dprism.skia.gpu.backend`, default `AUTO`, graceful fallback when unavailable | Working |
+| **Software fallback without a GPU** — no GPU or no driver: the full pipeline runs on Windows' WARP software rasterizer (faster than Prism's software mode), with a CPU raster tier as the last resort | Working |
 | **Uncapped frame rate** — render at the display's *actual* refresh (120/144/240Hz+), not a hardcoded 60 | Working |
+| **Smooth frame pacing** — one presented frame per display refresh with VSync on, no dropped frames; lower worst-case frame times than stock JavaFX in our A/B runs | Working |
 | **Runtime VSync toggle** — `Application.setVsyncEnabled(...)` / `vsyncEnabledProperty()`, global, on by default | Working |
 | **Wall-clock animation** — animations driven by real time, correct at any cadence | Working |
 | **Full effect suite on Skia** — every JavaFX `Effect` mapped to Skia image filters: blur, shadows, glow, color adjust, displacement, lighting and more | Working |
-| **Crisp text** — Skia glyph rendering with anti-alias tuned for translucent layers; color-emoji groundwork | Working |
+| **Crisp text** — Skia glyph rendering, subpixel glyph positioning with baseline snap, text weight tuned to match stock JavaFX; color-emoji groundwork | Working |
+| **Sharp HiDPI rendering** — pixel-exact borders, clips, opacity groups and cached nodes at 125/150/175% scaling; `setImageSmoothing(false)` / `ImageView.setSmooth(false)` honored | Working |
 | **Vector SVG** — `SvgImage` / `SvgImageView`, pixel-perfect at any zoom/DPI, zoom + tint + grid, CSS-styleable | Working |
 | **Bounded, observable memory** — GPU budgets, eviction policies, `Cleaner`-driven native lifecycles | Working |
 | **Copy elimination** — architecturally zero-copy hot paths, per-frame off-heap arenas, no per-frame `new` | Ongoing |
@@ -91,9 +94,42 @@ foresight of the foundation they built. **Thank you.**
 | **Dual-source playback** — `Media(audioSource, videoSource)` plays separate audio + video URLs as one synced stream, with accurate seeking on fragmented (DASH-style) MP4 | Working |
 | **MediaMixer** — mux separate audio + video files/URLs into a single MP4, off the FX thread, with progress callbacks | Working |
 | **Custom primary stage** — generic `Application<W extends Stage>` so apps can use their own `Stage` subclass | Working |
+| **Extended stage + HeaderBar** — `StageStyle.EXTENDED` with `HeaderBar`, aligned with the OpenJFX 27 API (replaces the earlier skia-fx-only `StageStyle.CUSTOM`) | Working |
 | **Signed native libs** — per-module SHA-256 manifest + loader override for cache integrity | Working |
 | **3D scene graph** — bgfx engine sharing Skia's D3D12 device: meshes, `PerspectiveCamera`, lights, `PhongMaterial`, textures, MSAA, shadows | Working |
 | **glTF 2.0 model loading** — new `javafx.scene3d` module (`ModelLoader` / `Model3D`), native cgltf | Working |
+
+---
+
+## Measured against stock JavaFX
+
+The same stock-API test app runs on both pipelines and records frame pacing, memory and
+on-screen pixels. Numbers below are from the developer's machine (Windows 11, 165 Hz
+display, AMD RX 6800, 1280x800 window), not a guarantee for yours. fps is capped by the
+display when VSync is on.
+
+| Scene | Stock JavaFX (GPU) | skia-fx (D3D12) | Stock JavaFX (software) | skia-fx (no GPU, WARP) |
+|---|---|---|---|---|
+| 3000 animated shapes | 145-164 fps | **163 fps** | 62 fps | **92 fps** |
+| 48 drop shadows + blur | 112 fps | **165 fps** | 0.8 fps | **1.9 fps** |
+| scrolling list (text) | 165 fps | 165 fps | 62 fps | **165 fps** |
+| table + form controls | 165 fps | 165 fps | 62 fps | **88 fps** |
+| worst 1% frame time (shapes) | 12.6-16.5 ms | **9.9 ms** | | |
+| process memory (controls) | 528 MB | **465 MB** | | |
+
+Clarity is checked by capturing the real window pixels at 100/125/150% scaling and
+diffing them against stock JavaFX; borders, clips, opacity groups, cached nodes and pixel
+art match, and text matches stock in weight and spacing.
+
+Reproduce it yourself:
+
+```bash
+./gradlew :samples:ensemble:runPerfAB    # prints fps, frame-time spread, memory per scene
+./gradlew :samples:ensemble:runClarity   # saves a screen capture of a crispness test card
+```
+
+Method, all configurations (including OpenGL and the CPU raster tier) and the list of
+fixes behind these numbers: [`docs/PERF_MEMORY_CLARITY.md`](docs/PERF_MEMORY_CLARITY.md).
 
 ---
 
@@ -385,11 +421,15 @@ background, and an "Open SVG..." file chooser).
 ## The pipeline, in depth
 
 ### GPU backends
-- **Ganesh / OpenGL** — the portable baseline; an off-screen WGL context owns the Ganesh
-  GL surface, presented to the window.
-- **Direct3D 12** — preferred on Windows; a flip-model swap chain wired so the Skia
+- **Direct3D 12** — the Windows default; a flip-model swap chain wired so the Skia
   surface is backed *directly* by the swap-chain image (architecturally zero intermediate
-  blit). Survives resize, focus loss, minimize/restore.
+  blit). Survives resize, focus loss, minimize/restore, and scene switches.
+- **Ganesh / OpenGL** — the portable baseline; an off-screen WGL context owns the Ganesh
+  GL surface, presented to the window. Used on Windows when D3D12 is unavailable.
+- **WARP (no GPU)** — when there is no usable GPU or driver, the D3D12 pipeline runs on
+  WARP, the software rasterizer built into Windows. Every feature keeps working, and it
+  is faster than stock JavaFX's software mode. A CPU raster tier
+  (`-Dprism.skia.gpu=false`) is the last resort.
 - **D3D11-to-GL interop** — `WGL_NV_DX_interop2` aliasing so decoded video textures land
   on the GPU without a CPU round-trip.
 
@@ -398,8 +438,10 @@ shutdown or hard device loss, with cache rebuild on recovery.
 
 ### Selecting a GPU backend
 
-By default skia-fx picks the best backend for the platform (**`AUTO`**). You can request
-a specific one through a small additive API on `Application`:
+By default skia-fx picks the best backend for the platform (**`AUTO`**). On Windows that
+order is **D3D12 on the GPU -> OpenGL on the GPU -> D3D12 on WARP (software) -> CPU
+raster**, so a GPU whose driver lacks D3D12 still renders on the GPU. You can request a
+specific one through a small additive API on `Application`:
 
 ```java
 public enum GpuBackend { AUTO, OPENGL, DIRECT3D12, METAL, VULKAN }
@@ -447,8 +489,9 @@ var > AUTO**):
 # System property (accepts: auto, opengl/gl, direct3d12/d3d12/d3d, metal, vulkan/vk)
 java -Dprism.skia.gpu.backend=d3d12 --module-path sdk/lib --add-modules javafx.controls -jar your-app.jar
 
-# Legacy env var (D3D12 opt-in under AUTO)
-set OPENJFX_SKIA_D3D=1
+# Legacy env var: restore the old GL-first order under AUTO
+# (AUTO on Windows is now D3D12 -> OpenGL -> D3D12 WARP software -> CPU raster)
+set OPENJFX_SKIA_D3D=0
 ```
 
 **Graceful fallback.** Requesting a backend that isn't available on the current
@@ -458,8 +501,11 @@ log reports the backend that is **actually** active (and notes any fallback), fo
 
 ```
 INFO: Skia GPU enabled: Direct3D 12.
+INFO: Skia GPU enabled: Direct3D 12 on the WARP software rasterizer (no usable GPU).
 INFO: Requested GPU backend METAL was not available; using OpenGL (Ganesh GL) instead.
 ```
+
+`OPENJFX_SKIA_D3D_WARP=1` forces WARP, to test the no-GPU path on a machine that has a GPU.
 
 `METAL` (macOS) and `VULKAN` (Linux/Windows) are reserved for the per-platform backends
 on the roadmap; until those native paths land they resolve to `AUTO`.
@@ -491,6 +537,10 @@ live via a per-present swap-chain flag — no pipeline rebuild, safe to toggle a
 time. Turning it off is how you actually exceed the display's refresh on a high-refresh
 panel; leaving it on keeps presentation tear-free.
 
+With VSync on, the swap chain itself paces frames to the display, so every rendered frame
+is shown: one frame per refresh, no skipped presents and no judder. Run with
+`-Dskia.verbose=true` to see the presented frame rate once a second.
+
 ### Memory — bounded and observable
 GPU resources live under **soft/hard budgets** with eviction policies (glyph atlas, image
 atlas, standalone textures, render targets, picture cache), tunable via system properties.
@@ -498,6 +548,11 @@ Native handles use explicit `Cleaner`-registered lifecycles — **GPU frees are 
 the render thread**, never run on a daemon thread where they'd corrupt the GPU heap. The
 render-thread hot path targets **zero per-frame heap allocation** via pooled objects and
 per-frame confined off-heap arenas.
+
+Skia's own GPU cache (uploaded images, glyph and path atlases, effect scratch surfaces) is
+bounded too: `-Djavafx.gpu.skiaCacheBudget=96m` by default (accepts `k`/`m`/`g`), and
+resources unused for 5 seconds are released automatically. `-Dskia.verbose=true` prints
+the current and purgeable cache size.
 
 ---
 
@@ -549,7 +604,10 @@ java --module-path sdk/lib --add-modules javafx.controls,javafx.fxml -jar your-a
 ## Roadmap
 
 **Working today**
-- Skia GPU pipeline (OpenGL + D3D12), full 2D draw surface
+- Skia GPU pipeline (D3D12 default on Windows, OpenGL), full 2D draw surface
+- No-GPU fallback on Windows via WARP, faster than stock JavaFX's software mode
+- Measured A/B against stock JavaFX (`runPerfAB`, `runClarity`): smoother frame pacing,
+  higher throughput on shape- and effect-heavy scenes, lower memory, sharp HiDPI output
 - Full JavaFX effect set on Skia image filters
 - Vector SVG (`SvgImage` / `SvgImageView`) — crisp at any zoom/DPI, zoom + tint + grid
 - 3D scene graph via bgfx (meshes, `PerspectiveCamera`, lights, `PhongMaterial`, textures,
@@ -562,7 +620,8 @@ java --module-path sdk/lib --add-modules javafx.controls,javafx.fxml -jar your-a
 - Selectable GPU backend (`Application.setGpuBackend` / `-Dprism.skia.gpu.backend`,
   default `AUTO`) with graceful fallback and a truthful active-backend log
 - Memory budgets + render-thread-safe native lifecycles
-- Custom primary stage, signed native-lib manifest
+- Custom primary stage, `StageStyle.EXTENDED` + `HeaderBar` (OpenJFX 27 API), signed
+  native-lib manifest
 
 **In active development**
 - **WebView / Blink** — DOM, JSObject bridge, network interception, dialogs,
@@ -571,7 +630,8 @@ java --module-path sdk/lib --add-modules javafx.controls,javafx.fxml -jar your-a
 - **Media** — Linux/macOS wiring for the new format tiers, subtitle tracks, and
   continued soak-hardening of the streaming paths.
 - **Copy elimination and profiling** — `SkPicture` subtree caching, atlas tuning,
-  persistent staging buffers, copy/memory instrumentation.
+  persistent staging buffers, copy/memory instrumentation, fewer image/video upload
+  copies, freeing GPU memory on minimize, D3D12 frame-latency control.
 - **SVG animation** — SMIL / CSS-in-SVG playback (a render-thread-driven animation pass);
   today an animated SVG shows its static first frame.
 - **3D** — the bgfx engine and glTF loading work today; skeletal/keyframe **animation**

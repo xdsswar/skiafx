@@ -184,18 +184,18 @@
     -fx-stroke: #aeb8c7;
 }
 
-/* Hover feedback driven by native WM_NCHITTEST + :ht-* pseudo-classes
-   set by CustomDecorations.updateHovered. */
-.win-btn-min:ht-min,
-.win-btn-max:ht-max {
+/* Caption-button hover feedback (HeaderBar buttonType nodes receive
+   normal mouse events, so plain :hover works). */
+.win-btn-min:hover,
+.win-btn-max:hover {
     -fx-background-color: rgba(255,255,255,0.08);
 }
 
-.win-btn-close:ht-close {
+.win-btn-close:hover {
     -fx-background-color: #e81123;
 }
 
-.win-btn-close:ht-close .ctb-icon {
+.win-btn-close:hover .ctb-icon {
     -fx-stroke: #ffffff;
 }
 

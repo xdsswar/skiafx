@@ -39,7 +39,6 @@ set(GLASS_SOURCES
     GlassTextRangeProvider.cpp
     GlassView.cpp
     GlassWindow.cpp
-    custom/CustomWinProc.cpp
     KeyTable.cpp
     ManipulationEvents.cpp
     Pixels.cpp

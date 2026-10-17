@@ -1,13 +1,15 @@
 /*
- * CustomTitleBarDemo — exercises StageStyle.CUSTOM end-to-end.
+ * CustomTitleBarDemo — exercises StageStyle.EXTENDED + HeaderBar end-to-end.
  *
- * The window has no platform decorations; this sample draws its own
- * title bar (icon + title text + minimize/maximize/close buttons)
- * directly in the scene graph, then tells the system which parts of
- * the scene are draggable / button hit zones via the Stage hit-region
- * API. The OS still does the heavy lifting (drag to move, double-click
- * to maximize, Aero snap, right-click for system menu, edge resize) —
- * we just provide the geometry.
+ * The client area extends into the title bar and the system-provided
+ * header buttons are hidden (HeaderBar.setSystemButtonHeight(stage, 0));
+ * this sample draws its own title bar (icon + title text +
+ * minimize/maximize/close buttons) in the scene graph. Two HeaderBars
+ * (sidebar header + content top strip) mark the draggable areas, and the
+ * caption buttons carry a HeaderButtonType. The OS still does the heavy
+ * lifting (drag to move, double-click to maximize, Aero snap, Win11 snap
+ * layouts on the maximize button, right-click for system menu, edge
+ * resize) — we just provide the geometry.
  *
  * The caption buttons are drawn with SVGPath glyphs (stroked, Fluent
  * style) instead of font characters, so they stay crisp at any DPI and
@@ -69,6 +71,9 @@ import javafx.scene.control.Tooltip;
 import javafx.scene.layout.BorderPane;
 import javafx.scene.layout.FlowPane;
 import javafx.scene.layout.HBox;
+import javafx.scene.layout.HeaderBar;
+import javafx.scene.layout.HeaderButtonType;
+import javafx.scene.layout.HeaderDragType;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.StackPane;
@@ -120,7 +125,9 @@ public final class CustomTitleBarDemo extends Application {
     @Override
     public void start(Stage stage) {
         this.stage = stage;
-        stage.initStyle(StageStyle.CUSTOM);
+        stage.initStyle(StageStyle.EXTENDED);
+        // We draw our own caption buttons; hide the system-provided ones.
+        HeaderBar.setSystemButtonHeight(stage, 0);
         stage.setTitle("Nebula Workspace");
 
         // ---- caption (window) buttons --------------------------------
@@ -142,13 +149,12 @@ public final class CustomTitleBarDemo extends Application {
         stage.maximizedProperty().addListener((obs, was, isMax) ->
                 maxIcon.setContent(isMax ? SVG_RESTORE : SVG_MAX));
 
-        // Wire up the actual actions. The OS sends SC_MINIMIZE /
-        // SC_MAXIMIZE / SC_CLOSE for HT_MIN/MAX/CLOSE hit codes
-        // automatically, but JavaFX consumers usually want to drive
-        // these from the JFX-level Stage API.
-        minBtn.setOnMouseClicked(e -> stage.setIconified(true));
-        maxBtn.setOnMouseClicked(e -> stage.setMaximized(!stage.isMaximized()));
-        closeBtn.setOnMouseClicked(e -> stage.close());
+        // The semantic button type makes HeaderBar perform the action
+        // (iconify / maximize-restore / close) and lets the platform
+        // integrate (e.g. Win11 snap layouts when hovering maximize).
+        HeaderBar.setButtonType(minBtn, HeaderButtonType.ICONIFY);
+        HeaderBar.setButtonType(maxBtn, HeaderButtonType.MAXIMIZE);
+        HeaderBar.setButtonType(closeBtn, HeaderButtonType.CLOSE);
 
         HBox winButtons = new HBox(minBtn, maxBtn, closeBtn);
         winButtons.getStyleClass().add("win-buttons");
@@ -177,9 +183,12 @@ public final class CustomTitleBarDemo extends Application {
         HBox navHeader = new HBox(10, navHeaderMark, navHeaderText);
         navHeader.setAlignment(Pos.CENTER_LEFT);
         navHeader.getStyleClass().add("nav-header");
+        // The sidebar header is a drag area: wrap it in its own HeaderBar.
+        HeaderBar.setDragType(navHeader, HeaderDragType.DRAGGABLE_SUBTREE);
+        HeaderBar navHeaderBar = headerBar(navHeader);
 
         // Footer: a tiny "logged-in user" cell, like every real app.
-        VBox navRail = new VBox(navHeader, navItems, grow(), userCell());
+        VBox navRail = new VBox(navHeaderBar, navItems, grow(), userCell());
         navRail.getStyleClass().add("nav-rail");
         navRail.setMinWidth(212);
         navRail.setPrefWidth(212);
@@ -211,6 +220,7 @@ public final class CustomTitleBarDemo extends Application {
 
         Region capDrag = new Region();
         HBox.setHgrow(capDrag, Priority.ALWAYS);
+        HeaderBar.setDragType(capDrag, HeaderDragType.DRAGGABLE);
 
         HBox rightTools = new HBox(12, search, newBtn);
         rightTools.setAlignment(Pos.CENTER_RIGHT);
@@ -259,7 +269,7 @@ public final class CustomTitleBarDemo extends Application {
         // ---- assemble + stylesheet ----------------------------------
         // Content column: top strip · view · status bar. The nav rail to
         // its left spans the full window height (top-to-bottom sidebar).
-        VBox rightColumn = new VBox(topStrip, viewHolder, statusBar);
+        VBox rightColumn = new VBox(headerBar(topStrip), viewHolder, statusBar);
         rightColumn.getStyleClass().add("content-column");
         HBox.setHgrow(rightColumn, Priority.ALWAYS);
 
@@ -271,16 +281,6 @@ public final class CustomTitleBarDemo extends Application {
         if (css != null) {
             scene.getStylesheets().add(css.toExternalForm());
         }
-
-        // ---- register hit regions ----------------------------------
-        // Drag zones: the sidebar header (top of the full-height rail)
-        // and the flexible caption strip in the content column. The
-        // buttons get their dedicated hit codes so hover styling /
-        // Win11 snap-layouts work.
-        stage.setCaptionRegions(navHeader, capDrag);
-        stage.setMinRegion(minBtn);
-        stage.setMaxRegion(maxBtn);
-        stage.setCloseRegion(closeBtn);
 
         // Land on the dashboard.
         tDash.setSelected(true);
@@ -643,10 +643,19 @@ public final class CustomTitleBarDemo extends Application {
     }
 
     /**
-     * Wraps an icon in a fixed-size caption button. Returns a Region
-     * (StackPane) so it can be handed straight to the Stage hit-region
-     * API.
+     * Wraps a title-bar row in a HeaderBar so its draggable areas and
+     * caption buttons take effect. The row fills the bar; the system
+     * insets are zero because the system buttons are hidden.
      */
+    private static HeaderBar headerBar(Region row) {
+        HeaderBar.setAlignment(row, Pos.CENTER_LEFT);
+        HeaderBar bar = new HeaderBar();
+        bar.setCenter(row);
+        bar.setMinHeight(Region.USE_PREF_SIZE);
+        return bar;
+    }
+
+    /** Wraps an icon in a fixed-size caption button (StackPane). */
     private static Region button(String role, SVGPath glyph) {
         StackPane b = new StackPane(glyph);
         b.getStyleClass().addAll("win-btn", "win-btn-" + role);

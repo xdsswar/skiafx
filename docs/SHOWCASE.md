@@ -18,9 +18,9 @@ as an A/B benchmark harness against a stock OpenJFX 25 SDK.
 
 | File | Role |
 |---|---|
-| `ShowcaseApp.java` | `Application` entry; `StageStyle.CUSTOM`, loads the FXML shell, attaches the stylesheet. |
-| `showcase.fxml` | Shell layout: custom title bar + collapsible sidebar + content `StackPane` + status bar. |
-| `ShowcaseController.java` | All behaviour: animated sidebar toggle, responsive auto-collapse, loader-gated section switching, every section's nodes, global FPS badge, title-bar hit-region install. |
+| `ShowcaseApp.java` | `Application` entry; `StageStyle.EXTENDED` (system header buttons hidden), loads the FXML shell, attaches the stylesheet. |
+| `showcase.fxml` | Shell layout: custom title bar in a `HeaderBar` (drag area + `HeaderBar.buttonType` caption buttons) + collapsible sidebar + content `StackPane` + status bar. |
+| `ShowcaseController.java` | All behaviour: animated sidebar toggle, responsive auto-collapse, loader-gated section switching, every section's nodes, global FPS badge, maximize-glyph sync. |
 | `showcase.css` | Single light-theme stylesheet (design tokens → title bar → sidebar → controls → charts → status/FPS → loader). |
 | `StressScene.java` | Shared, **stock-API-only** particle field + `BenchPanel` (metrics) + CSV `Recorder`. |
 | `ShowcaseBenchmark.java` | Portable `DECORATED` benchmark window — runs on a stock SDK for true A/B. |
@@ -74,6 +74,7 @@ java --module-path <javafx-sdk-25>/lib --add-modules javafx.controls \
 Load both CSVs into any charting tool and compare `fps` / `frame_ms` / `p99_ms`
 at matching `nodes`.
 
-> Note: the showcase shell (custom title bar via `StageStyle.CUSTOM` + caption
-> hit regions) uses skia-fx-only API and is **not** part of the portable
-> benchmark — that's deliberate, so the benchmark stays stock-runnable.
+> Note: the showcase shell (custom title bar via `StageStyle.EXTENDED` +
+> `HeaderBar`) needs JavaFX 27 API and is **not** part of the portable
+> benchmark — that's deliberate, so the benchmark stays runnable on a stock
+> OpenJFX 25 SDK.

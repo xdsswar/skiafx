@@ -18,9 +18,12 @@ import javafx.application.Application;
 import java.lang.System.Logger;
 import java.lang.System.Logger.Level;
 import java.lang.foreign.MemorySegment;
+import java.lang.ref.WeakReference;
 import java.lang.foreign.ValueLayout;
 import java.nio.IntBuffer;
 import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
 /**
@@ -149,6 +152,9 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
               /*msaa*/ false);
         this.pState = pState;
         this.presentMode = alloc.mode();
+        if (presentMode == PresentMode.D3D) {
+            SWAP_CHAIN_OWNERS.put(pState.getNativeWindow(), new WeakReference<>(this));
+        }
         this.pixelSource =
             new RectQueuedPixelSource(presentMode == PresentMode.READBACK);
         this.builtRenderScaleX = pState.getRenderScaleX();
@@ -221,6 +227,29 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         }
     }
 
+    /**
+     * Live D3D swap-chain presentable per native window (render thread only).
+     * DXGI permits ONE flip-model swap chain per HWND. When a stage switches
+     * scenes, the new scene's painter can build its presentable before the old
+     * painter's dispose job has run (setScene resizes the window, which fires a
+     * synchronous live-repaint pulse). CreateSwapChainForHwnd then fails with
+     * E_ACCESSDENIED and the window silently degrades to the readback tier
+     * (~20 fps, a CPU copy per frame) for the rest of that scene. Any presentable
+     * still registered for the HWND at allocation time is necessarily stale —
+     * a painter always disposes its own presentable before recreating it — so
+     * it is released here, first. Weak refs: a GC'd owner just drops out.
+     */
+    private static final Map<Long, WeakReference<SkiaPresentable>> SWAP_CHAIN_OWNERS =
+        new HashMap<>();
+
+    private static void releaseStaleSwapChain(long hwnd) {
+        WeakReference<SkiaPresentable> ref = SWAP_CHAIN_OWNERS.remove(hwnd);
+        SkiaPresentable stale = ref == null ? null : ref.get();
+        if (stale != null && !stale.isSurfaceLost()) {
+            stale.dispose();
+        }
+    }
+
     private static AllocResult allocate(PresentableState pState) {
         int w = pState.getRenderWidth();
         int h = pState.getRenderHeight();
@@ -229,6 +258,7 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         // Tier 0: D3D12 + DXGI flip-model + ALLOW_TEARING. The only
         // path that escapes Windows DWM's windowed-vsync cap.
         if (SkiaGpu.isEnabled() && hwnd != 0L) {
+            releaseStaleSwapChain(hwnd);
             MemorySegment seg = NativeBridge.surfaceCreateSwapChainD3d(
                 MemorySegment.ofAddress(hwnd), w, h);
             if (seg != null && !seg.equals(MemorySegment.NULL)) {
@@ -275,6 +305,13 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
 
     @Override
     public boolean lockResources(PresentableState newState) {
+        // Released out from under its painter (stale swap chain handed to a
+        // newer presentable for the same window, see SWAP_CHAIN_OWNERS):
+        // report lost so a reused painter rebuilds instead of drawing into a
+        // dead surface.
+        if (isSurfaceLost()) {
+            return true;
+        }
         int nw = newState.getRenderWidth();
         int nh = newState.getRenderHeight();
         boolean sizeChanged = getPhysicalWidth() != nw || getPhysicalHeight() != nh;
@@ -583,6 +620,19 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         NativeBridge.surfacePrimeWindow(MemorySegment.ofAddress(getNativeHandle()));
     }
 
+    /**
+     * True when this presentable's own present call paces frames to the
+     * display while VSync is on: the GPU swap-chain tiers (D3D12
+     * {@code Present(1)}; GL {@code SwapBuffers} + DwmFlush pacing in the
+     * native bridge). The painter then must NOT apply its wall-clock present
+     * cap — a cap measured against a rounded refresh rate drops roughly every
+     * other frame when presents already arrive one vblank apart, which is
+     * visible judder. The readback tier has no vblank sync and keeps the cap.
+     */
+    public boolean pacesToDisplay() {
+        return presentMode != PresentMode.READBACK && Application.isVsyncEnabled();
+    }
+
     @Override
     public boolean present() {
         // SPIKE hook: draw the 3D cube LAST (after the scene is painted),
@@ -601,6 +651,9 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         // only changes the present sync interval, never rebuilds the swap chain,
         // so it is safe at any time.
         final int vsync = Application.isVsyncEnabled() ? 1 : 0;
+        // Release GPU resources Skia hasn't used for a while (rate-limited
+        // natively to ~1/s; no-op without a GPU context).
+        NativeBridge.gpuHousekeeping();
         switch (presentMode) {
             case D3D -> {
                 // grCtx->flushAndSubmit + DXGI Present (vsync ? (1,0) : (0, ALLOW_TEARING)).
@@ -684,8 +737,11 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
                     .SkiaEffectRenderer.ALLOC_COUNT.getAndSet(0);
                 long bypass = com.sun.scenario.effect.impl.skia
                     .SkiaEffectRenderer.BYPASS_COUNT.getAndSet(0);
-                System.err.printf("[skia] %.1f fps  %s  effects: checkouts=%d allocs=%d bypass=%d%n",
-                    fps, Copies.formatLine(copies), checkouts, allocs, bypass);
+                long[] cache = NativeBridge.gpuCacheUsage();
+                System.err.printf("[skia] %.1f fps  %s  effects: checkouts=%d allocs=%d bypass=%d"
+                        + "  gpuCache=%.1fMB (purgeable %.1fMB)%n",
+                    fps, Copies.formatLine(copies), checkouts, allocs, bypass,
+                    cache[0] / 1048576.0, cache[1] / 1048576.0);
                 fpsWindowStart = now;
                 fpsFrames = 0;
             }

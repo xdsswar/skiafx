@@ -64,6 +64,32 @@ public final class SkiaGpu {
         return Boolean.TRUE.equals(enabled);
     }
 
+    /** Default Skia GPU resource-cache budget: 96 MB. */
+    private static final long DEFAULT_SKIA_CACHE_BUDGET = 96L << 20;
+
+    /**
+     * {@code -Djavafx.gpu.skiaCacheBudget=<n>[k|m|g]} (plain number = bytes),
+     * default {@value #DEFAULT_SKIA_CACHE_BUDGET} bytes. Unparseable values
+     * fall back to the default.
+     */
+    static long skiaCacheBudgetBytes() {
+        String v = System.getProperty("javafx.gpu.skiaCacheBudget");
+        if (v == null || v.isBlank()) return DEFAULT_SKIA_CACHE_BUDGET;
+        v = v.trim().toLowerCase(Locale.ROOT);
+        long mul = 1;
+        char last = v.charAt(v.length() - 1);
+        if (last == 'k' || last == 'm' || last == 'g') {
+            mul = last == 'k' ? 1L << 10 : last == 'm' ? 1L << 20 : 1L << 30;
+            v = v.substring(0, v.length() - 1);
+        }
+        try {
+            long n = Long.parseLong(v.trim()) * mul;
+            return n > 0 ? n : DEFAULT_SKIA_CACHE_BUDGET;
+        } catch (NumberFormatException e) {
+            return DEFAULT_SKIA_CACHE_BUDGET;
+        }
+    }
+
     private static synchronized boolean probe() {
         Boolean cached = enabled;
         if (cached != null) return cached;
@@ -82,6 +108,10 @@ public final class SkiaGpu {
         // the most suitable backend for the platform (see resolveBackendPref).
         GpuBackend requested = resolveRequestedBackend();
         NativeBridge.setGpuBackend(toNativePref(requested));
+        // Bound Skia's own GPU cache (textures, atlases, effect scratch) before
+        // the context is built. Skia's default is 256 MB and is invisible to
+        // the Java texture budget; most UIs need far less.
+        NativeBridge.setResourceCacheLimit(skiaCacheBudgetBytes());
 
         MemorySegment h;
         try {
@@ -106,6 +136,11 @@ public final class SkiaGpu {
         // hardcoded name — D3D init can fall back to GL, and AUTO is resolved natively.
         int active = NativeBridge.activeBackend();
         String activeName = backendName(active);
+        if (NativeBridge.isSoftwareDevice()) {
+            // No usable GPU/driver: the GPU pipeline runs on the OS software
+            // rasterizer (D3D12 WARP) — still far faster than the CPU raster tier.
+            activeName += " on the WARP software rasterizer (no usable GPU)";
+        }
         LOG.log(Level.INFO, "Skia GPU enabled: " + activeName + ".");
         if (requested != GpuBackend.AUTO && !matchesActive(requested, active)) {
             LOG.log(Level.INFO, "Requested GPU backend " + requested

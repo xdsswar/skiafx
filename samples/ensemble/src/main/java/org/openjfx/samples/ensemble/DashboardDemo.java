@@ -1,7 +1,7 @@
 /*
  * DashboardDemo — a polished, web-style admin dashboard for skia-fx.
  *
- * A StageStyle.CUSTOM window with a self-drawn title bar, an animated
+ * A StageStyle.EXTENDED window with a self-drawn title bar, an animated
  * collapsible icon-rail sidebar (icons-only when collapsed), a top bar with
  * search + profile, and several fully-styled sections: an analytics
  * dashboard, a crypto-style "Swap" panel, a multi-step registration form,
@@ -24,6 +24,7 @@ import javafx.application.Application;
 import javafx.fxml.FXMLLoader;
 import javafx.scene.Parent;
 import javafx.scene.Scene;
+import javafx.scene.layout.HeaderBar;
 import javafx.stage.Stage;
 import javafx.stage.StageStyle;
 
@@ -51,7 +52,9 @@ public final class DashboardDemo extends Application {
             scene.getStylesheets().add(css.toExternalForm());
         }
 
-        stage.initStyle(StageStyle.CUSTOM);
+        stage.initStyle(StageStyle.EXTENDED);
+        // The title bar draws its own caption buttons; hide the system ones.
+        HeaderBar.setSystemButtonHeight(stage, 0);
         stage.setTitle("Numa · Dashboard");
         stage.setMinWidth(760);
         stage.setMinHeight(560);

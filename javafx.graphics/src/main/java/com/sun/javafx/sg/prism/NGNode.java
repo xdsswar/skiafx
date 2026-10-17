@@ -37,12 +37,14 @@ import com.sun.javafx.geom.DirtyRegionPool;
 import com.sun.javafx.geom.Point2D;
 import com.sun.javafx.geom.RectBounds;
 import com.sun.javafx.geom.Rectangle;
+import com.sun.javafx.geom.transform.Affine2D;
 import com.sun.javafx.geom.transform.Affine3D;
 import com.sun.javafx.geom.transform.BaseTransform;
 import com.sun.javafx.geom.transform.GeneralTransform3D;
 import com.sun.javafx.geom.transform.NoninvertibleTransformException;
 import com.sun.javafx.tk.quantum.QuantumToolkit;
 import com.sun.prism.CompositeMode;
+import com.sun.prism.paint.Paint;
 import com.sun.prism.skia.SkiaGraphics;
 import com.sun.prism.skia.impl.SkiaGpu;
 import com.sun.prism.Graphics;
@@ -2370,6 +2372,28 @@ public abstract class NGNode {
             }
         }
 
+        // skia-fx: a filled, opaque shape clip (rounded Rectangle, Circle,
+        // Path...) becomes a native anti-aliased path clip on the canvas and
+        // the content renders straight through. The generic path below renders
+        // content + mask into two LOGICAL-resolution offscreens and blends
+        // them; with the pixel scale kept out of the transform (Skia pipeline)
+        // that lands at the wrong size/position on HiDPI, and it costs two
+        // intermediate surfaces + a blend pass at any scale.
+        if (g instanceof SkiaGraphics sg && curXform.is2D()
+                && isPathClipCandidate(getClipNode())) {
+            NGShape clipShape = (NGShape) getClipNode();
+            PATH_CLIP_XFORM.setTransform(curXform);
+            PATH_CLIP_XFORM.concatenate(clipShape.getTransform());
+            if (sg.pushClipShape(clipShape.getShape(), PATH_CLIP_XFORM)) {
+                try {
+                    renderForClip(g);
+                } finally {
+                    sg.popClip();
+                }
+                return;
+            }
+        }
+
         if (!curXform.is2D()) {
             Rectangle savedClip = g.getClipRect();
             g.setClipRect(clipRect);
@@ -2427,6 +2451,23 @@ public abstract class NGNode {
         Effect.releaseCompatibleImage(fctx, clipImg);
     }
 
+    /** Render-thread scratch for the path-clip fast path in {@link #renderClip}. */
+    private static final Affine2D PATH_CLIP_XFORM = new Affine2D();
+
+    /**
+     * A clip node whose coverage equals its own filled geometry: a visible,
+     * opaque, fill-only shape with no effect, clip or opacity of its own
+     * (text is excluded — its outline is costly and it is rarely a clip).
+     * Such a clip is exactly a path clip.
+     */
+    private static boolean isPathClipCandidate(NGNode clip) {
+        if (!(clip instanceof NGShape s) || clip instanceof NGText) return false;
+        if (s.getMode() != NGShape.Mode.FILL || !s.isVisible()) return false;
+        if (s.getClipNode() != null || s.getEffectFilter() != null || s.getOpacity() < 1f) return false;
+        Paint fill = s.getFillPaint();
+        return fill != null && fill.isOpaque();
+    }
+
     void renderForClip(Graphics g) {
         if (getEffectFilter() != null) {
             renderEffect(g);
@@ -2465,31 +2506,37 @@ public abstract class NGNode {
         BaseBounds bounds = getContentBounds(new RectBounds(), curXform);
         Rectangle r = new Rectangle(bounds);
         r.intersectWith(PrEffectHelper.getGraphicsClipNoClone(g));
-        // skia-fx HiDPI: the Skia pipeline keeps the pixel scale separate from
-        // the transform (curXform is LOGICAL). Sizing the offscreen from r
-        // (logical) would render the subtree at logical resolution and upscale
-        // it on composite -> blur on 150%/175% monitors. Allocate the offscreen
-        // at DEVICE resolution and set the pixel scale on its Graphics so the
-        // subtree (incl. nested effects) renders crisp; the composite-back is
-        // unchanged (the device-res texture maps 1:1 once the window Graphics
-        // re-applies the scale). No-op under Prism / at 100%.
+        // skia-fx HiDPI: the Skia pipeline keeps the pixel scale out of the
+        // Graphics transform (curXform is LOGICAL). Render the group into an
+        // offscreen covering the DEVICE-pixel-snapped bounds, with the scale
+        // baked into its transform (the same convention as CacheFilter /
+        // PrEffectHelper, so nested effects see one consistent space), then
+        // composite it back so it maps 1:1 onto whole device pixels. Sizing it
+        // in device px but placing it at the LOGICAL origin (r.x * 1.25 is
+        // fractional) resampled the whole group: soft borders, fuzzy text.
+        // Identity at 100% / under Prism (ps == 1).
         float psx = (g instanceof SkiaGraphics) ? g.getPixelScaleFactorX() : 1f;
         float psy = (g instanceof SkiaGraphics) ? g.getPixelScaleFactorY() : 1f;
         boolean hidpi = (psx != 1f || psy != 1f);
-        int iw = hidpi ? (int) Math.ceil(r.width  * psx) : r.width;
-        int ih = hidpi ? (int) Math.ceil(r.height * psy) : r.height;
+        int dx0 = r.x, dy0 = r.y, iw = r.width, ih = r.height;
+        if (hidpi) {
+            dx0 = (int) Math.floor(r.x * psx);
+            dy0 = (int) Math.floor(r.y * psy);
+            iw = (int) Math.ceil((r.x + r.width) * psx) - dx0;
+            ih = (int) Math.ceil((r.y + r.height) * psy) - dy0;
+        }
         PrDrawable img = (PrDrawable)
             Effect.getCompatibleImage(fctx, iw, ih);
         if (img == null) {
             return;
         }
         Graphics gImg = img.createGraphics();
-        if (hidpi) {
-            gImg.setPixelScaleFactors(psx, psy);
-        }
         gImg.setHasPreCullingBits(g.hasPreCullingBits());
         gImg.setClipRectIndex(g.getClipRectIndex());
-        gImg.translate(-r.x, -r.y);
+        gImg.translate(-dx0, -dy0);
+        if (hidpi) {
+            gImg.scale(psx, psy);
+        }
         gImg.transform(curXform);
         renderContent(gImg);
         // img contents have already been rendered in device space, so
@@ -2497,7 +2544,12 @@ public abstract class NGNode {
         g.setTransform(null);
         float ea = g.getExtraAlpha();
         g.setExtraAlpha(getOpacity()*ea);
-        g.drawTexture(img.getTextureObject(), r.x, r.y, r.width, r.height);
+        if (hidpi) {
+            // Logical rect whose device image is exactly (dx0, dy0, iw, ih).
+            g.drawTexture(img.getTextureObject(), dx0 / psx, dy0 / psy, iw / psx, ih / psy);
+        } else {
+            g.drawTexture(img.getTextureObject(), r.x, r.y, r.width, r.height);
+        }
         g.setExtraAlpha(ea);
         // transform state will be restored in render() method above...
         Effect.releaseCompatibleImage(fctx, img);

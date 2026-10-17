@@ -23,6 +23,7 @@
 #include <dxgi1_5.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <vector>
 
 #include <atomic>
@@ -61,6 +62,9 @@ struct D3DGlobal {
     bool                 allowTearing = false;
     bool                 initialized  = false;
     bool                 succeeded    = false;
+    bool                 warp         = false;  // device is the WARP software rasterizer
+    bool                 hardwareTried = false;
+    bool                 warpTried     = false;
 };
 
 static D3DGlobal& g() {
@@ -105,6 +109,9 @@ struct OpenJfxD3DSwapChain {
     ID3D12CommandQueue*           queue          = nullptr;
 };
 
+// Shared scene-surface props (text contrast/gamma), defined in openjfx_skia_bridge.cpp.
+const SkSurfaceProps* openjfxTextSurfaceProps();
+
 // ---------------------------------------------------------------------------
 // Init / device + queue + factory + tearing capability detection.
 // ---------------------------------------------------------------------------
@@ -113,19 +120,34 @@ namespace {
 
 // Brings up the process-wide D3D objects (idempotent). Returns true if
 // the globals are populated and the device is usable.
-bool ensureD3DInitialized() {
+// Re-callable with a wider policy: AUTO first asks for hardware only (so a
+// GPU without D3D12 support falls back to hardware GL, not to WARP), and only
+// asks for WARP after GL also failed. Each adapter class is tried once.
+bool ensureD3DInitialized(D3DAdapterPolicy policy) {
     D3DGlobal& s = g();
-    if (s.initialized) return s.succeeded;
+    if (s.succeeded) return true;
     s.initialized = true;
 
     HRESULT hr;
     UINT factoryFlags = 0;
 
-    hr = CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&s.factory));
-    if (FAILED(hr) || !s.factory) return false;
+    if (!s.factory) {
+        hr = CreateDXGIFactory2(factoryFlags, IID_PPV_ARGS(&s.factory));
+        if (FAILED(hr) || !s.factory) return false;
+    }
+
+    // OPENJFX_SKIA_D3D_WARP=1 forces the WARP adapter (testing the no-GPU path
+    // on a machine that has one).
+    const char* warpEnv = std::getenv("OPENJFX_SKIA_D3D_WARP");
+    const bool forceWarp = warpEnv && warpEnv[0] && warpEnv[0] != '0';
+    const bool tryHardware = !forceWarp && !s.hardwareTried
+        && policy != D3DAdapterPolicy::WarpOnly;
+    const bool tryWarp = !s.warpTried
+        && (forceWarp || policy != D3DAdapterPolicy::HardwareOnly);
+    if (tryHardware) s.hardwareTried = true;
 
     // Pick the first hardware adapter that creates a D3D12 device.
-    for (UINT i = 0;; ++i) {
+    for (UINT i = 0; tryHardware; ++i) {
         IDXGIAdapter1* a = nullptr;
         if (s.factory->EnumAdapters1(i, &a) == DXGI_ERROR_NOT_FOUND) break;
         DXGI_ADAPTER_DESC1 desc;
@@ -142,6 +164,26 @@ bool ensureD3DInitialized() {
             break;
         }
         a->Release();
+    }
+    // No usable hardware adapter (no GPU, no/broken driver, Microsoft Basic
+    // Display Adapter): use WARP, the software rasterizer that ships with every
+    // Windows 10+ install. It is a multithreaded SIMD JIT, far faster than a
+    // scalar CPU raster path, and keeps the full GPU feature set (effects,
+    // swap-chain present) working — the CPU fallback without losing features.
+    if (!s.device && tryWarp) {
+        s.warpTried = true;
+        IDXGIAdapter1* wa = nullptr;
+        if (SUCCEEDED(s.factory->EnumWarpAdapter(IID_PPV_ARGS(&wa))) && wa) {
+            ID3D12Device* dev = nullptr;
+            hr = D3D12CreateDevice(wa, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&dev));
+            if (SUCCEEDED(hr) && dev) {
+                s.adapter = wa;
+                s.device  = dev;
+                s.warp    = true;
+            } else {
+                wa->Release();
+            }
+        }
     }
     if (!s.device) {
         s.factory->Release();
@@ -191,12 +233,13 @@ static void releaseD3DGlobals() {
     if (s.factory) { s.factory->Release(); s.factory = nullptr; }
     s.allowTearing = false;
     s.succeeded    = false;
-    // Leave `initialized` true so a second openjfxD3DMakeContext call
-    // returns null fast without re-attempting.
+    s.warp         = false;
+    // hardwareTried / warpTried stay set, so each adapter class is attempted
+    // at most once per process.
 }
 
-sk_sp<GrDirectContext> openjfxD3DMakeContext() {
-    if (!ensureD3DInitialized()) {
+sk_sp<GrDirectContext> openjfxD3DMakeContext(D3DAdapterPolicy policy) {
+    if (!ensureD3DInitialized(policy)) {
         std::fprintf(stderr,
             "[openjfx-skia] D3D12 init failed (CreateDXGIFactory2 / D3D12CreateDevice / CreateCommandQueue) — falling back to GL.\n");
         return nullptr;
@@ -235,6 +278,10 @@ sk_sp<GrDirectContext> openjfxD3DMakeContext() {
 
 bool openjfxD3DAllowTearing() {
     return g().allowTearing;
+}
+
+bool openjfxD3DIsWarp() {
+    return g().warp;
 }
 
 // ---------------------------------------------------------------------------
@@ -407,7 +454,7 @@ bool wrapBackBuffers(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx) {
             kTopLeft_GrSurfaceOrigin,
             kRGBA_8888_SkColorType,
             /* colorSpace    */ nullptr,
-            /* surfaceProps  */ nullptr,
+            openjfxTextSurfaceProps(),
             /* releaseProc   */ nullptr,
             /* releaseContext*/ nullptr);
         if (!surface) {
@@ -498,7 +545,7 @@ OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
     out->queue = s.queue;
 
     if (!wrapBackBuffers(out, grCtx)) {
-        openjfxD3DDestroySwapChain(out);
+        openjfxD3DDestroySwapChain(out, grCtx);
         return nullptr;
     }
 
@@ -602,7 +649,7 @@ int32_t openjfxD3DPresent(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx, int32
     return 0;
 }
 
-void openjfxD3DDestroySwapChain(OpenJfxD3DSwapChain* sc) {
+void openjfxD3DDestroySwapChain(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx) {
     if (!sc) return;
     // Wait for the GPU to drain its queue before tearing anything
     // down — releasing the back-buffer SkSurfaces while the GPU is
@@ -618,6 +665,14 @@ void openjfxD3DDestroySwapChain(OpenJfxD3DSwapChain* sc) {
     }
     sc->backBuffers.clear(); // releases the per-buffer SkSurfaces
                              // (and their adopted ID3D12Resource refs)
+    // Skia's D3D backend still references the buffers from its in-flight /
+    // finished command lists until it next reaps them. A synchronous flush
+    // reaps them now, so the swap chain's buffers are truly unreferenced when
+    // we Release() below and DXGI destroys the swap chain immediately —
+    // freeing the HWND for the next presentable's CreateSwapChainForHwnd.
+    if (grCtx && !skia_fx::d3d12_device_lost()) {
+        grCtx->flushAndSubmit(GrSyncCpu::kYes);
+    }
     if (sc->fenceEvent) { ::CloseHandle(sc->fenceEvent); sc->fenceEvent = nullptr; }
     if (sc->fence)      { sc->fence->Release();          sc->fence      = nullptr; }
     if (sc->queue)      { sc->queue->Release();          sc->queue      = nullptr; }

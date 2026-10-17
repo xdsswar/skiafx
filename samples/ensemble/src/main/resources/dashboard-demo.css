@@ -73,10 +73,9 @@
     -fx-stroke-line-cap: round;
     -fx-stroke-line-join: round;
 }
-.win-btn-min:ht-min,  .win-btn-max:ht-max  { -fx-background-color: rgba(28,37,51,0.08); }
-.win-btn-min:hover,   .win-btn-max:hover   { -fx-background-color: rgba(28,37,51,0.06); }
-.win-btn-close:ht-close, .win-btn-close:hover { -fx-background-color: -bad; }
-.win-btn-close:ht-close .ctb-icon, .win-btn-close:hover .ctb-icon { -fx-stroke: #ffffff; }
+.win-btn-min:hover,   .win-btn-max:hover   { -fx-background-color: rgba(28,37,51,0.08); }
+.win-btn-close:hover { -fx-background-color: -bad; }
+.win-btn-close:hover .ctb-icon { -fx-stroke: #ffffff; }
 
 /* generic thin stroked glyph (toolbar / inline icons) */
 .thin-icon {

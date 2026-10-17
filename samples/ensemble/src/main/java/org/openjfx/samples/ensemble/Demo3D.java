@@ -15,9 +15,9 @@
  *   - Continuous animation (Rotate transforms driven per-frame) so the
  *     uncapped submit path is exercised under real 3D load.
  *
- * The whole thing lives inside a StageStyle.CUSTOM window — the demo
- * paints its own title bar and hands the OS the hit-region geometry
- * (drag-to-move, double-click-maximize, Aero snap, edge resize), with
+ * The whole thing lives inside a StageStyle.EXTENDED window — the demo
+ * paints its own title bar inside a HeaderBar (drag-to-move,
+ * double-click-maximize, Aero snap, edge resize), with
  * a translucent 2D HUD composited over the live 3D SubScene.
  *
  * Run: ./gradlew :samples:ensemble:runDemo3D
@@ -93,7 +93,9 @@ public final class Demo3D extends Application<Stage> {
 
     @Override
     public void start(Stage stage) {
-        stage.initStyle(StageStyle.CUSTOM);
+        stage.initStyle(StageStyle.EXTENDED);
+        // We draw our own caption buttons; hide the system-provided ones.
+        HeaderBar.setSystemButtonHeight(stage, 0);
         stage.setTitle("Skia 3D Showcase");
 
         // The whole point of this demo is to test 3D on the Skia
@@ -652,10 +654,10 @@ public final class Demo3D extends Application<Stage> {
     }
 
     // ====================================================================
-    //  Custom title bar (StageStyle.CUSTOM)
+    //  Custom title bar (StageStyle.EXTENDED + HeaderBar)
     // ====================================================================
 
-    private HBox buildTitleBar(Stage stage) {
+    private HeaderBar buildTitleBar(Stage stage) {
         Region appMark = new Region();
         appMark.getStyleClass().add("app-mark");
         appMark.setPrefSize(14, 14);
@@ -669,6 +671,7 @@ public final class Demo3D extends Application<Stage> {
         titleLeft.setAlignment(Pos.CENTER_LEFT);
         titleLeft.setPadding(new Insets(0, 0, 0, 14));
         HBox.setHgrow(titleLeft, Priority.ALWAYS);
+        HeaderBar.setDragType(titleLeft, HeaderDragType.DRAGGABLE_SUBTREE);
 
         SVGPath maxIcon = icon(SVG_MAX);
         Region minBtn   = captionButton("min", icon(SVG_MIN));
@@ -679,9 +682,9 @@ public final class Demo3D extends Application<Stage> {
         stage.maximizedProperty().addListener((o, was, isMax) ->
                 maxIcon.setContent(isMax ? SVG_RESTORE : SVG_MAX));
 
-        minBtn.setOnMouseClicked(e -> stage.setIconified(true));
-        maxBtn.setOnMouseClicked(e -> stage.setMaximized(!stage.isMaximized()));
-        closeBtn.setOnMouseClicked(e -> stage.close());
+        HeaderBar.setButtonType(minBtn, HeaderButtonType.ICONIFY);
+        HeaderBar.setButtonType(maxBtn, HeaderButtonType.MAXIMIZE);
+        HeaderBar.setButtonType(closeBtn, HeaderButtonType.CLOSE);
 
         HBox bar = new HBox(titleLeft, minBtn, maxBtn, closeBtn);
         bar.getStyleClass().add("ctb-title-bar");
@@ -690,11 +693,11 @@ public final class Demo3D extends Application<Stage> {
         bar.setMinHeight(40);
         bar.setMaxHeight(40);
 
-        stage.setCaptionRegions(titleLeft);
-        stage.setMinRegion(minBtn);
-        stage.setMaxRegion(maxBtn);
-        stage.setCloseRegion(closeBtn);
-        return bar;
+        HeaderBar.setAlignment(bar, Pos.CENTER_LEFT);
+        HeaderBar headerBar = new HeaderBar();
+        headerBar.setCenter(bar);
+        headerBar.setMinHeight(Region.USE_PREF_SIZE);
+        return headerBar;
     }
 
     private static SVGPath icon(String svg) {

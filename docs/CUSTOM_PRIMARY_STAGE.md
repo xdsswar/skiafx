@@ -12,8 +12,8 @@ never receive a *custom* `Stage` subclass as its primary window — even
 though secondary windows can be any subclass.
 
 skia-fx makes `Application` generic on its stage type so the primary
-window can be a custom `Stage` subclass (e.g. an undecorated stage that
-paints its own title bar via `StageStyle.CUSTOM`, or one that exposes
+window can be a custom `Stage` subclass (e.g. a stage that builds its
+own title bar with `StageStyle.EXTENDED` + `HeaderBar`, or one that exposes
 app-specific window API) — **without writing any factory code**:
 
 ```java
@@ -54,7 +54,7 @@ the custom stage yourself.
 ```java
 public final class MyStage extends Stage {        // public, public no-arg ctor
     public MyStage() {
-        initStyle(StageStyle.CUSTOM);   // we paint our own chrome
+        initStyle(StageStyle.EXTENDED); // our own HeaderBar chrome
         // ... custom window API ...
     }
 }

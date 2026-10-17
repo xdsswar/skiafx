@@ -121,4 +121,30 @@ tasks.register('runRasterFillBench', JavaExec) {
     applyPerfRunConfig(it)
 }
 
+tasks.register('runSnapHunt', JavaExec) {
+    group = 'verification'
+    description = 'Render hot-path scenes, probe ground-truth pixels, dump PNGs (bug hunt). -Pperf.cpu=true for the software tier.'
+    dependsOn 'classes'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.perf.SnapHunt')
+    mainModule.set('openjfx.samples.perf')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'prism.order', 'skia'
+    systemProperty 'hunt.dshadowOnly',
+        providers.gradleProperty('dshadowOnly').getOrElse('false')
+    applyPerfRunConfig(it)
+}
+
+tasks.register('runGraphicsDemo', JavaExec) {
+    group = 'application'
+    description = 'Interactive visual gallery of the stabilized 2D paths (drop shadows, dashed strokes, effects, gradients, blends, clipping, shapes, transforms, text). -Pperf.cpu=true for the software tier.'
+    dependsOn 'classes'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.perf.GraphicsDemo')
+    mainModule.set('openjfx.samples.perf')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'prism.order', 'skia'
+    applyPerfRunConfig(it)
+}
+
 description = 'Performance benchmarks and copy-counter target scenes.'

@@ -193,18 +193,14 @@ public final class DashboardController {
         showSection("dashboard");
     }
 
-    /** Wire the custom chrome once the Stage exists (called by DashboardDemo). */
+    /**
+     * Called by DashboardDemo once the Stage exists. Drag zones (brand
+     * header + caption strip) and caption button actions are declared on
+     * the HeaderBars in dashboard-demo.fxml; this keeps the maximize glyph
+     * and size readout in sync.
+     */
     void installStage(Stage stage) {
         this.stage = stage;
-        // Drag zones: the brand header and the flexible caption strip.
-        stage.setCaptionRegions(sidebarHeader, captionRegion);
-        stage.setMinRegion(minBtn);
-        stage.setMaxRegion(maxBtn);
-        stage.setCloseRegion(closeBtn);
-
-        minBtn.setOnMouseClicked(e -> stage.setIconified(true));
-        maxBtn.setOnMouseClicked(e -> stage.setMaximized(!stage.isMaximized()));
-        closeBtn.setOnMouseClicked(e -> stage.close());
 
         maxIcon.setContent(stage.isMaximized() ? SVG_RESTORE : SVG_MAX);
         stage.maximizedProperty().addListener((o, was, isMax) ->

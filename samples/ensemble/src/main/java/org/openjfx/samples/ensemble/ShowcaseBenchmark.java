@@ -2,7 +2,7 @@
  * ShowcaseBenchmark — the portable A/B harness.
  *
  * Deliberately uses ONLY stock JavaFX API (plain DECORATED window, no
- * StageStyle.CUSTOM, no caption regions, no skia-fx additions). That means
+ * custom window decorations, no skia-fx additions). That means
  * this exact class compiles and runs against a vanilla OpenJFX 25 SDK, so
  * you can run the identical workload on both pipelines and diff the CSVs.
  *

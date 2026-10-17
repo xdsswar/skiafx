@@ -284,7 +284,7 @@ tasks.register('runDashboard', JavaExec) {
 
 tasks.register('runCustomTitleBar', JavaExec) {
     group = 'application'
-    description = 'Launch CustomTitleBarDemo (StageStyle.CUSTOM end-to-end).'
+    description = 'Launch CustomTitleBarDemo (StageStyle.EXTENDED + HeaderBar end-to-end).'
     dependsOn 'classes'
     classpath  = sourceSets.main.runtimeClasspath
     mainClass.set('org.openjfx.samples.ensemble.CustomTitleBarDemo')
@@ -407,6 +407,53 @@ tasks.register('runBench', JavaExec) {
         def v = project.findProperty(k)
         if (v == null) v = System.getProperty(k)
         if (v != null) systemProperty k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runPerfAB', JavaExec) {
+    group = 'verification'
+    description = 'Run PerfAB (timed scene sequence; prints [perfab] frame-pacing + memory lines, then exits).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.PerfAB')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    systemProperty 'perfab.label', 'skia-fx'
+    ['perfab.seconds', 'perfab.scenes', 'perfab.label', 'skia.verbose',
+     'javafx.gpu.memDump', 'prism.skia.gpu.backend', 'skia.present.diag',
+     'skia.present.maxHz', 'javafx.animation.fullspeed', 'javafx.animation.pulse',
+     'prism.vsync', 'prism.skia.gpu', 'skia.ffm.critical', 'skia.raster.bgra'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    ['OPENJFX_SKIA_D3D', 'OPENJFX_SKIA_D3D_WARP', 'OPENJFX_SKIA_GL_PACING'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
+    }
+    applyDevTreeRunConfig(it)
+}
+
+tasks.register('runClarity', JavaExec) {
+    group = 'verification'
+    description = 'Run ClarityShot (renders a crispness test card, saves a screen capture PNG, exits).'
+    dependsOn 'classes'
+    classpath  = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.ensemble.ClarityShot')
+    mainModule.set('openjfx.samples.ensemble')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED'
+    ['clarity.out', 'clarity.label', 'glass.win.uiScale', 'prism.skia.gpu',
+     'prism.skia.gpu.backend'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getProperty(k)
+        if (v != null) systemProperty k, v.toString()
+    }
+    ['OPENJFX_SKIA_TEXT_CONTRAST', 'OPENJFX_SKIA_TEXT_GAMMA', 'OPENJFX_SKIA_D3D'].each { k ->
+        def v = project.findProperty(k)
+        if (v == null) v = System.getenv(k)
+        if (v != null) environment k, v.toString()
     }
     applyDevTreeRunConfig(it)
 }

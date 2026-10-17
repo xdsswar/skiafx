@@ -28,7 +28,6 @@
 #include "FullScreenWindow.h"
 #include "GlassApplication.h"
 #include "GlassWindow.h"
-#include "custom/CustomWinProc.h"
 #include "GlassScreen.h"
 #include "GlassMenu.h"
 #include "GlassView.h"
@@ -1763,11 +1762,6 @@ JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinWindow__1initIDs
      ASSERT(javaIDs.Window.notifyDelegatePtr);
      if (env->ExceptionCheck()) return;
 
-     // skia-fx: cache the WinWindow.jniHitTest jmethodID for the
-     // custom-decorations WindowProc. Optional — windows that aren't
-     // custom-decorated never invoke it.
-     SkiaCustomWinProc::initIDs(env, cls);
-
      javaIDs.WinWindow.nonClientHitTest = env->GetMethodID(cls, "nonClientHitTest", "(II)I");
      ASSERT(javaIDs.WinWindow.nonClientHitTest);
      if (env->ExceptionCheck()) return;
@@ -1794,66 +1788,41 @@ JNIEXPORT jlong JNICALL Java_com_sun_glass_ui_win_WinWindow__1createWindow
             mask |= com_sun_glass_ui_Window_TITLED;
         }
 
-        // skia-fx: StageStyle.CUSTOM — give the
-        // window the full overlapped style (caption + thick frame +
-        // sizebox + min/max boxes) so the OS still does Aero snap,
-        // Win11 snap-layouts, edge resize, taskbar thumbnail, and
-        // window animations. After window creation we subclass the
-        // WindowProc via SkiaCustomWinProc::install() (see custom/),
-        // which owns WM_NCCALCSIZE (removes the visible frame +
-        // caption) and WM_NCHITTEST (routes to the Java-side region
-        // snapshot).
-        const bool isCustomDecorations =
-            (mask & com_sun_glass_ui_Window_CUSTOM_DECORATIONS) != 0;
-        if (isCustomDecorations) {
-            dwStyle = WS_CLIPCHILDREN | WS_OVERLAPPEDWINDOW;
-            if (!(mask & com_sun_glass_ui_Window_MINIMIZABLE)) {
-                dwStyle &= ~WS_MINIMIZEBOX;
+        if (mask & com_sun_glass_ui_Window_TITLED) {
+            dwExStyle = WS_EX_WINDOWEDGE;
+            dwStyle |= WS_CAPTION;
+
+            if (mask & com_sun_glass_ui_Window_MINIMIZABLE) {
+                dwStyle |= WS_MINIMIZEBOX;
             }
-            if (!(mask & com_sun_glass_ui_Window_MAXIMIZABLE)) {
-                dwStyle &= ~WS_MAXIMIZEBOX;
-            }
-            dwExStyle = WS_EX_APPWINDOW;
-            if (mask & com_sun_glass_ui_Window_RIGHT_TO_LEFT) {
-                dwExStyle |= WS_EX_NOINHERITLAYOUT | WS_EX_LAYOUTRTL;
+            if (mask & com_sun_glass_ui_Window_MAXIMIZABLE) {
+                dwStyle |= WS_MAXIMIZEBOX;
             }
         } else {
-            if (mask & com_sun_glass_ui_Window_TITLED) {
-                dwExStyle = WS_EX_WINDOWEDGE;
-                dwStyle |= WS_CAPTION;
-
-                if (mask & com_sun_glass_ui_Window_MINIMIZABLE) {
-                    dwStyle |= WS_MINIMIZEBOX;
-                }
-                if (mask & com_sun_glass_ui_Window_MAXIMIZABLE) {
-                    dwStyle |= WS_MAXIMIZEBOX;
-                }
-            } else {
-                dwExStyle = 0;
-                dwStyle |= WS_POPUP;
-                // if undecorated or transparent and not modal, enable taskbar iconification toggling
-                if (!(mask & com_sun_glass_ui_Window_MODAL)) {
-                    dwStyle |= WS_MINIMIZEBOX;
-                }
+            dwExStyle = 0;
+            dwStyle |= WS_POPUP;
+            // if undecorated or transparent and not modal, enable taskbar iconification toggling
+            if (!(mask & com_sun_glass_ui_Window_MODAL)) {
+                dwStyle |= WS_MINIMIZEBOX;
             }
+        }
 
-            if (mask & com_sun_glass_ui_Window_TRANSPARENT) {
-                dwExStyle |= WS_EX_LAYERED;
-            }
+        if (mask & com_sun_glass_ui_Window_TRANSPARENT) {
+            dwExStyle |= WS_EX_LAYERED;
+        }
 
-            if (mask & com_sun_glass_ui_Window_POPUP) {
-                dwStyle |= WS_POPUP;
-                // Popups should not appear in the taskbar, so WS_EX_TOOLWINDOW
-                dwExStyle |= WS_EX_TOOLWINDOW;
-            }
+        if (mask & com_sun_glass_ui_Window_POPUP) {
+            dwStyle |= WS_POPUP;
+            // Popups should not appear in the taskbar, so WS_EX_TOOLWINDOW
+            dwExStyle |= WS_EX_TOOLWINDOW;
+        }
 
-            if (mask & com_sun_glass_ui_Window_UTILITY) {
-                dwExStyle |= WS_EX_TOOLWINDOW;
-            }
+        if (mask & com_sun_glass_ui_Window_UTILITY) {
+            dwExStyle |= WS_EX_TOOLWINDOW;
+        }
 
-            if (mask & com_sun_glass_ui_Window_RIGHT_TO_LEFT) {
-                dwExStyle |= WS_EX_NOINHERITLAYOUT | WS_EX_LAYOUTRTL;
-            }
+        if (mask & com_sun_glass_ui_Window_RIGHT_TO_LEFT) {
+            dwExStyle |= WS_EX_NOINHERITLAYOUT | WS_EX_LAYOUTRTL;
         }
 
         GlassWindow *pWindow =
@@ -1865,21 +1834,6 @@ JNIEXPORT jlong JNICALL Java_com_sun_glass_ui_win_WinWindow__1createWindow
                 owner);
 
         HWND hWnd = pWindow->Create(dwStyle, dwExStyle, hMonitor, owner);
-
-        if (hWnd && isCustomDecorations) {
-            // skia-fx: subclass the WindowProc with the custom-
-            // decorations handler. This installs WM_NCCALCSIZE +
-            // WM_NCHITTEST + the rest of the nfx-lib ported pipeline
-            // for this HWND. See win/custom/CustomWinProc.cpp.
-            SkiaCustomWinProc::install(GetEnv(), hWnd, jThis);
-
-            // Apply Win11 rounded corners (DWMWA_WINDOW_CORNER_PREFERENCE
-            // = 33, DWMWCP_ROUND = 2). No-op on Windows versions that
-            // don't recognise the attribute.
-            DWORD pref = 2 /* DWMWCP_ROUND */;
-            ::DwmSetWindowAttribute(hWnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */,
-                                    &pref, sizeof(pref));
-        }
 
         if (!hWnd) {
             delete pWindow;
@@ -2154,115 +2108,6 @@ JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinWindow__1setDarkFrame
     LEAVE_MAIN_THREAD_WITH_hWnd;
 
     ARG(dark) = dark;
-    PERFORM();
-}
-
-// ---- skia-fx DWM accent setters for StageStyle.CUSTOM windows ---------
-//
-// argb=-1 (0xFFFFFFFF) is treated as "reset to default" — matches
-// DWMWA_COLOR_DEFAULT in dwmapi.h. For colours we use COLORREF
-// (0x00BBGGRR) — DWM takes the bottom 24 bits as a Windows colour ref.
-
-namespace {
-    // DWMWA_* attribute integer values (matches dwmapi.h Win10+).
-    // The Win10 SDK is in scope at build time so we can use the
-    // symbolic constants directly; the integer values are inlined
-    // here for reference. DWMWA_COLOR_DEFAULT = 0xFFFFFFFF means
-    // "reset to platform default" for the colour attributes.
-
-    // Convert a packed ARGB int from Java to a COLORREF (0x00BBGGRR).
-    // Java passes -1 to mean "default" — we pass that through as
-    // DWMWA_COLOR_DEFAULT (= 0xFFFFFFFF).
-    DWORD argbToDwmColor(jint argb) {
-        if (argb == -1) return 0xFFFFFFFF; // DWMWA_COLOR_DEFAULT
-        BYTE r = (BYTE) ((argb >> 16) & 0xFF);
-        BYTE g = (BYTE) ((argb >> 8)  & 0xFF);
-        BYTE b = (BYTE) ( argb        & 0xFF);
-        return RGB(r, g, b);
-    }
-}
-
-/*
- * Class:     com_sun_glass_ui_win_WinWindow
- * Method:    _setDwmCaptionColor
- * Signature: (JI)V
- */
-JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinWindow__1setDwmCaptionColor
-    (JNIEnv *env, jobject jThis, jlong ptr, jint argb)
-{
-    ENTER_MAIN_THREAD()
-    {
-        DWORD c = color;
-        ::DwmSetWindowAttribute(hWnd, DWMWA_CAPTION_COLOR, &c, sizeof(c));
-    }
-    DWORD color;
-    LEAVE_MAIN_THREAD_WITH_hWnd;
-
-    ARG(color) = argbToDwmColor(argb);
-    PERFORM();
-}
-
-/*
- * Class:     com_sun_glass_ui_win_WinWindow
- * Method:    _setDwmTextColor
- * Signature: (JI)V
- */
-JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinWindow__1setDwmTextColor
-    (JNIEnv *env, jobject jThis, jlong ptr, jint argb)
-{
-    ENTER_MAIN_THREAD()
-    {
-        DWORD c = color;
-        ::DwmSetWindowAttribute(hWnd, DWMWA_TEXT_COLOR, &c, sizeof(c));
-    }
-    DWORD color;
-    LEAVE_MAIN_THREAD_WITH_hWnd;
-
-    ARG(color) = argbToDwmColor(argb);
-    PERFORM();
-}
-
-/*
- * Class:     com_sun_glass_ui_win_WinWindow
- * Method:    _setDwmBorderColor
- * Signature: (JI)V
- */
-JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinWindow__1setDwmBorderColor
-    (JNIEnv *env, jobject jThis, jlong ptr, jint argb)
-{
-    ENTER_MAIN_THREAD()
-    {
-        DWORD c = color;
-        ::DwmSetWindowAttribute(hWnd, DWMWA_BORDER_COLOR, &c, sizeof(c));
-    }
-    DWORD color;
-    LEAVE_MAIN_THREAD_WITH_hWnd;
-
-    ARG(color) = argbToDwmColor(argb);
-    PERFORM();
-}
-
-/*
- * Class:     com_sun_glass_ui_win_WinWindow
- * Method:    _setDwmCornerPreference
- * Signature: (JI)V
- *
- * pref: 0 = DEFAULT, 1 = DONOTROUND, 2 = ROUND, 3 = ROUNDSMALL
- *       (matches DWM_WINDOW_CORNER_PREFERENCE values).
- */
-JNIEXPORT void JNICALL Java_com_sun_glass_ui_win_WinWindow__1setDwmCornerPreference
-    (JNIEnv *env, jobject jThis, jlong ptr, jint pref)
-{
-    ENTER_MAIN_THREAD()
-    {
-        DWORD p = (DWORD) preference;
-        ::DwmSetWindowAttribute(hWnd, DWMWA_WINDOW_CORNER_PREFERENCE,
-                                &p, sizeof(p));
-    }
-    jint preference;
-    LEAVE_MAIN_THREAD_WITH_hWnd;
-
-    ARG(preference) = pref;
     PERFORM();
 }
 

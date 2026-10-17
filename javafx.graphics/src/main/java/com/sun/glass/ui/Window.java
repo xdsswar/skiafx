@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2010, 2025, Oracle and/or its affiliates. All rights reserved.
+ * Copyright (c) 2010, 2026, Oracle and/or its affiliates. All rights reserved.
  * DO NOT ALTER OR REMOVE COPYRIGHT NOTICES OR THIS FILE HEADER.
  *
  * This code is free software; you can redistribute it and/or modify it
@@ -30,7 +30,9 @@ import javafx.beans.property.BooleanProperty;
 import javafx.beans.property.DoubleProperty;
 import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.ReadOnlyBooleanProperty;
+import javafx.beans.property.ReadOnlyBooleanWrapper;
 import javafx.beans.property.ReadOnlyDoubleProperty;
+import javafx.beans.property.ReadOnlyDoubleWrapper;
 import javafx.beans.property.ReadOnlyObjectProperty;
 import javafx.beans.property.SimpleBooleanProperty;
 import javafx.beans.property.SimpleDoubleProperty;
@@ -178,97 +180,6 @@ public abstract class Window {
      */
     @Native public static final int DARK_FRAME = 1 << 11;
 
-    /**
-     * skia-fx: indicates that the window uses custom decorations — the
-     * application draws its own title bar / window controls in the scene
-     * graph and the native side routes WM_NCHITTEST / WM_NCCALCSIZE to
-     * the per-window {@code CustomDecorations} hit-region snapshot.
-     * See {@link javafx.stage.StageStyle#CUSTOM}.
-     */
-    @Native public static final int CUSTOM_DECORATIONS = 1 << 12;
-
-    /**
-     * skia-fx: hit-test code constants returned from
-     * {@link HitTestProvider#hitTest(int, int, boolean)} to the native
-     * non-client message handler. Values mirror the Win32 HT* constants
-     * (without the WM_NCHITTEST prefix); platforms that don't use HT
-     * codes map them internally.
-     */
-    public static final int HT_CLIENT     = 1;
-    public static final int HT_CAPTION    = 2;
-    public static final int HT_SYS_MENU   = 3;
-    public static final int HT_MIN_BUTTON = 8;
-    public static final int HT_MAX_BUTTON = 9;
-    public static final int HT_CLOSE      = 20;
-    public static final int HT_FSCREEN    = 21;
-    public static final int HT_TOP        = 12;
-
-    /**
-     * skia-fx: callback interface installed on a custom-decorated
-     * {@code Window} so the native non-client hit-test handler can
-     * resolve scene-coordinate hits into Win32 HT* codes.
-     * <p>
-     * Implementations must be thread-safe — they're called from the
-     * platform message thread, while the underlying region snapshot is
-     * mutated on the FX thread. See {@code CustomDecorations} for the
-     * standard implementation.
-     */
-    @FunctionalInterface
-    public interface HitTestProvider {
-        /**
-         * @param x scene-coordinate X (DIP)
-         * @param y scene-coordinate Y (DIP)
-         * @param onResizeBorder true if the native side detected the
-         *                       cursor is inside an implicit resize
-         *                       border (top edge by default); the
-         *                       provider should usually return
-         *                       {@link Window#HT_TOP} or {@link Window#HT_CAPTION}
-         *                       depending on whether the spot lies on
-         *                       a draggable caption region
-         * @return an HT_* code from {@link Window}
-         */
-        int hitTest(int x, int y, boolean onResizeBorder);
-
-        /**
-         * Called by the native side when the cursor has been verified
-         * to have left the window AND the OS modal sizing/moving loop
-         * is not active. Implementations should clear any hover state
-         * they keep so {@code :ht-*} pseudo-classes don't stick on a
-         * region the cursor is no longer over. Default: no-op.
-         */
-        default void clear() {}
-    }
-
-    private HitTestProvider hitTestProvider;
-
-    /**
-     * skia-fx: installs the per-window hit-test provider used by the
-     * native non-client message handler when this window has the
-     * {@link #CUSTOM_DECORATIONS} style bit.
-     */
-    public final void setHitTestProvider(HitTestProvider provider) {
-        this.hitTestProvider = provider;
-    }
-
-    /** skia-fx: returns the currently-installed hit-test provider, or {@code null}. */
-    public final HitTestProvider getHitTestProvider() {
-        return hitTestProvider;
-    }
-
-    // ---- skia-fx DWM accent setters --------------------------------------
-    // Default no-ops on platforms that don't have a DWM-equivalent. Windows
-    // overrides these in {@code com.sun.glass.ui.win.WinWindow}. {@code argb}
-    // of -1 means "reset to platform default".
-
-    /** Set the platform-painted title-bar accent colour. */
-    public void setDwmCaptionColor(int argb) {}
-    /** Set the platform-painted caption-text accent colour. */
-    public void setDwmTextColor(int argb) {}
-    /** Set the platform-painted window-border accent colour. */
-    public void setDwmBorderColor(int argb) {}
-    /** Set the window's corner-preference (0=default, 1=square, 2=round, 3=round-small). */
-    public void setDwmCornerPreference(int pref) {}
-
     final static public class State {
         @Native public static final int NORMAL = 1;
         @Native public static final int MINIMIZED = 2;
@@ -400,11 +311,16 @@ public abstract class Window {
      * Implementations should choose a sensible default height for their header button visualization if
      * {@link HeaderBar#USE_DEFAULT_SIZE} is specified.
      */
-    private final DoubleProperty prefHeaderButtonHeight =
-        new SimpleDoubleProperty(this, "prefHeaderButtonHeight", HeaderBar.USE_DEFAULT_SIZE);
+    private ReadOnlyDoubleWrapper headerButtonHeight;
 
-    public final ReadOnlyDoubleProperty prefHeaderButtonHeightProperty() {
-        return prefHeaderButtonHeight;
+    private ReadOnlyDoubleWrapper headerButtonHeightPropertyImpl() {
+        return headerButtonHeight == null
+            ? headerButtonHeight = new ReadOnlyDoubleWrapper(this, "headerButtonHeight", HeaderBar.USE_DEFAULT_SIZE)
+            : headerButtonHeight;
+    }
+
+    public final ReadOnlyDoubleProperty headerButtonHeightProperty() {
+        return headerButtonHeightPropertyImpl().getReadOnlyProperty();
     }
 
     /**
@@ -413,8 +329,34 @@ public abstract class Window {
      * Note: Sub-classes must not use this method to change the preferred header button height.
      *       It is only invoked by the toolkit's {@link com.sun.javafx.tk.TKStage} implementation.
      */
-    public final void setPrefHeaderButtonHeight(double height) {
-        prefHeaderButtonHeight.set(height);
+    public final void setHeaderButtonHeight(double height) {
+        headerButtonHeightPropertyImpl().set(height);
+    }
+
+    /**
+     * Specifies whether header buttons are displayed in a style appropriate for dark mode.
+     * Sub-classes can use this value in their header button visualization, but they are not required to do so.
+     */
+    private ReadOnlyBooleanWrapper headerButtonDarkStyle;
+
+    private ReadOnlyBooleanWrapper headerButtonDarkStylePropertyImpl() {
+        return headerButtonDarkStyle == null
+            ? headerButtonDarkStyle = new ReadOnlyBooleanWrapper(this, "headerButtonDarkStyle")
+            : headerButtonDarkStyle;
+    }
+
+    public final ReadOnlyBooleanProperty headerButtonDarkStyleProperty() {
+        return headerButtonDarkStylePropertyImpl().getReadOnlyProperty();
+    }
+
+    /**
+     * Sets the dark-style preference for header buttons.
+     * <p>
+     * Note: Sub-classes must not use this method to change the dark-style preference.
+     *       It is only invoked by the toolkit's {@link com.sun.javafx.tk.TKStage} implementation.
+     */
+    public final void setHeaderButtonDarkStyle(boolean darkStyle) {
+        headerButtonDarkStylePropertyImpl().set(darkStyle);
     }
 
     /**
@@ -1275,47 +1217,6 @@ public abstract class Window {
     // *****************************************************
     protected void notifyClose() {
         handleWindowEvent(System.nanoTime(), WindowEvent.CLOSE);
-    }
-
-    /**
-     * skia-fx: invoked from the native non-client message handler on
-     * every WM_NCHITTEST (or platform equivalent) for a window with
-     * the {@link #CUSTOM_DECORATIONS} style bit. Delegates to the
-     * installed {@link HitTestProvider}; returns {@link #HT_CLIENT}
-     * (fall through to normal client behaviour) when no provider is
-     * installed, the provider returns 0, or the provider throws.
-     *
-     * <p>Called from the platform message thread. The provider must
-     * be thread-safe; the standard implementation reads an immutable
-     * volatile snapshot built on the FX thread.</p>
-     */
-    protected int notifyHitTest(int x, int y, boolean onResizeBorder) {
-        HitTestProvider p = hitTestProvider;
-        if (p == null) return HT_CLIENT;
-        try {
-            int code = p.hitTest(x, y, onResizeBorder);
-            return code == 0 ? HT_CLIENT : code;
-        } catch (Throwable t) {
-            t.printStackTrace(System.err);
-            return HT_CLIENT;
-        }
-    }
-
-    /**
-     * skia-fx: invoked from the native non-client message handler
-     * when the cursor has been verified to have left the window
-     * (WM_NCMOUSELEAVE with WindowFromPoint check) AND no modal
-     * sizing/moving loop is active. Asks the installed
-     * {@link HitTestProvider} to drop any sticky hover state.
-     */
-    protected void notifyHitRegionsCleared() {
-        HitTestProvider p = hitTestProvider;
-        if (p == null) return;
-        try {
-            p.clear();
-        } catch (Throwable t) {
-            t.printStackTrace(System.err);
-        }
     }
 
     protected void notifyDestroy() {

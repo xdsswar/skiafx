@@ -136,7 +136,15 @@ final class PresentingPainter extends ViewPainter {
                 ? 0L
                 : 1_000_000_000L / PRESENT_MAX_HZ_OVERRIDE;
         }
-        // 2) Per-window monitor refresh via native query.
+        // 2) The presentable already blocks once per vblank (VSync on, GPU
+        //    swap-chain tier): no wall-clock cap. Capping on top of a
+        //    vblank-paced present drops ~every other frame (the integer Hz
+        //    the OS reports, e.g. 59 for 59.94, makes the gap slightly longer
+        //    than a real refresh) — the main source of on-screen judder.
+        if (presentable instanceof SkiaPresentable sp && sp.pacesToDisplay()) {
+            return 0L;
+        }
+        // 3) Per-window monitor refresh via native query.
         int hz = 0;
         try {
             long hwnd = sceneState.getNativeWindow();
@@ -167,7 +175,7 @@ final class PresentingPainter extends ViewPainter {
             }
             return 1_000_000_000L / hz;
         }
-        // 3) Native query said "unknown" — pick a reasonable default
+        // 4) Native query said "unknown" — pick a reasonable default
         //    that won't over-queue on the common 60/100/120/144 panels.
         return 1_000_000_000L / PRESENT_MAX_HZ_FALLBACK;
     }
