@@ -39,6 +39,7 @@ import com.sun.javafx.geom.transform.BaseTransform;
 import com.sun.javafx.scene.text.GlyphList;
 import com.sun.javafx.text.TextRun;
 import com.sun.prism.Graphics;
+import com.sun.prism.skia.SkiaGraphics;
 import com.sun.prism.paint.Color;
 
 public class NGText extends NGShape {
@@ -341,11 +342,15 @@ public class NGText extends NGShape {
                     float offset = y + metrics.getUnderLineOffset();
                     float thickness = metrics.getUnderLineThickness();
                     if ((op & SHAPE_FILL) != 0) {
-                        if (thickness <= 1f && g.getTransformNoClone().isTranslateOrIdentity()) {
-                            float myt = (float)g.getTransformNoClone().getMyt();
-                            offset = Math.round(offset + myt) - myt;
+                        if (g instanceof SkiaGraphics) {
+                            fillDecorationSnapped(g, x, offset, run.getWidth(), thickness);
+                        } else {
+                            if (thickness <= 1f && g.getTransformNoClone().isTranslateOrIdentity()) {
+                                float myt = (float)g.getTransformNoClone().getMyt();
+                                offset = Math.round(offset + myt) - myt;
+                            }
+                            g.fillRect(x, offset, run.getWidth(), thickness);
                         }
-                        g.fillRect(x, offset, run.getWidth(), thickness);
                     } else {
                         g.drawRect(x, offset, run.getWidth(), thickness);
                     }
@@ -354,16 +359,41 @@ public class NGText extends NGShape {
                     float offset = y + metrics.getStrikethroughOffset();
                     float thickness = metrics.getStrikethroughThickness();
                     if ((op & SHAPE_FILL) != 0) {
-                        if (thickness <= 1f && g.getTransformNoClone().isTranslateOrIdentity()) {
-                            float myt = (float)g.getTransformNoClone().getMyt();
-                            offset = Math.round(offset + myt)  - myt;
+                        if (g instanceof SkiaGraphics) {
+                            fillDecorationSnapped(g, x, offset, run.getWidth(), thickness);
+                        } else {
+                            if (thickness <= 1f && g.getTransformNoClone().isTranslateOrIdentity()) {
+                                float myt = (float)g.getTransformNoClone().getMyt();
+                                offset = Math.round(offset + myt) - myt;
+                            }
+                            g.fillRect(x, offset, run.getWidth(), thickness);
                         }
-                        g.fillRect(x, offset, run.getWidth(), thickness);
                     } else {
                         g.drawRect(x, offset, run.getWidth(), thickness);
                     }
                 }
             }
         }
+    }
+
+    /**
+     * skia-fx: underline / strikethrough snapped to whole DEVICE pixels.
+     * The Skia pipeline keeps the HiDPI scale out of the Graphics transform,
+     * so the stock logical-pixel rounding left decorations straddling two
+     * device rows (2px soft lines) at 125/150/175%. Snap edge and thickness
+     * in device space, as Chromium does; unchanged for rotated/scaled text.
+     */
+    private static void fillDecorationSnapped(Graphics g, float x, float offset,
+                                              float width, float thickness) {
+        BaseTransform tx = g.getTransformNoClone();
+        if (tx.isTranslateOrIdentity()) {
+            float ps = g.getPixelScaleFactorY();
+            float myt = (float) tx.getMyt();
+            float devTop = Math.round((offset + myt) * ps);
+            float devThick = Math.max(1f, Math.round(thickness * ps));
+            offset = devTop / ps - myt;
+            thickness = devThick / ps;
+        }
+        g.fillRect(x, offset, width, thickness);
     }
 }

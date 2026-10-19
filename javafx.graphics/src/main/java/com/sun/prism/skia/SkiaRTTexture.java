@@ -17,6 +17,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.Buffer;
+import java.nio.ByteBuffer;
 import java.nio.IntBuffer;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.LongAdder;
@@ -206,7 +207,11 @@ public class SkiaRTTexture extends SkiaTextureBase implements RTTexture {
 
     @Override public boolean isOpaque()             { return opaque; }
     @Override public void setOpaque(boolean opaque) { this.opaque = opaque; }
-    @Override public boolean isMSAA()               { return msaa; }
+    // The requested `msaa` flag is recorded but no multisampled surface is ever
+    // allocated (allocSurface / surfaceCreateGpu take no sample count; Skia AAs
+    // per-draw). Reporting the request would make UploadingPainter add a resolve
+    // RT + blit every frame for nothing, so report what was actually allocated.
+    @Override public boolean isMSAA()               { return false; }
     @Override public boolean isVolatile()           { return false; }
 
     // ---- RTTexture --------------------------------------------------------
@@ -329,50 +334,72 @@ public class SkiaRTTexture extends SkiaTextureBase implements RTTexture {
 
     @Override
     public boolean readPixels(Buffer pixels, int x, int y, int width, int height) {
-        if (!(pixels instanceof IntBuffer ib)) {
+        // IntBuffer (INT_ARGB_PRE) and ByteBuffer (BYTE_BGRA_PRE, e.g. RTImage)
+        // receive the same little-endian BGRA bytes — upstream D3DRTTexture
+        // accepts both. Anything else is unsupported → false (never throw on
+        // the readback path).
+        if (!(pixels instanceof IntBuffer) && !(pixels instanceof ByteBuffer)) {
             return false;
         }
-        if (READ_CALLERS.size() < READ_CALLERS_CAP) {
+        if (width <= 0 || height <= 0) {
+            return false;
+        }
+        long h = getNativeHandle();
+        if (h == 0L) {
+            return false; // disposed / surface lost: upstream returns false too
+        }
+        if (VERBOSE && READ_CALLERS.size() < READ_CALLERS_CAP) {
             // One-line caller signature (skip Throwable.fillInStackTrace
-            // + this method itself). Set is cheap on the hot path once
-            // it's full because we only check size().
+            // + this method itself). Only walked under -Dskia.verbose; the
+            // set caps the catalog so it never floods the console.
             StackTraceElement[] st = Thread.currentThread().getStackTrace();
             String key = (st.length >= 4)
                 ? st[2].toString() + " <- " + st[3].toString()
                        + (st.length >= 5 ? " <- " + st[4] : "")
                 : "<unknown>";
-            if (READ_CALLERS.add(key) && VERBOSE) {
+            if (READ_CALLERS.add(key)) {
                 System.err.println("[skia.readback] " + key
                     + "  region=" + width + "x" + height);
             }
         }
         tickFps();
-        // Direct IntBuffer: Skia writes BGRA bytes (= INT_ARGB_PRE)
-        // straight into the buffer's native memory in one Skia-side
-        // memcpy. We honor the buffer's current position via
-        // MemorySegment.ofBuffer.
-        if (ib.isDirect()) {
-            MemorySegment seg = MemorySegment.ofBuffer(ib);
+        MemorySegment surface = MemorySegment.ofAddress(h);
+        long n = (long) width * height;
+        long needBytes = n * 4;
+        // Direct buffer: Skia writes BGRA bytes (= INT_ARGB_PRE) straight
+        // into the buffer's native memory in one Skia-side memcpy. We honor
+        // the buffer's current position via MemorySegment.ofBuffer. The
+        // native side writes w*h*4 bytes unconditionally, so a short buffer
+        // would be a native heap overrun (= JVM crash) — refuse it instead.
+        if (pixels.isDirect()) {
+            MemorySegment seg = MemorySegment.ofBuffer(pixels);
+            if (seg.byteSize() < needBytes) {
+                return false;
+            }
             int rc = NativeBridge.surfaceReadPixelsArgb(
-                handleSegment(), seg, x, y, width, height);
+                surface, seg, x, y, width, height);
             if (rc == 0) {
                 Copies.add(Category.SNAPSHOT_READBACK, 1);
             }
             return rc == 0;
         }
-        // Heap-array IntBuffer. Use a pooled native scratch buffer
+        // Heap-array buffer. Use a pooled native scratch buffer
         // (allocated once, grown monotonically) so we don't pay an
         // Arena allocation each pulse.
-        long n = (long) width * height;
-        MemorySegment dst = ensureReadBuffer(n * 4);
+        MemorySegment target = MemorySegment.ofBuffer(pixels);
+        if (target.isReadOnly() || target.byteSize() < needBytes) {
+            return false; // as the direct path: never report a truncated read
+        }
+        MemorySegment dst = ensureReadBuffer(needBytes);
         int rc = NativeBridge.surfaceReadPixelsArgb(
-            handleSegment(), dst, x, y, width, height);
+            surface, dst, x, y, width, height);
         if (rc != 0) return false;
         Copies.add(Category.SNAPSHOT_READBACK, 1);
-        int[] arr = ib.array();
-        int off = ib.arrayOffset() + ib.position();
-        MemorySegment.copy(dst, ValueLayout.JAVA_INT, 0L,
-                           arr, off, (int) Math.min(n, arr.length - off));
+        // MemorySegment.ofBuffer covers array-backed buffers AND heap views
+        // (e.g. ByteBuffer.asIntBuffer()) from position..limit. A raw byte copy
+        // of native-order BGRA into int[]/byte[] storage equals the old
+        // JAVA_INT copy (size checked above).
+        MemorySegment.copy(dst, 0L, target, 0L, needBytes);
         Copies.add(Category.MEMORY_SEGMENT_COPY, 1);
         return true;
     }
@@ -494,14 +521,34 @@ public class SkiaRTTexture extends SkiaTextureBase implements RTTexture {
 
     boolean is3DPassBegun() { return pass3dBegun; }
 
-    /** End the bgfx pass and wrap its color as a zero-copy SkImage handle (0 on failure). */
-    long composite3DEnd() {
+    /**
+     * Zero-copy SkImage over the bgfx color of the last finished 3D pass (0 if
+     * none). Owned here and kept until the next pass ends or the target is
+     * rebuilt: NGSubScene re-renders its scene graph only when dirty, and on
+     * the clean pulses in between (and for snapshots) it composites this RTT
+     * again — the 3D result must still be there, not just the Skia surface.
+     */
+    private long last3DImage;
+
+    long last3DImage() { return last3DImage; }
+
+    /** End the bgfx pass and re-wrap its color as {@link #last3DImage()}. */
+    void composite3DEnd() {
         if (native3dTarget == 0L || !pass3dBegun) {
-            return 0L;
+            return;
         }
         NativeBridge3D.targetEnd(native3dTarget);
         pass3dBegun = false;
-        return NativeBridge3D.targetWrapImage(native3dTarget);
+        replaceLast3DImage(NativeBridge3D.targetWrapImage(native3dTarget));
+    }
+
+    private void replaceLast3DImage(long img) {
+        long old = last3DImage;
+        last3DImage = img;
+        if (old != 0L) {
+            // Drops only our ref; draws already recorded keep theirs.
+            NativeBridge.imageDestroy(MemorySegment.ofAddress(old));
+        }
     }
 
     /**
@@ -510,6 +557,7 @@ public class SkiaRTTexture extends SkiaTextureBase implements RTTexture {
      * handle so {@link #ensureNative3DTarget()} rebuilds it on the next render.
      */
     private void closeNative3DTarget() {
+        replaceLast3DImage(0L); // it borrows the target's texture
         if (slot3d != null) {
             slot3d.close();
             slot3d = null;

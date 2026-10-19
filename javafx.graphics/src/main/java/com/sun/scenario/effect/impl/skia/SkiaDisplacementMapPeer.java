@@ -9,6 +9,7 @@ import java.lang.foreign.ValueLayout;
 
 import com.sun.javafx.geom.Rectangle;
 import com.sun.javafx.geom.transform.BaseTransform;
+import com.sun.prism.Graphics;
 import com.sun.prism.skia.impl.NativeBridge;
 import com.sun.scenario.effect.DisplacementMap;
 import com.sun.scenario.effect.Effect;
@@ -23,46 +24,40 @@ import com.sun.scenario.effect.impl.state.RenderState;
 /**
  * Skia peer for the {@code "DisplacementMap"} dispatch name.
  *
- * <p>Skia's {@code SkImageFilters::DisplacementMap} takes a
- * <em>filter</em> as its displacement source. We convert JFX's
- * {@link FloatMap} to an RGBA {@code SkImage} (red = X-offset,
- * green = Y-offset, with the conventional {@code color - 0.5} signed
- * encoding) and wrap it via {@code SkImageFilters::Image}, then
- * chain through {@code DisplacementMap} with the source image as the
- * "input" filter (null → defaults to the canvas content under the
- * saveLayer).</p>
- *
- * <h2>Encoding</h2>
- *
- * <p>JFX uses {@code sample ∈ [-1, 1]} where ±1 means
- * {@code ± scaleX/Y} pixel offset. Skia uses
- * {@code pixel_offset = scale * (channel - 0.5)} with
- * {@code channel ∈ [0, 1]}. So we encode
- * {@code channel = 0.5 + sample / 2}, and pass
- * {@code skia_scale = scaleX_jfx * 2} (and Y).</p>
+ * <p>Reproduces upstream {@code DisplacementMap.jsl} with an
+ * {@code SkRuntimeEffect} image filter ({@code openjfx_skia_effects_ext.cpp}):
+ * for each output pixel at unit position {@code pos} over the source content,
+ * {@code loc = pos + scale * (map(pos) + offset)} (in source-size units),
+ * optionally wrapped, then the source is sampled at {@code loc}. The
+ * {@link FloatMap} is uploaded once as a raw signed half-float RGBA image (no 8-bit
+ * quantization) and stretched over the source bounds; anisotropic scale,
+ * offset and wrap are all honoured.</p>
  *
  * <h2>Caching</h2>
  *
- * <p>One cached entry per peer: {@code (FloatMap-identity, content-digest)}.
- * When the same FloatMap is passed unchanged, we reuse the SkImage +
- * SkImageFilter handles. When the digest changes (the map was mutated)
- * we re-upload. Both native handles are released on miss / dispose.</p>
+ * <p>The uploaded map image is cached per {@code (FloatMap identity,
+ * FloatMap.getModCount())}; the filter is cached per (map image, source
+ * size, offset, scale, wrap). Both native handles are released on miss and on
+ * {@link #dispose()}.</p>
  *
- * <p>The {@code offsetX} / {@code offsetY} knobs on JFX's
- * DisplacementMap are not directly expressible through Skia's
- * DisplacementMap primitive; they're applied via an outer
- * {@code MatrixTransform} composition when non-zero.</p>
+ * <p>The effect uses {@code UnclippedUserSpaceRenderState}: any output pixel
+ * may sample any source pixel, so the output covers the full source bounds
+ * (not just the output clip).</p>
  */
 public final class SkiaDisplacementMapPeer extends EffectPeer<RenderState> {
 
-    // Cached upload for the most-recently-seen FloatMap. Held as a
-    // strong ref to the map identity so we can do == checks on the
-    // hot path; cleared whenever the digest mismatches or dispose()
-    // runs.
-    private FloatMap cachedMap;
-    private long     cachedDigest;
+    private static final int PARAM_COUNT = 9;
+
+    // Cached map upload.
+    private FloatMap      cachedMap;
+    private long          cachedModCount;
     private MemorySegment cachedImage;
-    private MemorySegment cachedImageFilter;
+
+    // Cached filter (built over cachedImage).
+    private MemorySegment cachedFilter;
+    private int     fSrcW, fSrcH;
+    private float   fOffX, fOffY, fScaleX, fScaleY;
+    private boolean fWrap;
 
     public SkiaDisplacementMapPeer(FilterContext fctx, Renderer r, String name) {
         super(fctx, r, name);
@@ -88,158 +83,136 @@ public final class SkiaDisplacementMapPeer extends EffectPeer<RenderState> {
             return srcData;
         }
         FloatMap map = dm.getMapData();
-        if (map == null) {
+        if (map == null || !SkiaEffectsNative.isDisplacementAvailable()) {
             srcData.addref();
             return srcData;
         }
 
         Rectangle srcBounds = srcData.getTransformedBounds(null);
-        Rectangle dstBounds = new Rectangle(srcBounds);
-        dstBounds.intersectWith(outputClip);
-        if (dstBounds.width <= 0 || dstBounds.height <= 0) {
-            return new ImageData(fctx, null, srcBounds);
+        if (srcBounds.width <= 0 || srcBounds.height <= 0) {
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), srcBounds);
+        }
+        if (outputClip != null) {
+            Rectangle visible = new Rectangle(srcBounds);
+            visible.intersectWith(outputClip);
+            if (visible.width <= 0 || visible.height <= 0) {
+                // Empty result: a real cleared drawable, like upstream (never image-less).
+                return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), visible);
+            }
+        }
+        // Full source bounds: displaced lookups may reach outside the clip.
+        final Rectangle dstBounds = new Rectangle(srcBounds);
+
+        if (!srcData.validate(fctx)) {
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
-        SkiaPrDrawable dst = (SkiaPrDrawable)
-            getRenderer().getCompatibleImage(dstBounds.width, dstBounds.height);
-        if (dst == null || !srcData.validate(fctx)) {
-            return new ImageData(fctx, dst, dstBounds);
-        }
-
-        // (Re-)build the displacement filter chain.
-        MemorySegment displaceFilter = ensureDisplacementFilter(dm, map);
+        // Build (or reuse) the filter BEFORE checking out the destination so a
+        // native failure falls back to passthrough without leaking a pooled
+        // drawable.
+        MemorySegment displaceFilter = ensureDisplacementFilter(dm, map,
+            dstBounds.width, dstBounds.height);
         if (displaceFilter == null) {
-            // Native upload failed — fall back to passthrough.
             srcData.addref();
             return srcData;
         }
 
-        // displaceFilter is built fresh per call (it composes the cached
-        // displacement image-filter with the per-call scale); the outer finally
-        // releases it on every exit path — including the early returns below —
-        // so it never leaks a native SkImageFilter every frame.
-        try {
-            com.sun.prism.Graphics gdst = dst.createGraphics();
-            if (gdst == null) {
-                return new ImageData(fctx, dst, dstBounds);
-            }
-            MemorySegment dstSeg = MemorySegment.ofAddress(dst.getSurfaceHandle());
-            if (dstSeg.equals(MemorySegment.NULL)) {
-                return new ImageData(fctx, dst, dstBounds);
-            }
-            NativeBridge.surfaceSaveLayerWithFilter(dstSeg, displaceFilter);
-            try {
-                PrEffectHelper.renderImageData(gdst, srcData, dstBounds);
-            } finally {
-                NativeBridge.surfaceRestore(dstSeg);
-            }
-            return new ImageData(fctx, dst, dstBounds);
-        } finally {
-            NativeBridge.filterDestroy(displaceFilter);
+        SkiaPrDrawable dst = (SkiaPrDrawable)
+            getRenderer().getCompatibleImage(dstBounds.width, dstBounds.height);
+        if (dst == null) {
+            return new ImageData(fctx, null, dstBounds);
         }
+
+        Graphics gdst = dst.createGraphics();
+        if (gdst == null) {
+            return new ImageData(fctx, dst, dstBounds);
+        }
+        MemorySegment dstSeg = MemorySegment.ofAddress(dst.getSurfaceHandle());
+        if (dstSeg.equals(MemorySegment.NULL)) {
+            return new ImageData(fctx, dst, dstBounds);
+        }
+        NativeBridge.surfaceSaveLayerWithFilter(dstSeg, displaceFilter);
+        try {
+            PrEffectHelper.renderImageData(gdst, srcData, dstBounds);
+        } finally {
+            NativeBridge.surfaceRestore(dstSeg);
+        }
+        return new ImageData(fctx, dst, dstBounds);
     }
 
     /**
-     * Returns the cached DisplacementMap filter for {@code dm} /
-     * {@code map}, re-uploading the FloatMap to an SkImage if the
-     * map identity or content changed since the last call.
+     * Returns the cached displacement filter, re-uploading the map when its
+     * identity / modification count changed and rebuilding the filter when
+     * any parameter changed. Null on native failure (caller passes through).
      */
-    private MemorySegment ensureDisplacementFilter(DisplacementMap dm, FloatMap map) {
-        long digest = digest(map);
-        if (map != cachedMap || digest != cachedDigest || cachedImageFilter == null) {
+    private MemorySegment ensureDisplacementFilter(DisplacementMap dm, FloatMap map,
+                                                   int srcW, int srcH) {
+        long mod = map.getModCount();
+        if (map != cachedMap || mod != cachedModCount || cachedImage == null) {
             releaseCached();
-            MemorySegment image = uploadFloatMap(map);
-            if (image == null || image.equals(MemorySegment.NULL)) return null;
-            MemorySegment imageFilter = NativeBridge.filterImage(image);
-            if (imageFilter == null || imageFilter.equals(MemorySegment.NULL)) {
-                NativeBridge.imageDestroy(image);
+            MemorySegment image = SkiaEffectsNative.floatMapImage(
+                map.getData(), map.getWidth(), map.getHeight());
+            if (image == null) {
                 return null;
             }
-            cachedMap         = map;
-            cachedDigest      = digest;
-            cachedImage       = image;
-            cachedImageFilter = imageFilter;
+            cachedMap      = map;
+            cachedModCount = mod;
+            cachedImage    = image;
         }
-        // Chain DisplacementMap(filter=imageFilter) over the layer
-        // input. Channel 0 = R, 1 = G.
-        float skiaScale = 2f * Math.max(Math.abs(dm.getScaleX()),
-                                        Math.abs(dm.getScaleY()));
-        // input filter null → Skia uses the saveLayer's source content.
-        return NativeBridge.filterDisplacementMap(
-            0, 1, skiaScale, cachedImageFilter, null);
-    }
-
-    /**
-     * Allocates a confined arena, packs the FloatMap into RGBA bytes
-     * (R = X-offset, G = Y-offset, B = 0, A = 255), calls
-     * {@code imageCreateRaster}, then releases the arena. Skia copies
-     * the pixels during {@code imageCreateRaster} so the native side
-     * holds nothing into our arena past return.
-     */
-    private static MemorySegment uploadFloatMap(FloatMap map) {
-        int w = map.getWidth();
-        int h = map.getHeight();
-        float[] src = map.getData(); // length = w * h * 4
+        float offX = dm.getOffsetX();
+        float offY = dm.getOffsetY();
+        float scX  = dm.getScaleX();
+        float scY  = dm.getScaleY();
+        boolean wrap = dm.getWrap();
+        if (cachedFilter != null && fSrcW == srcW && fSrcH == srcH
+                && fOffX == offX && fOffY == offY
+                && fScaleX == scX && fScaleY == scY && fWrap == wrap) {
+            return cachedFilter;
+        }
+        releaseFilter();
+        MemorySegment filter;
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment seg = arena.allocate((long) w * h * 4);
-            for (int y = 0; y < h; y++) {
-                for (int x = 0; x < w; x++) {
-                    int srcIdx = (x + y * w) * 4;
-                    int dstIdx = (x + y * w) * 4;
-                    float fx = src[srcIdx];
-                    float fy = src[srcIdx + 1];
-                    int rByte = encode(fx);
-                    int gByte = encode(fy);
-                    seg.set(ValueLayout.JAVA_BYTE, dstIdx,     (byte) rByte);
-                    seg.set(ValueLayout.JAVA_BYTE, dstIdx + 1, (byte) gByte);
-                    seg.set(ValueLayout.JAVA_BYTE, dstIdx + 2, (byte) 0);
-                    seg.set(ValueLayout.JAVA_BYTE, dstIdx + 3, (byte) 0xFF);
-                }
-            }
-            // colorType 0 = kRGBA_8888.
-            return NativeBridge.imageCreateRaster(w, h, w * 4, seg, 0);
+            MemorySegment p = arena.allocate(ValueLayout.JAVA_FLOAT, PARAM_COUNT);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 0, 0f);   // source rect in layer coords
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 1, 0f);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 2, srcW);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 3, srcH);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 4, offX);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 5, offY);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 6, scX);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 7, scY);
+            p.setAtIndex(ValueLayout.JAVA_FLOAT, 8, wrap ? 1f : 0f);
+            filter = SkiaEffectsNative.displacementFilter(cachedImage, p, PARAM_COUNT);
         }
+        if (filter == null) {
+            return null;
+        }
+        cachedFilter = filter;
+        fSrcW = srcW;
+        fSrcH = srcH;
+        fOffX = offX;
+        fOffY = offY;
+        fScaleX = scX;
+        fScaleY = scY;
+        fWrap = wrap;
+        return filter;
     }
 
-    /** Maps a signed [-1, 1] sample to an unsigned [0, 255] byte using
-     *  the conventional {@code byte = (sample + 1) * 127.5} formula
-     *  with saturation. */
-    private static int encode(float sample) {
-        int v = (int) ((sample + 1f) * 127.5f + 0.5f);
-        if (v < 0)   v = 0;
-        if (v > 255) v = 255;
-        return v;
-    }
-
-    /**
-     * Cheap content digest — sums float bits at sparse strides
-     * (every 256th pixel for large maps, every pixel for small).
-     * Detects whole-map mutations between frames without scanning
-     * every cell each call.
-     */
-    private static long digest(FloatMap map) {
-        float[] data = map.getData();
-        int w = map.getWidth(), h = map.getHeight();
-        long h64 = 0x100000001b3L ^ (((long) w << 32) | (long) h);
-        int stride = Math.max(1, (w * h) / 256); // ≤ 256 samples
-        for (int i = 0; i < data.length; i += stride * 4) {
-            h64 ^= Float.floatToRawIntBits(data[i]) & 0xFFFFFFFFL;
-            h64 *= 0x100000001b3L;
+    private void releaseFilter() {
+        if (cachedFilter != null) {
+            NativeBridge.filterDestroy(cachedFilter);
+            cachedFilter = null;
         }
-        return h64;
     }
 
     private void releaseCached() {
-        if (cachedImageFilter != null) {
-            NativeBridge.filterDestroy(cachedImageFilter);
-            cachedImageFilter = null;
-        }
+        releaseFilter();
         if (cachedImage != null) {
             NativeBridge.imageDestroy(cachedImage);
             cachedImage = null;
         }
         cachedMap = null;
-        cachedDigest = 0L;
+        cachedModCount = 0L;
     }
 
     @Override

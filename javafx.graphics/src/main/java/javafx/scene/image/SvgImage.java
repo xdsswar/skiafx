@@ -31,6 +31,7 @@ import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.Objects;
 import java.util.function.LongConsumer;
+import java.util.function.LongSupplier;
 
 import com.sun.javafx.util.DataURI;
 import com.sun.prism.skia.impl.NativeBridge;
@@ -175,6 +176,13 @@ public class SvgImage extends Image {
     long nativeHandle() {
         return slot == null ? 0L : slot.get();
     }
+
+    /**
+     * Stable live view of {@link #nativeHandle()} handed to the rendering peer,
+     * so a {@link #dispose()} is observed at draw time even when the view is
+     * not re-synced (a raw handle snapshot would go stale and be used after free).
+     */
+    final LongSupplier handleSource = this::nativeHandle;
 
     /**
      * Eagerly releases the native SVG document. Optional — the document is

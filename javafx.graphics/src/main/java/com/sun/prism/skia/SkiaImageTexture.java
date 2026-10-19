@@ -70,6 +70,15 @@ public final class SkiaImageTexture extends SkiaTextureBase {
         }
     }
 
+    /**
+     * Image textures hold a RASTER SkImage (pixels copied into CPU memory at
+     * creation), which every GrDirectContext uploads on demand — so they
+     * survive a GPU device replacement and only report lost once disposed.
+     */
+    @Override public boolean isSurfaceLost() {
+        return getNativeHandle() == 0L;
+    }
+
     private static void destroyNative(long handle) {
         NativeBridge.imageDestroy(MemorySegment.ofAddress(handle));
     }
@@ -98,6 +107,12 @@ public final class SkiaImageTexture extends SkiaTextureBase {
         int rowBytes = image.getScanlineStride();
         PixelFormat fmt = image.getPixelFormat();
         Buffer buf = image.getPixelBuffer();
+        // Sub-images (Image.createSubImage) share the parent's buffer and
+        // address their region via minX/minY — offset the read origin by it,
+        // in bytes from the buffer's current position (upstream
+        // BaseTexture.update(Image) passes the same minX/minY as srcx/srcy).
+        long srcOffset = (long) image.getMinY() * rowBytes
+                       + (long) image.getMinX() * fmt.getBytesPerPixelUnit();
 
         // BYTE_RGB has no direct SkColorType (Skia's kRGB_888x is 4-byte
         // stride with the 4th byte ignored). Expand on the Java side to a
@@ -105,7 +120,7 @@ public final class SkiaImageTexture extends SkiaTextureBase {
         // any opaque source image (JPEGs etc.) that the decoder hands back
         // in tight-RGB form.
         if (fmt == PixelFormat.BYTE_RGB) {
-            return uploadByteRgb(w, h, rowBytes, buf);
+            return uploadByteRgb(w, h, rowBytes, buf, srcOffset);
         }
 
         int colorType = switch (fmt) {
@@ -126,7 +141,7 @@ public final class SkiaImageTexture extends SkiaTextureBase {
         // to the native side which copies it again into Skia's internal
         // SkImage storage. The arena closes here, freeing our copy.
         try (Arena arena = Arena.ofConfined()) {
-            MemorySegment seg = toMemorySegment(arena, buf, fmt, h, rowBytes);
+            MemorySegment seg = toMemorySegment(arena, buf, fmt, h, rowBytes, srcOffset);
             MemorySegment imgHandle = NativeBridge.imageCreateRaster(
                 w, h, rowBytes, seg, colorType);
             if (imgHandle == null || imgHandle.equals(MemorySegment.NULL)) {
@@ -142,7 +157,8 @@ public final class SkiaImageTexture extends SkiaTextureBase {
      * RGBX layout and upload as kRGB_888x. The fourth byte (X) is set to
      * 0xFF so Skia callers that mis-treat it as alpha still see opaque.
      */
-    private static long uploadByteRgb(int w, int h, int srcRowBytes, Buffer buf) {
+    private static long uploadByteRgb(int w, int h, int srcRowBytes, Buffer buf,
+                                      long srcOffset) {
         if (!(buf instanceof ByteBuffer bb)) {
             throw new UnsupportedOperationException(
                 "SkiaImageTexture: BYTE_RGB upload expects a ByteBuffer, got "
@@ -155,10 +171,13 @@ public final class SkiaImageTexture extends SkiaTextureBase {
             // Take a view at the buffer's current position without
             // disturbing the caller's mark / position.
             ByteBuffer src = bb.duplicate();
+            // Rows are addressed relative to the buffer's position plus the
+            // sub-image origin, not from absolute index 0.
+            int base = bb.position() + (int) srcOffset;
             byte[] srcRow = new byte[Math.max(srcRowBytes, w * 3)];
             byte[] dstRow = new byte[dstRowBytes];
             for (int y = 0; y < h; y++) {
-                src.position(y * srcRowBytes);
+                src.position(base + y * srcRowBytes);
                 src.get(srcRow, 0, w * 3);
                 for (int x = 0; x < w; x++) {
                     int si = x * 3;
@@ -183,13 +202,14 @@ public final class SkiaImageTexture extends SkiaTextureBase {
     }
 
     private static MemorySegment toMemorySegment(Arena arena, Buffer buf,
-                                                 PixelFormat fmt, int h, int rowBytes) {
+                                                 PixelFormat fmt, int h, int rowBytes,
+                                                 long srcOffset) {
         long byteSize = (long) rowBytes * h;
         MemorySegment dst = arena.allocate(byteSize);
         if (buf instanceof ByteBuffer bb) {
-            int pos = bb.position();
+            int pos = bb.position() + (int) srcOffset;
             int lim = bb.limit();
-            int n = lim - pos;
+            int n = Math.max(0, lim - pos);
             if (bb.hasArray()) {
                 MemorySegment.copy(bb.array(), bb.arrayOffset() + pos,
                                    dst, java.lang.foreign.ValueLayout.JAVA_BYTE,
@@ -197,7 +217,7 @@ public final class SkiaImageTexture extends SkiaTextureBase {
             } else {
                 // Fallback: copy via a temporary array
                 byte[] tmp = new byte[Math.min(n, (int) byteSize)];
-                bb.duplicate().get(tmp);
+                bb.duplicate().position(pos).get(tmp);
                 MemorySegment.copy(tmp, 0, dst,
                                    java.lang.foreign.ValueLayout.JAVA_BYTE,
                                    0L, tmp.length);
@@ -205,16 +225,18 @@ public final class SkiaImageTexture extends SkiaTextureBase {
             return dst;
         }
         if (buf instanceof IntBuffer ib) {
-            int pos = ib.position();
+            // srcOffset is in bytes; an IntBuffer is indexed in 4-byte units
+            // (scanline stride and minX*4 are both int-aligned).
+            int pos = ib.position() + (int) (srcOffset / 4);
             int lim = ib.limit();
-            int nInts = lim - pos;
+            int nInts = Math.max(0, lim - pos);
             if (ib.hasArray()) {
                 MemorySegment.copy(ib.array(), ib.arrayOffset() + pos,
                                    dst, java.lang.foreign.ValueLayout.JAVA_INT,
                                    0L, Math.min(nInts, (int) (byteSize / 4)));
             } else {
                 int[] tmp = new int[Math.min(nInts, (int) (byteSize / 4))];
-                ib.duplicate().get(tmp);
+                ib.duplicate().position(pos).get(tmp);
                 MemorySegment.copy(tmp, 0, dst,
                                    java.lang.foreign.ValueLayout.JAVA_INT,
                                    0L, tmp.length);

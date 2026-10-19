@@ -25,11 +25,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
 
 #include <atomic>
 #include <utility>
 
 #include "include/core/SkAlphaType.h"
+#include "include/core/SkCanvas.h"
+#include "include/core/SkColor.h"
+#include "include/core/SkPaint.h"
 #include "include/core/SkColorSpace.h"
 #include "include/core/SkColorType.h"
 #include "include/core/SkData.h"
@@ -87,8 +91,19 @@ struct OpenJfxD3DSwapChain {
     HWND                          hwnd = nullptr;
     IDXGISwapChain3*              swapChain = nullptr;
     std::vector<sk_sp<SkSurface>> backBuffers;
+    // Back-buffer size. Grow-only with headroom (see openjfxD3DResize), so it
+    // can be larger than the window; DXGI_SCALING_NONE crops it to the client.
     int                           width = 0;
     int                           height = 0;
+    // Window content size the scene is rendered at (<= width/height). The
+    // margin outside it is filled with bgColor at present.
+    int                           contentWidth = 0;
+    int                           contentHeight = 0;
+    SkColor                       bgColor = SK_ColorWHITE;
+    // DXGI_SCALING_STRETCH chain (render scale != output scale, or the
+    // NONE create fell back). DWM scales the WHOLE buffer onto the client
+    // area, so these keep exact-size buffers: no headroom, no margin.
+    bool                          stretch = false;
     bool                          allowTearing = false;
 
     // ---- Frame-pacing state ------------------------------------------------
@@ -111,6 +126,7 @@ struct OpenJfxD3DSwapChain {
 
 // Shared scene-surface props (text contrast/gamma), defined in openjfx_skia_bridge.cpp.
 const SkSurfaceProps* openjfxTextSurfaceProps();
+const SkSurfaceProps* openjfxWindowTextSurfaceProps();
 
 // ---------------------------------------------------------------------------
 // Init / device + queue + factory + tearing capability detection.
@@ -303,16 +319,31 @@ SKIA_FX_API void* d3d12_queue() {
     return g().succeeded ? static_cast<void*>(g().queue) : nullptr;
 }
 
+// Bumped by openjfxD3DRecreateContext each time a lost device is replaced.
+static std::atomic<uint32_t> gDeviceGeneration{ 1 };
+
+SKIA_FX_API uint32_t d3d12_device_generation() {
+    return gDeviceGeneration.load(std::memory_order_acquire);
+}
+
 // Latches true once the D3D12 device is removed/reset (e.g. a TDR or an adapter
 // change while dragging the window across monitors of different DPI). Both Skia and
 // bgfx share this single device, so once it is gone EVERY further D3D call fails
 // (DXGI_ERROR_DEVICE_REMOVED, 0x887a0005) and hammering it spams errors and can hang
 // the driver. Callers (present, swap-chain resize, the bgfx 3D pass) check this and
 // skip all GPU work once the device is lost — degrade, never crash (errors-never-
-// kill-jvm). It stays latched until a future device-recreate path clears it.
+// kill-jvm). It stays latched until openjfx_skia_device_recover replaces the device.
 static std::atomic<bool> gDeviceLost{ false };
 
 void d3d12_mark_device_lost() { gDeviceLost.store(true, std::memory_order_relaxed); }
+
+// Cleared only by the recovery path, after the new device AND the new
+// GrDirectContext are installed (openjfx_skia_device_recover).
+void d3d12_clear_device_lost() { gDeviceLost.store(false, std::memory_order_release); }
+
+void d3d12_device_generation_bump() {
+    gDeviceGeneration.fetch_add(1, std::memory_order_acq_rel);
+}
 
 SKIA_FX_API bool d3d12_device_lost() {
     if (gDeviceLost.load(std::memory_order_relaxed)) return true;
@@ -420,6 +451,41 @@ SKIA_FX_API int32_t debug_dump_rt(void* resource, int32_t w, int32_t h, const ch
 
 } // namespace skia_fx
 
+sk_sp<GrDirectContext> openjfxD3DRecreateContext(D3DAdapterPolicy policy) {
+    // Drop our refs on the removed device / queue / adapter / factory (Skia's
+    // retired context keeps its own; releasing COM refs is safe on a removed
+    // device) and make every adapter class eligible again: after a TDR the
+    // same GPU usually comes back, and an adapter change may expose another.
+    releaseD3DGlobals();
+    D3DGlobal& s = g();
+    s.initialized   = false;
+    s.hardwareTried = false;
+    s.warpTried     = false;
+    sk_sp<GrDirectContext> ctx = openjfxD3DMakeContext(policy);
+    if (!ctx) return nullptr;
+    if (s.device && s.device->GetDeviceRemovedReason() != S_OK) {
+        // The driver is still resetting; the new device is already dead.
+        // Caller retries later.
+        ctx->abandonContext();
+        ctx.reset();
+        releaseD3DGlobals();
+        return nullptr;
+    }
+    skia_fx::d3d12_device_generation_bump();
+    return ctx;
+}
+
+int32_t openjfxD3DTestRemoveDevice() {
+    D3DGlobal& s = g();
+    if (!s.succeeded || !s.device) return 1;
+    ID3D12Device5* d5 = nullptr;
+    if (FAILED(s.device->QueryInterface(IID_PPV_ARGS(&d5))) || !d5) return 2;
+    d5->RemoveDevice();   // a real removal: every D3D call now fails like a TDR
+    d5->Release();
+    return 0;
+}
+
+
 // ---------------------------------------------------------------------------
 // Per-window swap chain.
 // ---------------------------------------------------------------------------
@@ -454,7 +520,7 @@ bool wrapBackBuffers(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx) {
             kTopLeft_GrSurfaceOrigin,
             kRGBA_8888_SkColorType,
             /* colorSpace    */ nullptr,
-            openjfxTextSurfaceProps(),
+            openjfxWindowTextSurfaceProps(),
             /* releaseProc   */ nullptr,
             /* releaseContext*/ nullptr);
         if (!surface) {
@@ -470,7 +536,8 @@ bool wrapBackBuffers(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx) {
 } // namespace
 
 OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
-    void* hwndVoid, int32_t width, int32_t height, GrDirectContext* grCtx) {
+    void* hwndVoid, int32_t width, int32_t height, GrDirectContext* grCtx,
+    bool stretch) {
     if (!grCtx || !hwndVoid || width <= 0 || height <= 0) return nullptr;
     D3DGlobal& s = g();
     if (!s.succeeded) return nullptr;
@@ -486,7 +553,17 @@ OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
     scd.SampleDesc.Quality = 0;
     scd.BufferUsage        = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount        = kBufferCount;
-    scd.Scaling            = DXGI_SCALING_STRETCH;
+    // DXGI_SCALING_NONE: while a border-drag resizes the window, DWM keeps
+    // composing the last presented buffer until the next frame (at the new
+    // size) lands. STRETCH scales that stale frame to the new client size,
+    // so every WM_SIZE visibly zooms the whole UI and the next present snaps
+    // it back: the resize "jump/flicker", worst on heavy scenes whose frames
+    // take longest. NONE leaves it 1:1 at the top-left (stock Prism
+    // behaviour); the newly exposed strip shows the swap chain background
+    // colour (openjfxD3DSetBackgroundColor). STRETCH is only for a render
+    // scale that differs from the output scale (glass.win.renderScale),
+    // where the buffer is intentionally smaller than the client area.
+    scd.Scaling            = stretch ? DXGI_SCALING_STRETCH : DXGI_SCALING_NONE;
     scd.SwapEffect         = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     scd.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
     // ALLOW_TEARING (when supported) lets Present(0, ALLOW_TEARING)
@@ -502,6 +579,14 @@ OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
     IDXGISwapChain1* sc1 = nullptr;
     HRESULT hr = s.factory->CreateSwapChainForHwnd(
         s.queue, hwnd, &scd, nullptr, nullptr, &sc1);
+    if ((FAILED(hr) || !sc1) && scd.Scaling == DXGI_SCALING_NONE) {
+        // Not expected on flip-model swap chains (Windows 8+), but never lose
+        // the D3D tier over it: retry with the old stretch scaling.
+        scd.Scaling = DXGI_SCALING_STRETCH;
+        sc1 = nullptr;
+        hr = s.factory->CreateSwapChainForHwnd(
+            s.queue, hwnd, &scd, nullptr, nullptr, &sc1);
+    }
     if (FAILED(hr) || !sc1) return nullptr;
 
     // Disable DXGI's stock Alt-Enter handling — we don't want exclusive
@@ -518,6 +603,9 @@ OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
     out->swapChain    = sc3;
     out->width        = width;
     out->height       = height;
+    out->contentWidth  = width;
+    out->contentHeight = height;
+    out->stretch       = (scd.Scaling == DXGI_SCALING_STRETCH);
     out->allowTearing = s.allowTearing;
 
     // No SetMaximumFrameLatency — the default (3) is what we want.
@@ -573,6 +661,23 @@ OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
     return out;
 }
 
+int32_t openjfxD3DSetBackgroundColor(OpenJfxD3DSwapChain* sc,
+                                     float r, float g, float b) {
+    if (!sc || !sc->swapChain) return 1;
+    sc->bgColor = SkColorSetARGB(0xFF,
+        static_cast<U8CPU>(r * 255.0f + 0.5f),
+        static_cast<U8CPU>(g * 255.0f + 0.5f),
+        static_cast<U8CPU>(b * 255.0f + 0.5f));
+    DXGI_RGBA c = { r, g, b, 1.0f };
+    return SUCCEEDED(sc->swapChain->SetBackgroundColor(&c)) ? 0 : 2;
+}
+
+void openjfxD3DContentSize(OpenJfxD3DSwapChain* sc, int32_t* w, int32_t* h) {
+    if (!sc) { *w = *h = 0; return; }
+    *w = sc->contentWidth;
+    *h = sc->contentHeight;
+}
+
 SkSurface* openjfxD3DCurrentSurface(OpenJfxD3DSwapChain* sc) {
     if (!sc || sc->backBuffers.empty()) return nullptr;
     UINT idx = sc->swapChain->GetCurrentBackBufferIndex();
@@ -613,8 +718,43 @@ int32_t openjfxD3DAcquireNextBuffer(OpenJfxD3DSwapChain* sc) {
 int32_t openjfxD3DPresent(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx, int32_t vsync) {
     if (!sc || !sc->swapChain) return 1;
     if (skia_fx::d3d12_device_lost()) return 3; // device gone — don't touch the GPU
-    if (grCtx) grCtx->flushAndSubmit();
     UINT idx = sc->swapChain->GetCurrentBackBufferIndex();
+    // Fill the headroom margin (back buffer beyond the content size) with the
+    // scene fill. While a border-drag grows the window, DWM keeps showing this
+    // frame until the next one lands; the newly exposed strip then shows the
+    // fill instead of black. Draws are save/restore-balanced, so the canvas is
+    // at its base state (identity, no clip) here; skip if it is not.
+    if ((sc->width > sc->contentWidth || sc->height > sc->contentHeight)
+            && idx < sc->backBuffers.size() && sc->backBuffers[idx]) {
+        SkCanvas* cv = sc->backBuffers[idx]->getCanvas();
+        if (cv && cv->getSaveCount() == 1) {
+            SkPaint paint;
+            paint.setColor(sc->bgColor);
+            paint.setBlendMode(SkBlendMode::kSrc);
+            cv->save();
+            cv->resetMatrix();
+            const float cw = static_cast<float>(sc->contentWidth);
+            const float ch = static_cast<float>(sc->contentHeight);
+            const float bw = static_cast<float>(sc->width);
+            const float bh = static_cast<float>(sc->height);
+            if (bw > cw) cv->drawRect(SkRect::MakeLTRB(cw, 0, bw, bh), paint);
+            if (bh > ch) cv->drawRect(SkRect::MakeLTRB(0, ch, cw, bh), paint);
+            cv->restore();
+        }
+    }
+    if (grCtx) {
+        // Flush everything, then the back buffer with kPresent so Skia
+        // transitions it RENDER_TARGET -> PRESENT before Present (as Skia's
+        // own D3D12WindowContext does). Presenting a buffer still in
+        // RENDER_TARGET state is invalid D3D12 and can show corruption on
+        // drivers that compress render targets.
+        grCtx->flush();
+        if (idx < sc->backBuffers.size() && sc->backBuffers[idx]) {
+            grCtx->flush(sc->backBuffers[idx].get(),
+                         SkSurfaces::BackendSurfaceAccess::kPresent, GrFlushInfo());
+        }
+        grCtx->submit();
+    }
     // VSync ON  -> Present(1, 0): block for the next vblank, no tearing.
     // VSync OFF -> Present(0, ALLOW_TEARING): uncapped, escapes the DWM cap.
     // (DXGI forbids combining a non-zero sync interval with ALLOW_TEARING.)
@@ -690,7 +830,42 @@ int32_t openjfxD3DResize(OpenJfxD3DSwapChain* sc,
                          int32_t width, int32_t height,
                          GrDirectContext* grCtx) {
     if (!sc || !sc->swapChain || width <= 0 || height <= 0) return 1;
-    if (sc->width == width && sc->height == height) return 0; // no-op
+
+    // Grow-only back buffers with headroom. A border-drag sends a new size
+    // every WM_SIZE; ResizeBuffers on each one costs a full GPU drain and
+    // leaves the window wider than the last presented frame (DWM shows black
+    // there until the next present). Instead keep the buffers larger than the
+    // content and only move the content size; ResizeBuffers runs when the
+    // window outgrows the headroom, or is far smaller than the buffers
+    // (e.g. after un-maximize) so memory stays bounded.
+    int bufW = width;
+    int bufH = height;
+    if (sc->stretch) {
+        // STRETCH scales the whole buffer onto the client area: headroom
+        // would shrink the content and show the margin. Exact size only.
+        if (width == sc->width && height == sc->height) return 0;
+    } else {
+        constexpr int kPad = 256;
+        const bool fits = width <= sc->width && height <= sc->height;
+        const bool wasteful = sc->width > width + 2 * kPad
+                           || sc->height > height + 2 * kPad;
+        if (fits && !wasteful) {
+            sc->contentWidth  = width;
+            sc->contentHeight = height;
+            return 0;
+        }
+        bufW = width + kPad;
+        bufH = height + kPad;
+        // Never more headroom than the monitor the window is on (a maximized
+        // window then gets an exactly-sized buffer).
+        if (HMONITOR mon = ::MonitorFromWindow(sc->hwnd, MONITOR_DEFAULTTONEAREST)) {
+            MONITORINFO mi = { sizeof(mi) };
+            if (::GetMonitorInfo(mon, &mi)) {
+                bufW = std::min(bufW, std::max<int>(width,  mi.rcMonitor.right  - mi.rcMonitor.left));
+                bufH = std::min(bufH, std::max<int>(height, mi.rcMonitor.bottom - mi.rcMonitor.top));
+            }
+        }
+    }
     // A removed device's queue never signals its fence, so the drain below would
     // block forever (and ResizeBuffers would fail anyway). Bail out.
     if (skia_fx::d3d12_device_lost()) return 1;
@@ -717,14 +892,13 @@ int32_t openjfxD3DResize(OpenJfxD3DSwapChain* sc,
     //    refs that Skia adopted in wrapBackBuffers).
     sc->backBuffers.clear();
 
-    // 3. DXGI in-place resize — DWM treats this as a semantic resize,
-    //    so it does not stretch the previous composition while the
-    //    new buffers are being prepared. This is the artifact-free
-    //    property the GL path can't provide.
+    // 3. DXGI in-place resize. Keeps the HWND association (no second
+    //    flip-model swap chain on the window) and, with DXGI_SCALING_NONE,
+    //    nothing on screen is rescaled while the new buffers are prepared.
     UINT flags = sc->allowTearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
     HRESULT hr = sc->swapChain->ResizeBuffers(
         kBufferCount,
-        static_cast<UINT>(width), static_cast<UINT>(height),
+        static_cast<UINT>(bufW), static_cast<UINT>(bufH),
         kSwapFormat, flags);
     if (FAILED(hr)) {
         // ResizeBuffers fails for removal-class errors too (TDR mid-drag,
@@ -734,17 +908,22 @@ int32_t openjfxD3DResize(OpenJfxD3DSwapChain* sc,
             || (g().device && g().device->GetDeviceRemovedReason() != S_OK)) {
             skia_fx::d3d12_mark_device_lost();
         }
+        // No back buffers any more: never let a later "fits" resize return
+        // success on an empty set (null surface, garbage present).
+        sc->width = sc->height = 0;
         return 2;
     }
 
-    sc->width  = width;
-    sc->height = height;
+    sc->width  = bufW;
+    sc->height = bufH;
+    sc->contentWidth  = width;
+    sc->contentHeight = height;
 
     if (getenv("OPENJFX_SKIA_D3D_DIAG")) {
         DXGI_SWAP_CHAIN_DESC1 actual = {};
         if (SUCCEEDED(sc->swapChain->GetDesc1(&actual))) {
             std::fprintf(stderr,
-                "[skia.d3d] resize: req=%dx%d  actual=%ux%u\n",
+                "[skia.d3d] resize: content=%dx%d  buffers=%ux%u\n",
                 width, height, actual.Width, actual.Height);
         }
         RECT cr = {};
@@ -755,11 +934,15 @@ int32_t openjfxD3DResize(OpenJfxD3DSwapChain* sc,
         }
     }
 
-    // 4. Re-wrap the new back buffers as fresh SkSurfaces.
-    if (!wrapBackBuffers(sc, grCtx)) return 3;
-
-    // 5. The GPU is fully idle; all fence values are "done" from the
+    // 4. The GPU is fully idle; all fence values are "done" from the
     //    GPU's perspective. Reset so acquires don't spuriously wait.
     for (int i = 0; i < kBufferCount; ++i) sc->fenceValues[i] = 0;
+
+    // 5. Re-wrap the new back buffers as fresh SkSurfaces.
+    if (!wrapBackBuffers(sc, grCtx)) {
+        sc->backBuffers.clear();
+        sc->width = sc->height = 0;
+        return 3;
+    }
     return 0;
 }

@@ -121,6 +121,21 @@ tasks.register('runRasterFillBench', JavaExec) {
     applyPerfRunConfig(it)
 }
 
+tasks.register('runDeviceRecoveryTest', JavaExec) {
+    group = 'verification'
+    description = 'Remove the D3D12 device N times (as a TDR would) and verify rendering recovers. Needs a display. -Prec.cycles=N -Prec.3d=true'
+    dependsOn 'classes'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass.set('org.openjfx.samples.perf.DeviceRecoveryTest')
+    mainModule.set('openjfx.samples.perf')
+    jvmArgs '--enable-preview', '--enable-native-access=ALL-UNNAMED',
+        '--add-exports', 'javafx.graphics/com.sun.prism.skia.impl=openjfx.samples.perf'
+    systemProperty 'prism.order', 'skia'
+    systemProperty 'rec.cycles', providers.gradleProperty('rec.cycles').getOrElse('5')
+    systemProperty 'rec.3d', providers.gradleProperty('rec.3d').getOrElse('false')
+    applyPerfRunConfig(it)
+}
+
 tasks.register('runSnapHunt', JavaExec) {
     group = 'verification'
     description = 'Render hot-path scenes, probe ground-truth pixels, dump PNGs (bug hunt). -Pperf.cpu=true for the software tier.'

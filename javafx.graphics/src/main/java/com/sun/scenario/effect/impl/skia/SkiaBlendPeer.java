@@ -7,6 +7,8 @@ import com.sun.javafx.geom.Rectangle;
 import com.sun.javafx.geom.transform.BaseTransform;
 import com.sun.prism.Graphics;
 import com.sun.prism.skia.SkiaGraphics;
+import com.sun.prism.skia.impl.NativeBridge;
+import com.sun.scenario.effect.Blend;
 import com.sun.scenario.effect.Effect;
 import com.sun.scenario.effect.FilterContext;
 import com.sun.scenario.effect.ImageData;
@@ -58,11 +60,12 @@ public final class SkiaBlendPeer extends EffectPeer<RenderState> {
             case "SOFT_LIGHT"  -> 21;  // kSoftLight
             case "DIFFERENCE"  -> 22;  // kDifference
             case "EXCLUSION"   -> 23;  // kExclusion
-            // JFX channel-isolation modes (RED/GREEN/BLUE) don't have
-            // direct SkBlendMode equivalents; fall back to SRC_OVER
-            // for visual correctness on the alpha and most cases. A
-            // proper implementation would chain a ColorMatrix isolating
-            // the channel + a SRC_OVER blend.
+            // JFX channel-isolation modes (RED/GREEN/BLUE: SRC_OVER on one
+            // colour channel + alpha, the other channels keep the bottom)
+            // have no SkBlendMode equivalent and cannot be built from the
+            // existing colour-matrix / blend filters (it needs a per-channel
+            // alpha, i.e. a non-premultiplied intermediate). Falls back to
+            // SRC_OVER until a native per-channel blend entry point exists.
             default -> 3; // kSrcOver
         };
     }
@@ -92,7 +95,7 @@ public final class SkiaBlendPeer extends EffectPeer<RenderState> {
                 inputs[0].addref();
                 return inputs[0];
             }
-            return new ImageData(fctx, null, new Rectangle());
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), new Rectangle());
         }
 
         ImageData bottom = inputs[0];
@@ -104,16 +107,22 @@ public final class SkiaBlendPeer extends EffectPeer<RenderState> {
         dstBounds.add(topBounds);
         dstBounds.intersectWith(outputClip);
         if (dstBounds.width <= 0 || dstBounds.height <= 0) {
-            return new ImageData(fctx, null, dstBounds);
+            // Upstream PPSTwoSamplerPeer always returns a real (cleared)
+            // drawable, never an image-less ImageData, even for an empty
+            // result; callers such as NGCanvas.blendAthruBintoC rely on it.
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
-        if (!bottom.validate(fctx) || !top.validate(fctx)) {
-            return new ImageData(fctx, null, dstBounds);
-        }
+        // Upstream does not validate inputs in the peer. Degrade per input
+        // instead of returning an image-less result: an input that fails to
+        // validate is treated as transparent (skipped below).
+        final boolean bottomOk = bottom.validate(fctx);
+        final boolean topOk = top.validate(fctx);
 
         SkiaPrDrawable dst = (SkiaPrDrawable)
             getRenderer().getCompatibleImage(dstBounds.width, dstBounds.height);
         if (dst == null) {
+            // Genuine allocation failure (upstream: markLost + null image).
             return new ImageData(fctx, null, dstBounds);
         }
 
@@ -133,8 +142,19 @@ public final class SkiaBlendPeer extends EffectPeer<RenderState> {
             return new ImageData(fctx, dst, dstBounds);
         }
 
-        // Draw bottom with the default SRC_OVER (override -1).
-        PrEffectHelper.renderImageData(gdst, bottom, dstBounds);
+        int mode = skBlendMode(getUniqueName());
+        // With a transparent top, SRC_IN / SRC_OUT yield transparent; every
+        // other mode yields the bottom, which drawing the bottom alone gives.
+        final boolean drawBottom = bottomOk
+            && (topOk || (mode != NativeBridge.BLEND_SRC_IN
+                          && mode != NativeBridge.BLEND_SRC_OUT));
+        if (drawBottom) {
+            // Draw bottom with the default SRC_OVER (override -1).
+            PrEffectHelper.renderImageData(gdst, bottom, dstBounds);
+        }
+        if (!topOk) {
+            return new ImageData(fctx, dst, dstBounds);
+        }
 
         // Composite top with the target SkBlendMode. We must NOT set the
         // surface's sticky blend mode directly (surfaceSetBlendMode): the
@@ -144,12 +164,20 @@ public final class SkiaBlendPeer extends EffectPeer<RenderState> {
         // flooding the whole node (the InnerShadow "solid box"). Routing the
         // mode through the Graphics' per-draw blend override makes every
         // syncBeforeDraw of this top input use it.
-        int mode = skBlendMode(getUniqueName());
+        //
+        // Blend.jsl samples `top * opacity` before blending: apply the
+        // opacity as the Graphics' extra alpha for the top draw only.
+        float opacity = (effect instanceof Blend b) ? b.getOpacity() : 1f;
+        if (!(opacity >= 0f)) opacity = 0f;   // also maps NaN to 0
+        if (opacity > 1f) opacity = 1f;
         SkiaGraphics sg = (SkiaGraphics) gdst;
+        float prevAlpha = gdst.getExtraAlpha();
         sg.setPeerBlendOverride(mode);
+        gdst.setExtraAlpha(prevAlpha * opacity);
         try {
             PrEffectHelper.renderImageData(gdst, top, dstBounds);
         } finally {
+            gdst.setExtraAlpha(prevAlpha);
             sg.setPeerBlendOverride(-1);
         }
 

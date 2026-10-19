@@ -4,6 +4,7 @@ import com.sun.prism.PixelFormat;
 import com.sun.prism.Texture;
 import com.sun.prism.Texture.WrapMode;
 import com.sun.prism.skia.impl.NativeHandles;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.LongConsumer;
@@ -104,6 +105,9 @@ abstract class SkiaTextureBase implements Texture {
         this.contentHeight = contentHeight;
         this.wrapMode = wrapMode;
         this.useMipmap = useMipmap;
+        // Stamp creation as a use: a fresh, not-yet-locked RT must not sort as
+        // the oldest (tick 0) LRU victim for the opt-in 18b RT eviction.
+        this.lastUseTick = SkiaTextureResourcePool.nextUseTick();
     }
 
     /** Native handle for use by the bridge. {@code 0} once disposed. */
@@ -189,7 +193,20 @@ abstract class SkiaTextureBase implements Texture {
     @Override public void contentsUseful()    { /* TODO atlas eviction policy */ }
     @Override public void contentsNotUseful() { /* TODO atlas eviction policy */ }
 
-    @Override public boolean isSurfaceLost() { return slot.isClosed(); }
+    /** GPU device generation this texture's native object was created on. */
+    private final int deviceGeneration = SkiaGpu.deviceGeneration();
+
+    /**
+     * True when the GPU device was replaced (device-loss recovery) after this
+     * texture was created: its native object belongs to the abandoned context
+     * and draws nothing. Reported as surface-lost so the scene graph rebuilds
+     * it, exactly as Prism's D3D path does after a device reset.
+     */
+    protected final boolean isFromReplacedDevice() {
+        return deviceGeneration != SkiaGpu.deviceGeneration();
+    }
+
+    @Override public boolean isSurfaceLost() { return slot.isClosed() || isFromReplacedDevice(); }
 
     @Override public int getLastImageSerial()        { return lastImageSerial; }
     @Override public void setLastImageSerial(int s)  { this.lastImageSerial = s; }

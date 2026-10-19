@@ -44,6 +44,24 @@ enum class D3DAdapterPolicy {
 sk_sp<GrDirectContext> openjfxD3DMakeContext(
     D3DAdapterPolicy policy = D3DAdapterPolicy::HardwareThenWarp);
 
+/**
+ * Device-loss recovery: releases the removed device's globals, brings up a
+ * NEW device/queue (any adapter class may be retried) and returns a fresh
+ * GrDirectContext on it, bumping skia_fx::d3d12_device_generation(). Returns
+ * nullptr if no usable device is available yet (driver still resetting) —
+ * the caller retries later. Render thread only.
+ */
+sk_sp<GrDirectContext> openjfxD3DRecreateContext(D3DAdapterPolicy policy);
+
+/** Clears the device-lost latch (recovery only, after everything is rebuilt). */
+namespace skia_fx { void d3d12_clear_device_lost(); void d3d12_device_generation_bump(); }
+
+/**
+ * TEST ONLY: ID3D12Device5::RemoveDevice() on the shared device — a real
+ * device removal, as a TDR would cause. 0 on success.
+ */
+int32_t openjfxD3DTestRemoveDevice();
+
 /** True if DXGI_FEATURE_PRESENT_ALLOW_TEARING was detected at init. */
 bool openjfxD3DAllowTearing();
 
@@ -59,7 +77,22 @@ bool openjfxD3DIsWarp();
 OpenJfxD3DSwapChain* openjfxD3DCreateSwapChain(
     void* hwnd /* HWND */,
     int32_t width, int32_t height,
-    GrDirectContext* grCtx);
+    GrDirectContext* grCtx,
+    bool stretch);
+
+/**
+ * Sets the colour DWM shows in the part of the client area the last
+ * presented buffer does not cover (DXGI_SCALING_NONE). During a live
+ * border-drag that is the strip the window has grown by before the next
+ * frame lands, so it should match the scene fill rather than black.
+ * Channels are 0..1, opaque. Returns 0 on success.
+ */
+int32_t openjfxD3DSetBackgroundColor(OpenJfxD3DSwapChain* sc,
+                                     float r, float g, float b);
+
+/** Content size the scene renders at; the back buffers may be larger
+ *  (grow-only headroom), with the margin outside it unused. */
+void openjfxD3DContentSize(OpenJfxD3DSwapChain* sc, int32_t* w, int32_t* h);
 
 /** Returns the SkSurface for the swap chain's current back buffer. */
 SkSurface* openjfxD3DCurrentSurface(OpenJfxD3DSwapChain* sc);
@@ -89,10 +122,14 @@ int32_t openjfxD3DPresent(OpenJfxD3DSwapChain* sc, GrDirectContext* grCtx, int32
 int32_t openjfxD3DAcquireNextBuffer(OpenJfxD3DSwapChain* sc);
 
 /**
- * Re-sizes the swap chain in place via {@code IDXGISwapChain::ResizeBuffers}.
- * DWM treats this as a semantic resize, not a stretch — the only path
- * on Windows that avoids the resize-drag artifact OpenGL windowed apps
- * exhibit. Internally: waits for the GPU to finish all in-flight
+ * Sets the content size to {@code width x height}. The back buffers are
+ * grow-only with headroom (256 px per axis, capped at the monitor size):
+ * a size that fits only moves the content size (no GPU drain), and the
+ * margin outside the content is filled with the background colour at
+ * present, so a growing window shows the scene fill, not black, until the
+ * next frame lands (DXGI_SCALING_NONE crops the buffer to the client area).
+ * When the window outgrows the buffers, or is much smaller than them,
+ * the swap chain is resized via {@code IDXGISwapChain::ResizeBuffers}: waits for the GPU to finish all in-flight
  * frames, drops the per-buffer SkSurfaces, calls ResizeBuffers, then
  * re-wraps each new back buffer as a fresh SkSurface.
  *

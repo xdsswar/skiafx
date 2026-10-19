@@ -227,7 +227,10 @@ public final class SkiaTextureResourcePool implements TextureResourcePool<Object
     @Override public void resourceFreed(ManagedResource<Object> resource)   { }
 
     @Override public long estimateTextureSize(int width, int height, PixelFormat format) {
-        return (long) width * height * format.getBytesPerPixelUnit();
+        // BYTE_RGB has no 3-byte SkColorType: SkiaImageTexture expands it to
+        // kRGB_888x, i.e. 4 bytes per pixel in GPU/native memory.
+        int bpp = (format == PixelFormat.BYTE_RGB) ? 4 : format.getBytesPerPixelUnit();
+        return (long) width * height * bpp;
     }
     @Override public long estimateRTTextureSize(int width, int height, boolean hasDepth) {
         return (long) width * height * 4 + (hasDepth ? (long) width * height * 4 : 0);

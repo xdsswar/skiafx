@@ -74,7 +74,7 @@ OPENJFX3D_API uintptr_t openjfx_skia3d_material_create(void);
 OPENJFX3D_API void      openjfx_skia3d_material_set_diffuse(uintptr_t mat,
         float r, float g, float b, float a);
 OPENJFX3D_API void      openjfx_skia3d_material_set_specular(uintptr_t mat,
-        int32_t set, float r, float g, float b);
+        int32_t set, float r, float g, float b, float power);
 // Upload an RGBA8 texture map (typeOrdinal: 0=diffuse,1=specular,2=bump,3=self-illum).
 // pixels == null clears the slot. imageId is a stable per-Image id (0 = un-shared) so
 // the texture can be reused by other materials via openjfx_skia3d_material_bind_texture.
@@ -107,6 +107,11 @@ OPENJFX3D_API int32_t   openjfx_skia3d_target_end(uintptr_t target);
 // Notify the 3D pipeline that one real swap-chain present completed. Drives the
 // deferred target-free latency (see the .cpp). Safe to call when 3D is idle.
 OPENJFX3D_API void      openjfx_skia3d_notify_present(void);
+// Device-loss recovery: drop every reference to the lost shared D3D12 device
+// (bgfx shutdown + our D3D12 resources) before the 2D bridge rebuilds it.
+// 3D stays disabled afterwards. Returns 1 if 3D was running (and is now
+// disabled), 0 if bgfx was never initialized. Render thread only.
+OPENJFX3D_API int32_t   openjfx_skia3d_release_device(void);
 OPENJFX3D_API uintptr_t openjfx_skia3d_target_wrap_image(uintptr_t target);
 
 OPENJFX3D_API int32_t   openjfx_skia3d_draw(uintptr_t target, uintptr_t meshview,

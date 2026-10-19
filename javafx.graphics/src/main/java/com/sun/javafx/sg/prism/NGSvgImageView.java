@@ -27,6 +27,7 @@ package com.sun.javafx.sg.prism;
 
 import com.sun.prism.Graphics;
 import com.sun.prism.skia.SkiaGraphics;
+import java.util.function.LongSupplier;
 
 /**
  * Render peer for {@code javafx.scene.image.SvgImageView}.
@@ -47,7 +48,12 @@ import com.sun.prism.skia.SkiaGraphics;
 public class NGSvgImageView extends NGNode {
 
     // --- synced from SvgImageView.doUpdatePeer (logical coordinates) ---
-    private long svgHandle;             // borrowed; owned/freed by the SvgImage
+    // Live view of the SvgImage's handle, read on the render thread at draw
+    // time. A raw long snapshot would go stale when SvgImage.dispose() runs
+    // without the view being re-synced; the supplier returns 0 the instant the
+    // image is disposed, and the native free is deferred to the render thread,
+    // so a draw can never see a freed handle.
+    private LongSupplier svgSource;     // borrowed; owned/freed by the SvgImage
     private float x, y;                 // node origin
     private float w, h;                 // logical display size (fit size × zoom)
     private int bgArgb;                 // 0 = transparent (skip)
@@ -59,9 +65,9 @@ public class NGSvgImageView extends NGNode {
 
     // ---- peer state setters (called on the FX→render sync) -----------------
 
-    public void setSvgHandle(long handle) {
-        if (svgHandle != handle) {
-            svgHandle = handle;
+    public void setSvgSource(LongSupplier source) {
+        if (svgSource != source) {
+            svgSource = source;
             visualsChanged();
         }
     }
@@ -110,7 +116,11 @@ public class NGSvgImageView extends NGNode {
     @Override
     protected void renderContent(Graphics g) {
         // Note: !(w > 0) also rejects NaN (NaN comparisons are all false).
-        if (svgHandle == 0L || !(w > 0) || !(h > 0)) {
+        if (svgSource == null || !(w > 0) || !(h > 0)) {
+            return;
+        }
+        final long svgHandle = svgSource.getAsLong();
+        if (svgHandle == 0L) {
             return;
         }
         // SVG rendering is Skia-specific (it draws an SkSVGDOM straight onto the

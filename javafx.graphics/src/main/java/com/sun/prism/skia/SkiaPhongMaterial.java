@@ -7,6 +7,7 @@ import com.sun.prism.TextureMap;
 import com.sun.prism.impl.BasePhongMaterial;
 import com.sun.prism.impl.Disposer;
 import com.sun.prism.skia.impl.NativeBridge3D;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -61,8 +62,8 @@ final class SkiaPhongMaterial extends BasePhongMaterial {
 
     @Override
     public void setSpecularColor(boolean set, float r, float g, float b, float a) {
-        // Specular shading uses rgb + power; color alpha is unused.
-        NativeBridge3D.materialSetSpecularColor(nativeHandle, set, r, g, b);
+        // Prism passes the specular power in the alpha slot (NGPhongMaterial).
+        NativeBridge3D.materialSetSpecularColor(nativeHandle, set, r, g, b, a);
     }
 
     @Override
@@ -272,6 +273,20 @@ final class SkiaPhongMaterial extends BasePhongMaterial {
             }
         }
         return out;
+    }
+
+
+    /** GPU device generation this object's native resources belong to. */
+    private final int deviceGeneration = SkiaGpu.deviceGeneration();
+
+    /**
+     * Invalid once device-loss recovery replaced the GPU device: NGShape3D /
+     * NGTriangleMesh / NGPhongMaterial then dispose and rebuild it (the same
+     * isValid() contract Prism's D3D pipeline uses after a device reset).
+     */
+    @Override
+    public boolean isValid() {
+        return deviceGeneration == SkiaGpu.deviceGeneration();
     }
 
     static final class SkiaPhongMaterialDisposerRecord implements Disposer.Record {

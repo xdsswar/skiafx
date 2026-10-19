@@ -80,9 +80,24 @@ public class PrEffectHelper {
                               Graphics g, float x, float y,
                               Effect defaultInput)
     {
+        BaseTransform origtx = g.getTransformNoClone().copy();
+        try {
+            render(effect, g, x, y, defaultInput, origtx);
+        } finally {
+            // skia-fx: the body replaces the transform (null / rendertx) and
+            // has early returns (null filter result, non-invertible render
+            // transform) plus peer/native calls that can throw; always hand
+            // the caller back its transform.
+            g.setTransform(origtx);
+        }
+    }
+
+    private static void render(Effect effect,
+                               Graphics g, float x, float y,
+                               Effect defaultInput, BaseTransform origtx)
+    {
         BaseTransform transform;
         Rectangle rclip = getGraphicsClipNoClone(g);
-        BaseTransform origtx = g.getTransformNoClone().copy();
         BaseTransform rendertx;
         // skia-fx HiDPI: the Skia pipeline keeps the pixel scale SEPARATE from
         // the Graphics transform (SkiaGraphics applies it per draw), so origtx
@@ -115,6 +130,20 @@ public class PrEffectHelper {
                 transform = BaseTransform.IDENTITY_TRANSFORM;
             }
             g.setTransform(null);
+            // The filter now runs in DEVICE space, but SkiaGraphics' clip rect
+            // is LOGICAL (the pixel scale is applied per draw, see
+            // SkiaGraphics.syncBeforeDraw). Filtering against a logical clip
+            // truncates/drops effect nodes on HiDPI dirty-region repaints, so
+            // bring it into device space with the same floor-origin /
+            // ceil-extent rounding the native clip uses. The no-clip fallback
+            // (render-target content size) is already device pixels.
+            if (hidpiEffect && g.getClipRectNoClone() != null) {
+                int cx = (int) Math.floor(rclip.x * psX);
+                int cy = (int) Math.floor(rclip.y * psY);
+                int cw = (int) Math.ceil((rclip.x + rclip.width)  * (double) psX) - cx;
+                int ch = (int) Math.ceil((rclip.y + rclip.height) * (double) psY) - cy;
+                rclip = new Rectangle(cx, cy, cw, ch);
+            }
             // Counteract SkiaGraphics' per-draw ×pixelScale so the device-res
             // result composites 1:1 (identity in Prism / at 100%).
             if (hidpiEffect) {
@@ -230,10 +259,14 @@ public class PrEffectHelper {
                 // the actual image may be much larger than the region
                 // of interest ("r"), so to improve performance we render
                 // only that subregion here
-                Texture tex = ((PrTexture)res.getUntransformedImage()).getTextureObject();
-                g.setTransform(rendertx);
-                g.transform(res.getTransform());
-                g.drawTexture(tex, r.x, r.y, r.width, r.height);
+                // Skia peers return a real (cleared) drawable with zero-size
+                // bounds for an empty result, like upstream; nothing to draw.
+                if (r.width > 0 && r.height > 0) {
+                    Texture tex = ((PrTexture)res.getUntransformedImage()).getTextureObject();
+                    g.setTransform(rendertx);
+                    g.transform(res.getTransform());
+                    g.drawTexture(tex, r.x, r.y, r.width, r.height);
+                }
             } else {
                 // An invalid result with DEGENERATE bounds (null, or non-positive
                 // width/height) means there is simply nothing to draw — typically

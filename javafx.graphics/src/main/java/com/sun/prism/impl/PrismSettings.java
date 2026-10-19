@@ -25,6 +25,7 @@
 
 package com.sun.prism.impl;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Properties;
 import java.util.StringTokenizer;
@@ -226,7 +227,7 @@ public final class PrismSettings {
 
         String order = systemProperties.getProperty("prism.order");
         if (order != null) {
-            tryOrderArr = split(order, ",");
+            tryOrderArr = mapLegacyOrder(split(order, ","), systemProperties);
         }
 
         tryOrder = List.of(tryOrderArr);
@@ -425,6 +426,44 @@ public final class PrismSettings {
         }
 
         return dflt;
+    }
+
+    /**
+     * Drop-in compatibility for {@code -Dprism.order}: the Prism-era backends
+     * no longer exist, so map the GPU ones ({@code d3d}, {@code es2},
+     * {@code mtl}) to {@code skia} and the software ones ({@code sw},
+     * {@code j2d}) to {@code skia} on the CPU raster tier. The software tier is
+     * selected only when the FIRST recognised entry is a software backend
+     * (e.g. {@code sw} or {@code sw,d3d}); {@code d3d,sw} stays on the GPU
+     * (Skia degrades to raster on its own if the GPU is unavailable). An
+     * explicit {@code -Dprism.skia.gpu} always wins. Unknown names are kept so
+     * they fail exactly like upstream. Duplicates are removed.
+     */
+    private static String[] mapLegacyOrder(String[] requested, Properties props) {
+        List<String> out = new ArrayList<>(requested.length);
+        boolean firstRecognised = true;
+        for (String raw : requested) {
+            String name = raw.trim().toLowerCase();
+            if (name.isEmpty()) continue;
+            String mapped;
+            switch (name) {
+                case "skia", "d3d", "es2", "mtl" -> mapped = "skia";
+                case "sw", "j2d" -> {
+                    mapped = "skia";
+                    if (firstRecognised && props.getProperty("prism.skia.gpu") == null) {
+                        props.setProperty("prism.skia.gpu", "false");
+                    }
+                }
+                default -> mapped = name;
+            }
+            if ("skia".equals(mapped)) {
+                firstRecognised = false;
+            }
+            if (!out.contains(mapped)) {
+                out.add(mapped);
+            }
+        }
+        return out.toArray(new String[0]);
     }
 
     /* A simple version of String.split(), since that isn't available on CDC */

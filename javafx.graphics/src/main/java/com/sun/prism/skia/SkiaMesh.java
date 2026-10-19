@@ -3,6 +3,7 @@ package com.sun.prism.skia;
 import com.sun.prism.impl.BaseMesh;
 import com.sun.prism.impl.Disposer;
 import com.sun.prism.skia.impl.NativeBridge3D;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -38,6 +39,10 @@ final class SkiaMesh extends BaseMesh {
     @Override
     public boolean buildNativeGeometry(float[] vertexBuffer, int vertexBufferLength,
                                        int[] indexBuffer, int indexBufferLength) {
+        // After a device loss shut 3D down there is nothing to build into:
+        // report success so NGTriangleMesh doesn't throw out of every paint
+        // pass; the mesh simply draws nothing until restart.
+        if (NativeBridge3D.isDisabledByDeviceLoss()) return true;
         return NativeBridge3D.meshBuildInt(nativeHandle,
                 vertexBuffer, vertexBufferLength, indexBuffer, indexBufferLength);
     }
@@ -45,6 +50,10 @@ final class SkiaMesh extends BaseMesh {
     @Override
     public boolean buildNativeGeometry(float[] vertexBuffer, int vertexBufferLength,
                                        short[] indexBuffer, int indexBufferLength) {
+        // After a device loss shut 3D down there is nothing to build into:
+        // report success so NGTriangleMesh doesn't throw out of every paint
+        // pass; the mesh simply draws nothing until restart.
+        if (NativeBridge3D.isDisabledByDeviceLoss()) return true;
         return NativeBridge3D.meshBuildShort(nativeHandle,
                 vertexBuffer, vertexBufferLength, indexBuffer, indexBufferLength);
     }
@@ -64,6 +73,20 @@ final class SkiaMesh extends BaseMesh {
             countReleased = true;
             count.decrementAndGet();
         }
+    }
+
+
+    /** GPU device generation this object's native resources belong to. */
+    private final int deviceGeneration = SkiaGpu.deviceGeneration();
+
+    /**
+     * Invalid once device-loss recovery replaced the GPU device: NGShape3D /
+     * NGTriangleMesh / NGPhongMaterial then dispose and rebuild it (the same
+     * isValid() contract Prism's D3D pipeline uses after a device reset).
+     */
+    @Override
+    public boolean isValid() {
+        return deviceGeneration == SkiaGpu.deviceGeneration();
     }
 
     static final class SkiaMeshDisposerRecord implements Disposer.Record {

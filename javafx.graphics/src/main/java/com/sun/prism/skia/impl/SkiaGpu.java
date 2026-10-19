@@ -64,6 +64,24 @@ public final class SkiaGpu {
         return Boolean.TRUE.equals(enabled);
     }
 
+    /**
+     * Generation of the shared GPU device: 1 until device-loss recovery
+     * replaces the device, then bumped. GPU-backed textures, render targets,
+     * presentables and 3D resources record it at creation and report
+     * themselves lost/invalid once it changes, so the scene graph rebuilds
+     * them on the new device. A volatile read — cheap in hot paths.
+     */
+    private static volatile int deviceGeneration = 1;
+
+    public static int deviceGeneration() {
+        return deviceGeneration;
+    }
+
+    /** Re-read the device generation from native after a successful recovery. */
+    public static void refreshDeviceGeneration() {
+        deviceGeneration = NativeBridge.deviceGeneration();
+    }
+
     /** Default Skia GPU resource-cache budget: 96 MB. */
     private static final long DEFAULT_SKIA_CACHE_BUDGET = 96L << 20;
 
@@ -148,6 +166,17 @@ public final class SkiaGpu {
         }
         enabled = Boolean.TRUE;
         return true;
+    }
+
+    /**
+     * True when the 3D renderer may run: the pipeline isn't forced to the
+     * software raster ({@code -Dprism.skia.gpu=false}) and the app didn't
+     * force the OpenGL backend (bgfx 3D shares Skia's D3D12 device).
+     * Side-effect free; safe from any thread.
+     */
+    public static boolean allows3D() {
+        if ("false".equalsIgnoreCase(System.getProperty("prism.skia.gpu"))) return false;
+        return resolveRequestedBackend() != GpuBackend.OPENGL;
     }
 
     /**

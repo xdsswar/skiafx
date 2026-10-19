@@ -1,15 +1,23 @@
 package com.sun.prism.skia.impl;
 
+import com.sun.javafx.geom.transform.Affine2D;
+import com.sun.javafx.geom.transform.BaseTransform;
+import com.sun.prism.Image;
+import com.sun.prism.ResourceFactory;
+import com.sun.prism.Texture;
 import com.sun.prism.paint.Color;
 import com.sun.prism.paint.Gradient;
 import com.sun.prism.paint.ImagePattern;
 import com.sun.prism.paint.LinearGradient;
 import com.sun.prism.paint.RadialGradient;
 import com.sun.prism.paint.Stop;
+import com.sun.prism.skia.SkiaImageTexture;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Converts Prism {@link com.sun.prism.paint.Paint} instances into
@@ -17,10 +25,8 @@ import java.util.List;
  * underlying SkShader (heap {@code sk_sp<SkShader>*}); callers should
  * close it when done with the draw.
  *
- * <p>Image-pattern support requires an upload step (creating an
- * SkImage first), which is the slow path. For repeated use we'd cache
- * the SkImage handle on the {@link ImagePattern} itself; phase-1
- * builds the SkImage every call. CLAUDE.md atlas/cache work later.</p>
+ * <p>Image patterns reuse the factory's cached REPEAT texture's SkImage
+ * (see {@link #forImagePattern}).</p>
  */
 public final class SkiaShaders {
 
@@ -28,10 +34,17 @@ public final class SkiaShaders {
         public final MemorySegment shader;
         /** Optional image segment whose lifetime parallels the shader. */
         private final MemorySegment ownedImage;
+        /** True when the shader belongs to the gradient cache (close() keeps it). */
+        private final boolean cached;
 
         private Handle(MemorySegment shader, MemorySegment ownedImage) {
+            this(shader, ownedImage, false);
+        }
+
+        private Handle(MemorySegment shader, MemorySegment ownedImage, boolean cached) {
             this.shader = shader;
             this.ownedImage = ownedImage;
+            this.cached = cached;
         }
 
         public boolean isValid() {
@@ -39,7 +52,7 @@ public final class SkiaShaders {
         }
 
         @Override public void close() {
-            if (isValid()) {
+            if (isValid() && !cached) {
                 NativeBridge.shaderDestroy(shader);
             }
             if (ownedImage != null && !ownedImage.equals(MemorySegment.NULL)) {
@@ -67,6 +80,89 @@ public final class SkiaShaders {
      * letting the fill go black.</p>
      */
     public static Handle forGradient(Gradient g, float rx, float ry, float rw, float rh) {
+        // An absolute gradient does not depend on the fill bounds; key it
+        // bounds-free so every shape sharing it hits one entry.
+        if (!g.isProportional()) {
+            rx = 0f; ry = 0f; rw = 0f; rh = 0f;
+        }
+        synchronized (GRADIENT_CACHE) {
+            LOOKUP_KEY.set(g, rx, ry, rw, rh);
+            MemorySegment hit = GRADIENT_CACHE.get(LOOKUP_KEY);
+            if (hit != null) {
+                return new Handle(hit, null, true);
+            }
+        }
+        Handle created = createGradient(g, rx, ry, rw, rh);
+        if (!created.isValid()) {
+            return created;
+        }
+        synchronized (GRADIENT_CACHE) {
+            GradientKey key = new GradientKey();
+            key.set(g, rx, ry, rw, rh);
+            MemorySegment prev = GRADIENT_CACHE.putIfAbsent(key, created.shader);
+            if (prev != null) {
+                // Lost a race with another thread: keep the cached one.
+                NativeBridge.shaderDestroy(created.shader);
+                return new Handle(prev, null, true);
+            }
+        }
+        return new Handle(created.shader, null, true);
+    }
+
+    /**
+     * Gradient shaders keyed by (gradient identity, resolved bounds). Prism
+     * paints are immutable and the toolkit reuses one per FX paint, so a
+     * Modena-style UI fills the same few gradients over the same few control
+     * sizes every frame; this turns a native create + destroy per draw into a
+     * lookup. Bounded LRU; evicted shaders are unref'd (an in-flight draw
+     * holds its own reference natively, so eviction can never free a shader
+     * that is still being drawn with on this thread).
+     */
+    private static final int GRADIENT_CACHE_SIZE = 128;
+
+    private static final Map<GradientKey, MemorySegment> GRADIENT_CACHE =
+        new LinkedHashMap<>(GRADIENT_CACHE_SIZE * 2, 0.75f, true) {
+            @Override
+            protected boolean removeEldestEntry(Map.Entry<GradientKey, MemorySegment> e) {
+                if (size() > GRADIENT_CACHE_SIZE) {
+                    NativeBridge.shaderDestroy(e.getValue());
+                    return true;
+                }
+                return false;
+            }
+        };
+
+    /** Reused probe key so a cache hit allocates nothing but the Handle. */
+    private static final GradientKey LOOKUP_KEY = new GradientKey();
+
+    private static final class GradientKey {
+        private Gradient g;
+        private float rx, ry, rw, rh;
+        private int hash;
+
+        void set(Gradient g, float rx, float ry, float rw, float rh) {
+            this.g = g;
+            this.rx = rx; this.ry = ry; this.rw = rw; this.rh = rh;
+            int h = System.identityHashCode(g);
+            h = 31 * h + Float.floatToIntBits(rx);
+            h = 31 * h + Float.floatToIntBits(ry);
+            h = 31 * h + Float.floatToIntBits(rw);
+            h = 31 * h + Float.floatToIntBits(rh);
+            this.hash = h;
+        }
+
+        @Override public int hashCode() { return hash; }
+
+        @Override public boolean equals(Object o) {
+            return o instanceof GradientKey k && k.g == g
+                && Float.floatToIntBits(k.rx) == Float.floatToIntBits(rx)
+                && Float.floatToIntBits(k.ry) == Float.floatToIntBits(ry)
+                && Float.floatToIntBits(k.rw) == Float.floatToIntBits(rw)
+                && Float.floatToIntBits(k.rh) == Float.floatToIntBits(rh);
+        }
+    }
+
+    private static Handle createGradient(Gradient g, float rx, float ry, float rw, float rh) {
         List<Stop> stops = g.getStops();
         int n = stops.size();
         if (n < 1) return new Handle(MemorySegment.NULL, null);
@@ -106,7 +202,17 @@ public final class SkiaShaders {
             } else if (g instanceof RadialGradient rg) {
                 gr.resolveRadial(rg, rx, ry, rw, rh);
                 lm = gr.hasLocalMatrix && NativeBridge.lmShadersAvailable();
-                if (lm) {
+                if (gr.hasFocus && NativeBridge.focalRadialShaderAvailable()) {
+                    // Off-centre focus: two-point conical from the focus
+                    // point to the gradient circle (PaintHelper focus math).
+                    shader = lm
+                        ? NativeBridge.shaderFocalRadialGradientLm(
+                            gr.fx, gr.fy, gr.cx, gr.cy, gr.radius, n, positions, colors, tile,
+                            gr.m00, gr.m01, gr.m02, gr.m10, gr.m11, gr.m12)
+                        : NativeBridge.shaderFocalRadialGradientLm(
+                            gr.fx, gr.fy, gr.cx, gr.cy, gr.radius, n, positions, colors, tile,
+                            1f, 0f, 0f, 0f, 1f, 0f);
+                } else if (lm) {
                     shader = NativeBridge.shaderRadialGradientLm(
                         gr.cx, gr.cy, gr.radius, n, positions, colors, tile,
                         gr.m00, gr.m01, gr.m02, gr.m10, gr.m11, gr.m12);
@@ -161,63 +267,64 @@ public final class SkiaShaders {
     }
 
     /**
-     * Build an SkShader from an {@link ImagePattern}. Uploads the
-     * pattern's source image as an SkImage and wraps it.
+     * Build an SkShader from an {@link ImagePattern}, mirroring stock
+     * {@code PaintHelper.getImagePatternTx}: the image is mapped onto the
+     * pattern's anchor rect (resolved against {@code (rx,ry,rw,rh)} when the
+     * pattern is proportional), then through the pattern transform, and tiled
+     * with REPEAT from there.
+     *
+     * <p>The pixels come from the factory's REPEAT texture cache, so the image
+     * is uploaded once per content change rather than copied twice on every
+     * fill, and every pixel format the factory supports (BYTE_RGB JPEGs,
+     * BYTE_ALPHA, sub-images, direct buffers) works. The shader holds its own
+     * reference to the SkImage, so the cached texture keeps ownership.</p>
      */
-    public static Handle forImagePattern(ImagePattern p) {
-        // Build an SkImage from the pattern's pixels. We currently
-        // upload a fresh image each call; cache later.
-        com.sun.prism.Image src = p.getImage();
-        long imgHandle = uploadImage(src);
-        if (imgHandle == 0L) return new Handle(MemorySegment.NULL, null);
-        MemorySegment imgSeg = MemorySegment.ofAddress(imgHandle);
-        MemorySegment shader = NativeBridge.shaderImage(
-            imgSeg, NativeBridge.TILE_REPEAT, NativeBridge.TILE_REPEAT);
-        if (shader == null || shader.equals(MemorySegment.NULL)) {
-            NativeBridge.imageDestroy(imgSeg);
-            return new Handle(MemorySegment.NULL, null);
-        }
-        return new Handle(shader, imgSeg);
-    }
-
-    // Upload a Prism Image to a one-shot SkImage handle. Mirrors
-    // SkiaImageTexture.uploadImage but kept minimal and self-contained.
-    private static long uploadImage(com.sun.prism.Image image) {
-        int w = image.getWidth();
-        int h = image.getHeight();
-        int rowBytes = image.getScanlineStride();
-        int colorType = switch (image.getPixelFormat()) {
-            case BYTE_BGRA_PRE, INT_ARGB_PRE -> NativeBridge.CT_BGRA_8888_PREMUL;
-            case BYTE_GRAY                   -> NativeBridge.CT_GRAY_8;
-            default                          -> -1;
-        };
-        if (colorType < 0) return 0L;
-
-        try (FrameArena.Lease lease = FrameArena.current().open()) {
-            long byteSize = (long) rowBytes * h;
-            MemorySegment seg = lease.allocate(byteSize, 4);
-            java.nio.Buffer buf = image.getPixelBuffer();
-            if (buf instanceof java.nio.ByteBuffer bb && bb.hasArray()) {
-                int pos = bb.position();
-                int n = bb.limit() - pos;
-                MemorySegment.copy(bb.array(), bb.arrayOffset() + pos,
-                                   seg, ValueLayout.JAVA_BYTE,
-                                   0L, Math.min(n, (int) byteSize));
-            } else if (buf instanceof java.nio.IntBuffer ib && ib.hasArray()) {
-                int pos = ib.position();
-                int nInts = ib.limit() - pos;
-                MemorySegment.copy(ib.array(), ib.arrayOffset() + pos,
-                                   seg, ValueLayout.JAVA_INT,
-                                   0L, Math.min(nInts, (int) (byteSize / 4)));
-            } else {
-                return 0L;
+    public static Handle forImagePattern(ImagePattern p, ResourceFactory rf,
+                                         float rx, float ry, float rw, float rh) {
+        Image img = p.getImage();
+        if (img == null || rf == null) return new Handle(MemorySegment.NULL, null);
+        Texture tex = rf.getCachedTexture(img, Texture.WrapMode.REPEAT);
+        if (tex == null) return new Handle(MemorySegment.NULL, null);
+        try {
+            if (!(tex instanceof SkiaImageTexture st)) return new Handle(MemorySegment.NULL, null);
+            long imgHandle = st.getNativeHandle();
+            float cw = tex.getContentWidth();
+            float ch = tex.getContentHeight();
+            if (imgHandle == 0L || cw <= 0f || ch <= 0f) {
+                return new Handle(MemorySegment.NULL, null);
             }
-            MemorySegment imgHandle = NativeBridge.imageCreateRaster(
-                w, h, rowBytes, seg, colorType);
-            if (imgHandle == null || imgHandle.equals(MemorySegment.NULL)) return 0L;
-            return imgHandle.address();
+            float px = p.getX();
+            float py = p.getY();
+            float pw = p.getWidth();
+            float ph = p.getHeight();
+            if (p.isProportional()) {
+                px = rx + px * rw;
+                py = ry + py * rh;
+                pw = pw * rw;
+                ph = ph * rh;
+            }
+            // image px -> anchor rect -> pattern transform (user space)
+            Affine2D m = PATTERN_TX.get();
+            m.setToIdentity();
+            BaseTransform patternTx = p.getPatternTransformNoClone();
+            if (patternTx != null && !patternTx.isIdentity()) {
+                m.concatenate(patternTx);
+            }
+            m.translate(px, py);
+            m.scale(pw / cw, ph / ch);
+            MemorySegment shader = NativeBridge.shaderImageLm(
+                MemorySegment.ofAddress(imgHandle),
+                NativeBridge.TILE_REPEAT, NativeBridge.TILE_REPEAT,
+                (float) m.getMxx(), (float) m.getMxy(), (float) m.getMxt(),
+                (float) m.getMyx(), (float) m.getMyy(), (float) m.getMyt());
+            return new Handle(shader, null);
+        } finally {
+            tex.unlock();
         }
     }
+
+    private static final ThreadLocal<Affine2D> PATTERN_TX =
+        ThreadLocal.withInitial(Affine2D::new);
 
     private static int clamp8(double v) {
         if (v <= 0) return 0;

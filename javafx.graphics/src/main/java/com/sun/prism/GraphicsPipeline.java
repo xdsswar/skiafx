@@ -182,25 +182,24 @@ public abstract class GraphicsPipeline {
     private static GraphicsPipeline installedPipeline;
 
     public static GraphicsPipeline createPipeline() {
+        if (PrismSettings.tryOrder.isEmpty()) {
+            // Like upstream: no pipelines specified -> null (QuantumRenderer
+            // reports "no suitable pipeline found").
+            if (PrismSettings.verbose) {
+                System.out.println("No Skia pipeline specified");
+            }
+            return null;
+        }
         if (installedPipeline != null) {
             throw new IllegalStateException("pipeline already created:" +
                                             installedPipeline);
         }
-        if (PrismSettings.tryOrder.isEmpty()) {
-            throw new IllegalStateException(
-                "No Prism pipeline configured. openjfx-skia ships with " +
-                "SKIAPipeline as the only supported backend — set " +
-                "-Dprism.order=skia (the default) and ensure " +
-                "openjfx_skia_shared was built with SKIA_HOME pointing at " +
-                "a real Skia build.");
-        }
 
         // openjfx-skia: the Prism-era D3D / ES2 / MTL / SW / J2D backends
-        // are gone. The discovery loop now only ever loads
-        // com.sun.prism.skia.SKIAPipeline (it stays a loop so a user
-        // override via -Dprism.order is still honoured at runtime —
-        // unknown names just hit ClassNotFoundException and fall
-        // through to the hard-fail at the bottom).
+        // are gone. PrismSettings maps those -Dprism.order names onto
+        // "skia" (sw/j2d select the CPU raster tier), so the loop normally
+        // only ever loads com.sun.prism.skia.SKIAPipeline. Unknown names
+        // hit ClassNotFoundException and fall through, as upstream.
         Throwable lastFailure = null;
         for (String prefix : PrismSettings.tryOrder) {
             String className =
@@ -239,25 +238,23 @@ public abstract class GraphicsPipeline {
             }
         }
 
-        // Nothing in the tryOrder list could be brought up. With Skia
-        // being the only valid backend in this build, this is fatal —
-        // historically Prism would just return null and the JavaFX
-        // runtime would no-op into a broken state. Hard-fail instead
-        // so the user sees the real cause (typically: Skia native lib
-        // missing, or the user overrode -Dprism.order with an unknown
-        // backend that no longer exists in the tree).
+        // Nothing in the tryOrder list could be brought up. Degrade like
+        // upstream: report once and return null; QuantumRenderer turns that
+        // into its "no suitable pipeline found" error. The last cause is
+        // included so a missing Skia native lib is still diagnosable.
         StringBuilder sBuf = new StringBuilder(
-            "Skia pipeline initialization failed. Tried: ");
+            "Graphics Device initialization failed for :  ");
         boolean first = true;
         for (String prefix : PrismSettings.tryOrder) {
             if (!first) sBuf.append(", ");
             sBuf.append(prefix);
             first = false;
         }
-        sBuf.append(". Note that the Prism-era d3d/es2/mtl/sw/j2d ")
-            .append("backends have been removed from openjfx-skia; ")
-            .append("only 'skia' is valid for -Dprism.order.");
-        throw new IllegalStateException(sBuf.toString(), lastFailure);
+        if (lastFailure != null) {
+            sBuf.append(" (").append(lastFailure).append(')');
+        }
+        System.err.println(sBuf);
+        return null;
     }
 
     public static GraphicsPipeline getPipeline() {

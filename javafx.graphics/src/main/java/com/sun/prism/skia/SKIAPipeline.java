@@ -5,6 +5,7 @@ import com.sun.prism.GraphicsPipeline;
 import com.sun.prism.ResourceFactory;
 import com.sun.prism.skia.impl.NativeBridge;
 import com.sun.prism.skia.impl.NativeBridge3D;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 import java.util.HashMap;
 import java.util.List;
@@ -188,7 +189,7 @@ public final class SKIAPipeline extends GraphicsPipeline {
     // it's safe to call from any thread. If bgfx init later fails on the
     // render thread, 3D draws degrade to no-ops rather than crashing.
     private static final boolean THREE_D_SUPPORTED =
-        com.sun.prism.skia.impl.NativeBridge3D.available();
+        NativeBridge3D.available() && SkiaGpu.allows3D();
 
     @Override
     public boolean is3DSupported() {

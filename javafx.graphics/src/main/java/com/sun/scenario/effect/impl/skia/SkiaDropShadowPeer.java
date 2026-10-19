@@ -68,7 +68,8 @@ public final class SkiaDropShadowPeer extends EffectPeer<RenderState> {
             srcBounds.height + 2 * padY);
         dstBounds.intersectWith(outputClip);
         if (dstBounds.width <= 0 || dstBounds.height <= 0) {
-            return new ImageData(fctx, null, srcBounds);
+            // Empty result: a real cleared drawable, like upstream (never image-less).
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
         SkiaPrDrawable dst = (SkiaPrDrawable)

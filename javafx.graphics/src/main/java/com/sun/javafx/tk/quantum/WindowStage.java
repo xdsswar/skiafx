@@ -635,7 +635,13 @@ public class WindowStage extends GlassStage {
             && !isPopupStage
             && platformWindow != null
             && !platformWindow.isVisible()
-            && getScene() != null;
+            && getScene() != null
+            // Never drive the synchronous pre-show pulse re-entrantly: a
+            // show() issued from inside a pulse (Timeline onFinished,
+            // AnimationTimer, layout) would re-enter the primary timer's
+            // pulse and corrupt its receiver iteration. Fall back to the
+            // stock show-then-paint path in that case.
+            && !((QuantumToolkit) QuantumToolkit.getToolkit()).isInPulse();
 
         if (preShowPaint) {
             firstPresentLatch = new CountDownLatch(1);

@@ -30,6 +30,12 @@ public final class NativeBridge {
 
     private static final SymbolLookup LOOKUP = loadLibrary();
 
+    /** The loaded bridge library, for other internal downcall holders that
+     *  must bind against the exact same DLL (e.g. the effect extensions). */
+    public static SymbolLookup lookup() {
+        return LOOKUP;
+    }
+
     /**
      * Linker option for short, non-blocking leaf downcalls on the per-draw hot
      * path (begin/end bracket, rect/oval/rrect fills + strokes). These never
@@ -205,7 +211,19 @@ public final class NativeBridge {
             ValueLayout.ADDRESS,    // return: uintptr_t handle (0 if D3D unavailable)
             ValueLayout.ADDRESS,    // HWND
             ValueLayout.JAVA_INT,   // width
-            ValueLayout.JAVA_INT)); // height
+            ValueLayout.JAVA_INT,   // height
+            ValueLayout.JAVA_INT)); // stretch (1 = DXGI_SCALING_STRETCH, 0 = NONE)
+
+    // OPTIONAL (find, not findOrThrow): an older native lib without it only
+    // loses the resize-strip background colour, not the whole pipeline.
+    private static final MethodHandle MH_SURFACE_SET_BACKGROUND_D3D =
+        LOOKUP.find("openjfx_skia_surface_set_background_d3d")
+              .map(seg -> LINKER.downcallHandle(seg,
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,   // return: 0 on success
+                      ValueLayout.ADDRESS,    // handle
+                      ValueLayout.JAVA_INT))) // 0xRRGGBB
+              .orElse(null);
 
     private static final MethodHandle MH_SURFACE_PRESENT_WINDOW_D3D = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_surface_present_window_d3d"),
@@ -505,6 +523,29 @@ public final class NativeBridge {
 
     // ---- Text / glyph rendering --------------------------------------------
 
+    // OPTIONAL: per-surface LCD (ClearType) text flag around a text run.
+    private static final MethodHandle MH_SURFACE_SET_LCD_TEXT =
+        LOOKUP.find("openjfx_skia_surface_set_lcd_text")
+              .map(seg -> LINKER.downcallHandle(seg,
+                  FunctionDescriptor.of(
+                      ValueLayout.JAVA_INT,   // return: 0 on success
+                      ValueLayout.ADDRESS,    // surface handle
+                      ValueLayout.JAVA_INT),  // 1 = LCD eligible
+                  CRITICAL))
+              .orElse(null);
+
+    // OPTIONAL: typeface from a (memory-mapped) file at a .ttc face index.
+    // Absent on older native libs; SkiaTypeface then falls back to the
+    // copy-the-bytes path for face 0 only.
+    private static final MethodHandle MH_TYPEFACE_CREATE_FROM_FILE =
+        LOOKUP.find("openjfx_skia_typeface_create_from_file")
+              .map(seg -> LINKER.downcallHandle(seg,
+                  FunctionDescriptor.of(
+                      ValueLayout.ADDRESS,    // return: typeface handle (0 on failure)
+                      ValueLayout.ADDRESS,    // const char* utf8Path
+                      ValueLayout.JAVA_INT))) // face index
+              .orElse(null);
+
     private static final MethodHandle MH_TYPEFACE_CREATE_FROM_DATA = LINKER.downcallHandle(
         LOOKUP.findOrThrow("openjfx_skia_typeface_create_from_data"),
         FunctionDescriptor.of(
@@ -630,7 +671,8 @@ public final class NativeBridge {
     public static final int BLEND_DST_ATOP = 10;
     public static final int BLEND_XOR      = 11;
     public static final int BLEND_PLUS     = 12;
-    public static final int BLEND_MULTIPLY = 13;
+    public static final int BLEND_MODULATE = 13; // r = s*d (NOT the CSS multiply)
+    public static final int BLEND_MULTIPLY = 24; // SkBlendMode::kMultiply
     public static final int BLEND_SCREEN   = 14;
     public static final int BLEND_OVERLAY  = 15;
 
@@ -689,6 +731,30 @@ public final class NativeBridge {
                 ValueLayout.JAVA_INT,
                 ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
                 ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT)))
+            .orElse(null);
+
+    private static final MethodHandle MH_SHADER_FOCAL_RADIAL_LM =
+        LOOKUP.find("openjfx_skia_shader_create_focal_radial_gradient_lm")
+            .map(sym -> LINKER.downcallHandle(sym, FunctionDescriptor.of(
+                ValueLayout.ADDRESS,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // fx,fy
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // cx,cy
+                ValueLayout.JAVA_FLOAT,                            // radius
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                ValueLayout.JAVA_INT,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT)))
+            .orElse(null);
+
+    private static final MethodHandle MH_SHADER_IMAGE_LM =
+        LOOKUP.find("openjfx_skia_shader_create_image_lm")
+            .map(sym -> LINKER.downcallHandle(sym, FunctionDescriptor.of(
+                ValueLayout.ADDRESS,
+                ValueLayout.ADDRESS,                               // image handle
+                ValueLayout.JAVA_INT, ValueLayout.JAVA_INT,        // tileX, tileY
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,  // m00,m01,m02
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT))) // m10,m11,m12
             .orElse(null);
 
     private static final MethodHandle MH_SHADER_IMAGE = LINKER.downcallHandle(
@@ -1040,6 +1106,9 @@ public final class NativeBridge {
 
     // Optional: sticky stroke dash pattern. find() so an older native lib
     // (without the symbol) degrades to solid strokes instead of failing load.
+    // critical(true): the native side only copies the intervals (no upcall,
+    // no blocking), so the float[] is passed as a heap segment - no Arena /
+    // off-heap copy per setStroke.
     private static final MethodHandle MH_SURFACE_SET_STROKE_DASH =
         LOOKUP.find("openjfx_skia_surface_set_stroke_dash")
             .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
@@ -1047,7 +1116,31 @@ public final class NativeBridge {
                 ValueLayout.ADDRESS,                 // surface handle
                 ValueLayout.ADDRESS,                 // intervals (float*)
                 ValueLayout.JAVA_INT,                // count
-                ValueLayout.JAVA_FLOAT)))            // phase
+                ValueLayout.JAVA_FLOAT),             // phase
+                Linker.Option.critical(true)))
+            .orElse(null);
+
+    // Optional: sticky per-surface shape anti-aliasing (absent on older libs).
+    private static final MethodHandle MH_SURFACE_SET_ANTIALIAS =
+        LOOKUP.find("openjfx_skia_surface_set_antialias")
+            .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS,                 // surface handle
+                ValueLayout.JAVA_INT), CRITICAL))    // aa (0/1)
+            .orElse(null);
+
+    // Optional: image-rect draw with a paint colour (alpha-mask tinting).
+    private static final MethodHandle MH_SURFACE_DRAW_IMAGE_RECT_TINTED =
+        LOOKUP.find("openjfx_skia_surface_draw_image_rect_tinted")
+            .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(
+                ValueLayout.JAVA_INT,
+                ValueLayout.ADDRESS, ValueLayout.ADDRESS,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // src
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,
+                ValueLayout.JAVA_FLOAT, ValueLayout.JAVA_FLOAT,    // dst
+                ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE,
+                ValueLayout.JAVA_BYTE, ValueLayout.JAVA_BYTE)))    // r,g,b,a
             .orElse(null);
 
     private static final MethodHandle MH_SURFACE_REPLACE_BACKING_ARGB = LINKER.downcallHandle(
@@ -1192,6 +1285,37 @@ public final class NativeBridge {
      * clearing the lost flag on success. Returns {@code true} if the device is usable
      * again. No-op (returns {@code false}) on builds/backends without the recover path.
      */
+    private static final MethodHandle MH_DEVICE_GENERATION = LOOKUP.find("openjfx_skia_device_generation")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+        .orElse(null);
+
+    private static final MethodHandle MH_TEST_REMOVE_DEVICE = LOOKUP.find("openjfx_skia_test_remove_device")
+        .map(s -> LINKER.downcallHandle(s, FunctionDescriptor.of(ValueLayout.JAVA_INT)))
+        .orElse(null);
+
+    /** Generation of the shared GPU device (1 until a recovery replaces it). */
+    public static int deviceGeneration() {
+        if (MH_DEVICE_GENERATION == null) return 1;
+        try {
+            return (int) MH_DEVICE_GENERATION.invokeExact();
+        } catch (Throwable t) {
+            return 1;
+        }
+    }
+
+    /**
+     * TEST ONLY: removes the D3D12 device (ID3D12Device5::RemoveDevice), as a
+     * TDR would, to exercise device-loss recovery. Returns 0 on success.
+     */
+    public static int testRemoveDevice() {
+        if (MH_TEST_REMOVE_DEVICE == null) return -1;
+        try {
+            return (int) MH_TEST_REMOVE_DEVICE.invokeExact();
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
     public static boolean recoverDevice() {
         if (MH_DEVICE_RECOVER == null) return false;
         try {
@@ -1488,12 +1612,28 @@ public final class NativeBridge {
      * {@link #surfaceCreateWindowGpu} (GL), then offscreen GPU, then raster.
      */
     public static MemorySegment surfaceCreateSwapChainD3d(MemorySegment hwnd,
-                                                          int width, int height) {
+                                                          int width, int height,
+                                                          int stretch) {
         try {
             return (MemorySegment) MH_SURFACE_CREATE_SWAP_CHAIN_D3D.invokeExact(
-                hwnd, width, height);
+                hwnd, width, height, stretch);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_surface_create_swap_chain_d3d failed", t);
+        }
+    }
+
+    /**
+     * Sets the colour (0xRRGGBB) DWM shows where the swap chain's last
+     * presented buffer does not cover the window, i.e. the strip a window
+     * grows by during a live resize before the next frame lands.
+     * Returns 0 on success.
+     */
+    public static int surfaceSetBackgroundD3d(MemorySegment handle, int rgb) {
+        if (MH_SURFACE_SET_BACKGROUND_D3D == null) return -1;
+        try {
+            return (int) MH_SURFACE_SET_BACKGROUND_D3D.invokeExact(handle, rgb);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_set_background_d3d failed", t);
         }
     }
 
@@ -1839,6 +1979,63 @@ public final class NativeBridge {
             return (MemorySegment) MH_SHADER_IMAGE.invokeExact(imageHandle, tileModeX, tileModeY);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_shader_create_image failed", t);
+        }
+    }
+
+    /** Whether {@link #shaderFocalRadialGradientLm} is present in the native lib. */
+    public static boolean focalRadialShaderAvailable() {
+        return MH_SHADER_FOCAL_RADIAL_LM != null;
+    }
+
+    /**
+     * Focal radial gradient (RadialGradient focusAngle/focusDistance): a
+     * two-point conical gradient from the focus point (fx,fy), radius 0, to
+     * the circle (cx,cy,radius). The focus is clamped natively to 0.99 *
+     * radius from the centre. Same packing / local matrix as
+     * {@link #shaderRadialGradientLm}; NULL when degenerate. On an older
+     * native lib without the symbol this falls back to the concentric
+     * {@link #shaderRadialGradientLm} (focus ignored).
+     */
+    public static MemorySegment shaderFocalRadialGradientLm(float fx, float fy,
+                                                            float cx, float cy, float radius,
+                                                            int nStops,
+                                                            MemorySegment positions,
+                                                            MemorySegment colorsRGBA,
+                                                            int tileMode,
+                                                            float m00, float m01, float m02,
+                                                            float m10, float m11, float m12) {
+        if (MH_SHADER_FOCAL_RADIAL_LM == null) {
+            return shaderRadialGradientLm(cx, cy, radius, nStops, positions, colorsRGBA,
+                                          tileMode, m00, m01, m02, m10, m11, m12);
+        }
+        try {
+            return (MemorySegment) MH_SHADER_FOCAL_RADIAL_LM.invokeExact(
+                fx, fy, cx, cy, radius, nStops, positions, colorsRGBA, tileMode,
+                m00, m01, m02, m10, m11, m12);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_shader_create_focal_radial_gradient_lm failed", t);
+        }
+    }
+
+    /**
+     * Image shader with an explicit 2x3 local matrix (same convention as the
+     * gradient {@code _lm} variants). The shader holds its own reference to
+     * the SkImage, so the image handle may be destroyed independently of it.
+     * On an older native lib without the symbol this falls back to
+     * {@link #shaderImage} (identity local matrix).
+     */
+    public static MemorySegment shaderImageLm(MemorySegment imageHandle,
+                                              int tileModeX, int tileModeY,
+                                              float m00, float m01, float m02,
+                                              float m10, float m11, float m12) {
+        if (MH_SHADER_IMAGE_LM == null) {
+            return shaderImage(imageHandle, tileModeX, tileModeY);
+        }
+        try {
+            return (MemorySegment) MH_SHADER_IMAGE_LM.invokeExact(
+                imageHandle, tileModeX, tileModeY, m00, m01, m02, m10, m11, m12);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_shader_create_image_lm failed", t);
         }
     }
 
@@ -2519,6 +2716,34 @@ public final class NativeBridge {
      * Returns the native handle; the caller checks for
      * {@link MemorySegment#NULL} to detect failure.
      */
+    /** Marks following glyph draws on {@code surface} LCD-eligible (or not).
+     *  No-op on a native lib without the symbol (grayscale text). */
+    public static void surfaceSetLcdText(MemorySegment surface, boolean lcd) {
+        if (MH_SURFACE_SET_LCD_TEXT == null) return;
+        int flag = lcd ? 1 : 0;
+        try {
+            int unused = (int) MH_SURFACE_SET_LCD_TEXT.invokeExact(surface, flag);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_set_lcd_text failed", t);
+        }
+    }
+
+    /** True when the native lib can load a typeface by file + face index. */
+    public static boolean hasTypefaceCreateFromFile() {
+        return MH_TYPEFACE_CREATE_FROM_FILE != null;
+    }
+
+    /** Typeface from {@code utf8Path} (NUL-terminated) at {@code faceIndex};
+     *  NULL on failure or when the symbol is unavailable. */
+    public static MemorySegment typefaceCreateFromFile(MemorySegment utf8Path, int faceIndex) {
+        if (MH_TYPEFACE_CREATE_FROM_FILE == null) return MemorySegment.NULL;
+        try {
+            return (MemorySegment) MH_TYPEFACE_CREATE_FROM_FILE.invokeExact(utf8Path, faceIndex);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_typeface_create_from_file failed", t);
+        }
+    }
+
     public static MemorySegment typefaceCreateFromData(MemorySegment data, int length) {
         try {
             return (MemorySegment) MH_TYPEFACE_CREATE_FROM_DATA.invokeExact(data, length);
@@ -2617,6 +2842,35 @@ public final class NativeBridge {
         }
     }
 
+    /** Whether {@link #surfaceDrawImageRectTinted} is present in the native lib. */
+    public static boolean drawImageRectTintedAvailable() {
+        return MH_SURFACE_DRAW_IMAGE_RECT_TINTED != null;
+    }
+
+    /**
+     * {@link #surfaceDrawImageRect} with a paint colour (components 0..255).
+     * An alpha-only (BYTE_ALPHA / kAlpha_8) image is drawn as a coverage mask
+     * tinted with the colour - Prism's mask-texture semantics; a colour image
+     * is only modulated by {@code a}. Sticky blend / extra alpha / sampling
+     * apply as for {@code surfaceDrawImageRect}. Falls back to the untinted
+     * draw on an older native lib.
+     */
+    public static int surfaceDrawImageRectTinted(MemorySegment surface, MemorySegment image,
+                                                 float sx, float sy, float sw, float sh,
+                                                 float dx, float dy, float dw, float dh,
+                                                 int r, int g, int b, int a) {
+        if (MH_SURFACE_DRAW_IMAGE_RECT_TINTED == null) {
+            return surfaceDrawImageRect(surface, image, sx, sy, sw, sh, dx, dy, dw, dh);
+        }
+        try {
+            return (int) MH_SURFACE_DRAW_IMAGE_RECT_TINTED.invokeExact(
+                surface, image, sx, sy, sw, sh, dx, dy, dw, dh,
+                (byte) r, (byte) g, (byte) b, (byte) a);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_draw_image_rect_tinted failed", t);
+        }
+    }
+
     /**
      * Composites a BGRA8888 (premultiplied) buffer at native address
      * {@code pixels} onto the scene canvas {@code surfaceHandle}, scaling
@@ -2685,26 +2939,40 @@ public final class NativeBridge {
 
     /**
      * Sets (or clears) the sticky stroke dash on the surface. {@code dash} of
-     * null or length &lt; 2 clears it (solid strokes). No-op on an older native
-     * lib that lacks the symbol. The dash is consumed by subsequent strokes
-     * until changed; fills are unaffected.
+     * null or length 0 clears it (solid strokes); an odd-length pattern is
+     * repeated once (BasicStroke semantics: {@code [5]} = 5 on / 5 off). An
+     * unchanged pattern is a cheap native no-op (the dash effect is cached on
+     * the surface). No-op on an older native lib that lacks the symbol. The
+     * dash is consumed by subsequent strokes until changed; fills are
+     * unaffected. No off-heap allocation: the array is passed in place.
      */
     public static void surfaceSetStrokeDash(MemorySegment handle, float[] dash, float phase) {
         if (MH_SURFACE_SET_STROKE_DASH == null) return;
         try {
-            if (dash == null || dash.length < 2) {
+            if (dash == null || dash.length < 1) {
                 int ignored = (int) MH_SURFACE_SET_STROKE_DASH.invokeExact(
                     handle, MemorySegment.NULL, 0, 0f);
                 return;
             }
-            try (Arena arena = Arena.ofConfined()) {
-                MemorySegment seg = arena.allocate(ValueLayout.JAVA_FLOAT, dash.length);
-                MemorySegment.copy(dash, 0, seg, ValueLayout.JAVA_FLOAT, 0, dash.length);
-                int ignored = (int) MH_SURFACE_SET_STROKE_DASH.invokeExact(
-                    handle, seg, dash.length, phase);
-            }
+            MemorySegment seg = MemorySegment.ofArray(dash);
+            int ignored = (int) MH_SURFACE_SET_STROKE_DASH.invokeExact(
+                handle, seg, dash.length, phase);
         } catch (Throwable t) {
             throw new RuntimeException("openjfx_skia_surface_set_stroke_dash failed", t);
+        }
+    }
+
+    /**
+     * Sets the sticky shape anti-aliasing for every subsequent fill / stroke
+     * (solid and shader) on {@code surface}. Default is on. Text keeps its own
+     * edging. No-op on an older native lib that lacks the symbol.
+     */
+    public static void surfaceSetAntialias(MemorySegment surface, boolean aa) {
+        if (MH_SURFACE_SET_ANTIALIAS == null) return;
+        try {
+            int ignored = (int) MH_SURFACE_SET_ANTIALIAS.invokeExact(surface, aa ? 1 : 0);
+        } catch (Throwable t) {
+            throw new RuntimeException("openjfx_skia_surface_set_antialias failed", t);
         }
     }
 

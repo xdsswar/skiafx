@@ -402,7 +402,9 @@ openjfx_skia_d3d11_interop_smoke_test_make(uint8_t r, uint8_t g, uint8_t b,
         tex->Release();
         return nullptr;
     }
-    entry->ownerTex = tex; // we own it for the smoke test
+    // register_texture already AddRef'd tex into entry->ownerTex; drop our
+    // CreateTexture2D reference so unregister's single Release frees it.
+    tex->Release();
     return entry;
 }
 

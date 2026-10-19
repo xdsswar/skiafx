@@ -111,7 +111,7 @@ public final class SoftwareGradientCache {
             // Pure (logical) translation only — anything else changes the
             // rasterization and must use the direct path.
             if (!t.isTranslateOrIdentity()) {
-                return bail(0, "non-translate transform " + t);
+                return !VERBOSE ? false : bail(0, "non-translate transform " + t);
             }
 
             float devXf = (float) ((t.getMxt() + x) * psx);
@@ -126,27 +126,33 @@ public final class SoftwareGradientCache {
                     || Math.abs(devYf - devY) > INT_EPS
                     || Math.abs(devWf - devW) > INT_EPS
                     || Math.abs(devHf - devH) > INT_EPS) {
-                return bail(1, "fractional device rect "
+                return !VERBOSE ? false : bail(1, "fractional device rect "
                     + devXf + "," + devYf + " " + devWf + "x" + devHf);
             }
             if (devW <= 0 || devH <= 0
                     || (long) devW * devH < MIN_AREA_PX) {
-                return bail(2, "below min area " + devW + "x" + devH);
+                return !VERBOSE ? false : bail(2, "below min area " + devW + "x" + devH);
             }
 
             List<Stop> stops = g.getStops();
             int n = stops.size();
-            if (n < 2 || n > MAX_STOPS) return bail(3, "stop count " + n);
+            if (n < 2 || n > MAX_STOPS) return !VERBOSE ? false : bail(3, "stop count " + n);
 
             Key key = Key.of(g, stops, x, y, w, h, devW, devH,
                              arcW * psx, arcH * psy, psx, psy);
-            if (key == null) return bail(4, "unsupported gradient type "
+            if (key == null) return !VERBOSE ? false : bail(4, "unsupported gradient type "
                 + g.getClass().getSimpleName());
 
             Entry e = CACHE.get(key);
             if (e == null) {
+                // An entry bigger than the whole budget would be evicted by
+                // its own insertion (and its image freed before the draw
+                // below): fill directly instead.
+                if ((long) devW * devH * 4 > BUDGET_BYTES) {
+                    return !VERBOSE ? false : bail(7, "larger than cache budget");
+                }
                 e = render(g, x, y, w, h, arcW, arcH, devW, devH, psx, psy);
-                if (e == null) return bail(5, "native render failed");
+                if (e == null) return !VERBOSE ? false : bail(5, "native render failed");
                 CACHE.put(key, e);
                 cacheBytes += e.bytes();
                 evictOverBudget();
@@ -165,7 +171,7 @@ public final class SoftwareGradientCache {
                 targetSurface, e.image(), devX, devY, devW, devH) == 0;
         } catch (Throwable th) {
             // Any failure degrades to the direct fill — never break paint.
-            return bail(6, "exception " + th);
+            return !VERBOSE ? false : bail(6, "exception " + th);
         }
     }
 
@@ -243,7 +249,7 @@ public final class SoftwareGradientCache {
                       float x, float y, float w, float h, int devW, int devH,
                       float devArcW, float devArcH, float psx, float psy) {
             int n = stops.size();
-            float[] f = new float[19 + n];
+            float[] f = new float[21 + n];
             int[] colors = new int[n];
             int i = 0;
             // Key on the RESOLVED geometry (proportional endpoints against the
@@ -261,13 +267,17 @@ public final class SoftwareGradientCache {
                 f[i++] = gr.y1 - y;
                 f[i++] = gr.x2 - x;
                 f[i++] = gr.y2 - y;
+                f[i++] = 0f;
             } else if (g instanceof RadialGradient rg) {
                 gr.resolveRadial(rg, x, y, w, h);
                 f[i++] = 2f;
                 f[i++] = gr.cx - x;
                 f[i++] = gr.cy - y;
                 f[i++] = gr.radius;
-                f[i++] = rg.getFocusAngle() * 4096f + rg.getFocusDistance();
+                // Separate slots: angle*4096+distance lost the distance to
+                // float rounding, so an animated focus reused a stale image.
+                f[i++] = rg.getFocusAngle();
+                f[i++] = rg.getFocusDistance();
             } else {
                 return null;
             }
@@ -279,7 +289,8 @@ public final class SoftwareGradientCache {
             f[i++] = devH;
             f[i++] = devArcW;
             f[i++] = devArcH;
-            f[i++] = psx * 4096f + psy;
+            f[i++] = psx;
+            f[i++] = psy;
             for (int s = 0; s < n; s++) {
                 Stop stop = stops.get(s);
                 f[i++] = stop.getOffset();

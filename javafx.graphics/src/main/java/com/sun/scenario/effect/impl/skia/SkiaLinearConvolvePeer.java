@@ -16,6 +16,7 @@ import com.sun.scenario.effect.MotionBlur;
 import com.sun.scenario.effect.impl.EffectPeer;
 import com.sun.scenario.effect.impl.Renderer;
 import com.sun.scenario.effect.impl.prism.PrEffectHelper;
+import com.sun.scenario.effect.impl.state.BoxRenderState;
 import com.sun.scenario.effect.impl.state.LinearConvolveRenderState;
 
 /**
@@ -31,9 +32,13 @@ import com.sun.scenario.effect.impl.state.LinearConvolveRenderState;
  * </ul>
  *
  * <p>Same pass-collapse pattern as {@link SkiaLinearConvolveShadowPeer}:
- * apply the full Skia Blur on pass 0, pass through on subsequent
- * passes. Skia's Blur is separable internally so a single call
- * covers both 1-D passes JFX would otherwise dispatch.</p>
+ * apply the full 2-D Skia Blur on the FIRST pass that reaches this peer
+ * and pass through on the following pass of the same render state.
+ * Upstream skips a no-op pass entirely ({@code getPassPeer} returns null
+ * when {@code isPassNop()}), so the first pass that reaches us is not
+ * necessarily pass 0 — e.g. {@code BoxBlur(1, 10)} only dispatches
+ * pass 1. Skia's Blur is separable internally so a single call covers
+ * both 1-D passes JFX would otherwise dispatch.</p>
  */
 public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState> {
 
@@ -42,6 +47,13 @@ public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState
     // common CSS case (e.g. a fixed-size GaussianBlur).
     private long cachedKey   = -1L;
     private MemorySegment cachedFilter;
+
+    // Render state whose full 2-D blur was already applied by an earlier
+    // pass of the same LinearConvolveCoreEffect.filterImageDatas() call
+    // (a fresh render state is created per call, and both passes resolve
+    // to this same cached peer instance). The next pass for that state
+    // passes through; any other pass does the work itself.
+    private LinearConvolveRenderState workDoneFor;
 
     public SkiaLinearConvolvePeer(FilterContext fctx, Renderer r, String name) {
         super(fctx, r, name);
@@ -70,8 +82,32 @@ public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState
         return f;
     }
 
+    /**
+     * Gaussian sigma for one axis of a linear-convolve render state.
+     * Box kernels: {@code n} box passes of odd width {@code k} have
+     * variance {@code n(k^2-1)/12}. Gaussian kernels: the upstream weights
+     * use {@code sigma = radius / 3} with a kernel of {@code 1 + 2*ceil(r)}
+     * taps, i.e. {@code (ksize - 1) / 6}.
+     */
+    static float sigmaFor(LinearConvolveRenderState rstate, int pass) {
+        final int ks = rstate.getInputKernelSize(pass);
+        if (ks <= 1) {
+            return 0.001f;
+        }
+        if (rstate instanceof BoxRenderState box) {
+            final int n = box.getBlurPasses();
+            if (n <= 0) {
+                return 0.001f;
+            }
+            final int k = (ks - 1) / n + 1;
+            return Math.max(0.001f, (float) Math.sqrt(n * (k * (double) k - 1.0) / 12.0));
+        }
+        return Math.max(0.001f, (ks - 1) / 6.0f);
+    }
+
     @Override
     public void dispose() {
+        workDoneFor = null;
         if (cachedFilter != null) {
             NativeBridge.filterDestroy(cachedFilter);
             cachedFilter = null;
@@ -95,10 +131,15 @@ public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState
             return srcData;
         }
 
-        if (getPass() > 0) {
+        // The 2-D blur was already applied by the earlier pass of this same
+        // render state: pass through. Otherwise (pass 0, or pass 1 after a
+        // skipped no-op pass 0) do the full blur here.
+        if (getPass() > 0 && workDoneFor == rstate) {
+            workDoneFor = null;
             srcData.addref();
             return srcData;
         }
+        workDoneFor = (getPass() == 0) ? rstate : null;
 
         final Rectangle srcBounds = srcData.getTransformedBounds(null);
 
@@ -108,8 +149,7 @@ public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState
             // Directional 1-D motion kernel. Skia's Blur can't do a diagonal
             // kernel, so approximate it as an axis-aligned ellipse by splitting
             // the single sigma along the pass (direction) vector.
-            final int kernelSize = rstate.getInputKernelSize(0);
-            final float sigma = Math.max(0.001f, (kernelSize - 1) / 6.0f);
+            final float sigma = sigmaFor(rstate, 0);
             sigmaX = sigma;
             sigmaY = sigma;
             float[] v = rstate.getPassVector();
@@ -132,10 +172,8 @@ public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState
             // which zeroed sigmaY -> horizontal-only smear. Reading both passes'
             // kernels gives the correct isotropic 2-D blur (and honours an
             // anisotropic BoxBlur where hsize != vsize).
-            final int ksX = rstate.getInputKernelSize(0);
-            final int ksY = rstate.getInputKernelSize(1);
-            sigmaX = Math.max(0.001f, (ksX - 1) / 6.0f);
-            sigmaY = Math.max(0.001f, (ksY - 1) / 6.0f);
+            sigmaX = sigmaFor(rstate, 0);
+            sigmaY = sigmaFor(rstate, 1);
         }
 
         final int padX = (int) Math.ceil(sigmaX * 3f) + 1;
@@ -144,9 +182,19 @@ public class SkiaLinearConvolvePeer extends EffectPeer<LinearConvolveRenderState
             srcBounds.x - padX, srcBounds.y - padY,
             srcBounds.width  + 2 * padX,
             srcBounds.height + 2 * padY);
-        dstBounds.intersectWith(outputClip);
+        if (outputClip != null) {
+            // The kernel reads source pixels up to one pad OUTSIDE the clip,
+            // and only pixels drawn into the layer reach it: cover the clip
+            // grown by the pad (consumers clip the margin). Clipping to the
+            // bare outputClip dropped that fringe -- e.g. InnerShadow's
+            // opaque InvertMask pad never got blurred into the content.
+            Rectangle reach = new Rectangle(outputClip);
+            reach.grow(padX, padY);
+            dstBounds.intersectWith(reach);
+        }
         if (dstBounds.width <= 0 || dstBounds.height <= 0) {
-            return new ImageData(fctx, null, srcBounds);
+            // Empty result: a real cleared drawable, like upstream (never image-less).
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
         SkiaPrDrawable dst = (SkiaPrDrawable)

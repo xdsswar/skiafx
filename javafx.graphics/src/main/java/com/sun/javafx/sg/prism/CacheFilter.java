@@ -143,17 +143,27 @@ public class CacheFilter {
      * Compute the dirty region that must be re-rendered after scrolling
      */
     private Rectangle computeDirtyRegionForTranslate() {
+        // skia-fx: round the exposed strip UP. On HiDPI the logical scroll
+        // delta is fractional (e.g. 1/1.5 px steps); truncating it with (int)
+        // left the last partial logical pixel of the newly exposed strip
+        // unrepainted (stale pixels), while the device-space scroll-copy in
+        // moveCacheBy rounds the device delta. ceil(|delta|) logical, scaled
+        // out with floor/ceil in renderNodeToCache, always covers
+        // round(|delta| * pixelScale) device pixels. Identical for integer
+        // deltas (the stock 100% case).
         if (lastXDelta != 0) {
+            int dx = (int) Math.ceil(Math.abs(lastXDelta));
             if (lastXDelta > 0) {
-                TEMP_RECT.setBounds(0, 0, (int)lastXDelta, cacheBounds.height);
+                TEMP_RECT.setBounds(0, 0, dx, cacheBounds.height);
             } else {
-                TEMP_RECT.setBounds(cacheBounds.width + (int)lastXDelta, 0, -(int)lastXDelta, cacheBounds.height);
+                TEMP_RECT.setBounds(cacheBounds.width - dx, 0, dx, cacheBounds.height);
             }
         } else {
+            int dy = (int) Math.ceil(Math.abs(lastYDelta));
             if (lastYDelta > 0) {
-                TEMP_RECT.setBounds(0, 0, cacheBounds.width, (int)lastYDelta);
+                TEMP_RECT.setBounds(0, 0, cacheBounds.width, dy);
             } else {
-                TEMP_RECT.setBounds(0, cacheBounds.height + (int)lastYDelta, cacheBounds.width, -(int)lastYDelta);
+                TEMP_RECT.setBounds(0, cacheBounds.height - dy, cacheBounds.width, dy);
             }
         }
         return TEMP_RECT;
@@ -736,11 +746,6 @@ public class CacheFilter {
                 TEMP_CACHEFILTER_TRANSFORM.concatenate(xform);
             }
             if (dirtyBounds != null) {
-                TEMP_CONTAINER.deriveWithNewRegion((RectBounds)TEMP_BOUNDS.deriveWithNewBounds(dirtyBounds));
-                // Culling might save us a lot when there's a dirty region
-                node.doPreCulling(TEMP_CONTAINER, TEMP_CACHEFILTER_TRANSFORM, new GeneralTransform3D());
-                g.setHasPreCullingBits(true);
-                g.setClipRectIndex(0);
                 // The cache Graphics carries pixel-scale 1 (the device scale is
                 // baked into TEMP_CACHEFILTER_TRANSFORM above, not set as a
                 // Graphics pixel-scale factor), so SkiaGraphics.syncBeforeDraw
@@ -749,16 +754,25 @@ public class CacheFilter {
                 // here — otherwise the scroll repaint is clipped to 1/scale of
                 // the dirty strip and stale/garbage pixels are left behind on a
                 // 150%/175% monitor. No-op at 100%/scaleHint. (bugs.md NEW-H1)
+                Rectangle deviceDirty = dirtyBounds;
                 if (cachePixelScaleX != 1.0f || cachePixelScaleY != 1.0f) {
                     int cx = (int) Math.floor(dirtyBounds.x * cachePixelScaleX);
                     int cy = (int) Math.floor(dirtyBounds.y * cachePixelScaleY);
                     int cr = (int) Math.ceil((dirtyBounds.x + dirtyBounds.width)  * cachePixelScaleX);
                     int cb = (int) Math.ceil((dirtyBounds.y + dirtyBounds.height) * cachePixelScaleY);
                     TEMP_DIRTY_DEVICE.setBounds(cx, cy, cr - cx, cb - cy);
-                    g.setClipRect(TEMP_DIRTY_DEVICE);
-                } else {
-                    g.setClipRect(dirtyBounds);
+                    deviceDirty = TEMP_DIRTY_DEVICE;
                 }
+                // Culling might save us a lot when there's a dirty region.
+                // doPreCulling maps node bounds through TEMP_CACHEFILTER_TRANSFORM
+                // (which includes the baked pixel scale), so the culling region
+                // must be the DEVICE dirty rect too; the logical rect culled the
+                // newly exposed scroll strip away on HiDPI.
+                TEMP_CONTAINER.deriveWithNewRegion((RectBounds)TEMP_BOUNDS.deriveWithNewBounds(deviceDirty));
+                node.doPreCulling(TEMP_CONTAINER, TEMP_CACHEFILTER_TRANSFORM, new GeneralTransform3D());
+                g.setHasPreCullingBits(true);
+                g.setClipRectIndex(0);
+                g.setClipRect(deviceDirty);
             }
             g.transform(TEMP_CACHEFILTER_TRANSFORM);
             if (node.getClipNode() != null) {

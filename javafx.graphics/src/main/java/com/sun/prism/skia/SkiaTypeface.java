@@ -1,5 +1,6 @@
 package com.sun.prism.skia;
 
+import com.sun.javafx.font.FontFaceIndex;
 import com.sun.javafx.font.FontResource;
 import com.sun.prism.skia.impl.NativeBridge;
 import com.sun.prism.skia.impl.NativeHandles;
@@ -9,6 +10,7 @@ import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
 import java.nio.file.Files;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -25,9 +27,10 @@ import java.util.concurrent.ConcurrentHashMap;
  * registered {@link NativeHandles} cleaner is only a leak safety net —
  * fonts in a UI are few and shared, not a memory concern.</p>
  *
- * <p><b>Known limitation:</b> {@code .ttc} font collections are loaded at
- * face index 0; a non-primary face in a collection would resolve to the
- * wrong glyphs. Callers fall back to glyph-as-path rendering when
+ * <p>Typefaces are keyed by file <em>and</em> face index: in a
+ * {@code .ttc}/{@code .otc} collection (Meiryo UI, MS UI Gothic, Yu Gothic
+ * UI, Cambria Math, ...) glyph ids laid out by Prism are only valid against
+ * the same face. Callers fall back to glyph-as-path rendering when
  * {@code forFontResource} returns {@code null}.</p>
  */
 public final class SkiaTypeface implements AutoCloseable {
@@ -35,7 +38,7 @@ public final class SkiaTypeface implements AutoCloseable {
     /** Cache marker for fonts with no usable file — avoids re-probing. */
     private static final SkiaTypeface UNAVAILABLE = new SkiaTypeface();
 
-    /** One entry per font-file path; see {@link #forFontResource}. */
+    /** One entry per font file + face index ("path#index"). */
     private static final ConcurrentHashMap<String, SkiaTypeface> CACHE =
         new ConcurrentHashMap<>();
 
@@ -68,11 +71,30 @@ public final class SkiaTypeface implements AutoCloseable {
         if (file == null || file.isBlank()) {
             return null;
         }
-        SkiaTypeface tf = CACHE.computeIfAbsent(file, SkiaTypeface::load);
+        int face = FontFaceIndex.of(fr);
+        SkiaTypeface tf = CACHE.computeIfAbsent(file + '#' + face,
+            k -> load(file, face));
         return tf == UNAVAILABLE ? null : tf;
     }
 
-    private static SkiaTypeface load(String file) {
+    private static SkiaTypeface load(String file, int face) {
+        if (NativeBridge.hasTypefaceCreateFromFile()) {
+            // Memory-mapped by the native side: no heap copy of the file.
+            try (Arena arena = Arena.ofConfined()) {
+                byte[] utf8 = file.getBytes(StandardCharsets.UTF_8);
+                MemorySegment path = arena.allocate(utf8.length + 1L); // zeroed: NUL
+                MemorySegment.copy(utf8, 0, path, ValueLayout.JAVA_BYTE, 0L, utf8.length);
+                MemorySegment handle = NativeBridge.typefaceCreateFromFile(path, face);
+                if (handle != null && !handle.equals(MemorySegment.NULL)) {
+                    return new SkiaTypeface(handle.address());
+                }
+            }
+        }
+        // The data path below always loads face 0: never use it for another
+        // face of a collection (wrong outlines) — glyph-as-path instead.
+        if (face != 0) {
+            return UNAVAILABLE;
+        }
         byte[] bytes;
         try {
             bytes = Files.readAllBytes(Path.of(file));

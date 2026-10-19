@@ -83,6 +83,9 @@ std::atomic<bool> gInitOk{false};
 // Written by the bgfx fatal callback (potentially a bgfx-owned thread) and read
 // by the entry points — atomic so that cross-thread write/read isn't UB.
 std::atomic<bool> gBroken{false};
+// Generation of the shared D3D12 device bgfx was initialized on (0 = bgfx not
+// initialized yet). See deviceGone().
+uint32_t gBgfxDeviceGen = 0;
 
 struct RtState {
     void*                   res   = nullptr;  // ID3D12Resource* on the shared device
@@ -209,6 +212,7 @@ bool ensureBgfxInit() {
             "[skia3d] bgfx Direct3D12 init OK on shared device (renderer=%s).\n",
             bgfx::getRendererName(bgfx::getRendererType()));
     }
+    gBgfxDeviceGen = skia_fx::d3d12_device_generation();
     gInitOk = true;
     return true;
 }
@@ -355,6 +359,30 @@ constexpr uint16_t kView3D = 1;
 // zeroed/garbage struct (generation 0) never validates. Render-thread-owned; atomic
 // as defensive future-proofing for the eventual recovery path.
 std::atomic<uint32_t> gDeviceGen{1};
+
+// True when no 3D GPU work may run: the shared device is lost, or it was
+// REPLACED by device-loss recovery after bgfx was initialized on it. bgfx
+// cannot be re-initialized in-process on the shared-device architecture (a
+// second bgfx::init corrupts shared D3D12 state, see docs/3D.md §10.2), so the
+// old bgfx instance is left idle — never touched again — and 3D stays down
+// until restart while 2D keeps rendering on the new device. If bgfx was never
+// initialized before the loss it simply initializes on the new device.
+inline bool deviceGone() {
+    if (skia_fx::d3d12_device_lost()) return true;
+    if (gBgfxDeviceGen != 0 && gBgfxDeviceGen != skia_fx::d3d12_device_generation()) {
+        if (!gBroken.exchange(true)) {
+            // Every resource built on the old bgfx instance is stale: the as*()
+            // guards reject it and destroys skip its (dead) bgfx handles.
+            gDeviceGen.fetch_add(1, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                "[skia3d] GPU device was replaced after a device loss; 3D "
+                "rendering stays disabled until the application restarts "
+                "(2D rendering continues).\n");
+        }
+        return true;
+    }
+    return false;
+}
 
 // Common validity preamble for every native 3D resource struct. `magic` is a
 // distinct per-type tag (set at construction, poisoned to 0 on destroy) so a
@@ -654,7 +682,7 @@ bool ensureShadowResources() {
 #ifdef OPENJFX_SKIA3D_HAVE_SHADERS
     if (gShadow.ready)  return true;
     if (gShadow.failed) return false;
-    if (skia_fx::d3d12_device_lost() || !ensureBgfxInit()) return false;
+    if (deviceGone() || !ensureBgfxInit()) return false;
 
     gShadow.map = bgfx::createTexture2D((uint16_t) kShadowMapSize, (uint16_t) kShadowMapSize,
         false, 1, bgfx::TextureFormat::R32F,
@@ -797,7 +825,7 @@ void freeTargetNow(Target3D* t) {
     // COM ref is always safe (a plain refcount decrement, device-state-independent),
     // so we still do it (and the delete) to avoid leaking on device loss.
     if (t->deviceGen == gDeviceGen.load(std::memory_order_relaxed)
-            && !skia_fx::d3d12_device_lost()) {
+            && !deviceGone()) {
         if (bgfx::isValid(t->fb)) bgfx::destroy(t->fb);
         if (bgfx::isValid(t->colorTex)) bgfx::destroy(t->colorTex);
         if (bgfx::isValid(t->msaaColor)) bgfx::destroy(t->msaaColor);
@@ -839,10 +867,13 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_available(void) {
     // happens lazily on the render thread; if it fails, 3D draws degrade
     // to no-ops rather than crashing.
     //
-    // Opt-in: matches d3dOptedIn (3D needs the D3D12 backend). Enable
-    // with OPENJFX_SKIA_D3D=1.
+    // 3D needs the D3D12 backend, which is the Windows AUTO default: mirror
+    // d3dPreferredUnderAuto() in the 2D bridge (unset or "1" -> D3D12 first;
+    // OPENJFX_SKIA_D3D=0 -> GL first, no 3D). It used to be opt-in from before
+    // D3D12 became the default, which left SCENE3D unsupported out of the box.
+    // The Java side additionally excludes a forced GL / software pipeline.
     const char* v = std::getenv("OPENJFX_SKIA_D3D");
-    return (v && v[0] && v[0] != '0') ? 1 : 0;
+    return (v && v[0] == '0') ? 0 : 1;
 #else
     return 0;
 #endif
@@ -906,7 +937,7 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_mesh_build_int(
         uintptr_t mesh, const float* vb, int32_t vlen, const int32_t* ib, int32_t ilen) {
     auto* m = asMesh(mesh);
     if (!m || !vb || !ib || vlen <= 0 || ilen <= 0) return 0;
-    if (skia_fx::d3d12_device_lost()) return 0;   // no GPU work on a removed device
+    if (deviceGone()) return 0;   // no GPU work on a removed device
     if (!ensurePhongProgram()) return 0;
     if (!indicesInRange(ib, ilen, vlen)) return 0; // reject OOB app-supplied indices
     releaseMeshBuffers(m);                          // mutable-mesh rebuild: free old GPU buffers
@@ -923,7 +954,7 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_mesh_build_short(
         uintptr_t mesh, const float* vb, int32_t vlen, const int16_t* ib, int32_t ilen) {
     auto* m = asMesh(mesh);
     if (!m || !vb || !ib || vlen <= 0 || ilen <= 0) return 0;
-    if (skia_fx::d3d12_device_lost()) return 0;   // no GPU work on a removed device
+    if (deviceGone()) return 0;   // no GPU work on a removed device
     if (!ensurePhongProgram()) return 0;
     const int32_t numVerts = vlen / 9;            // pos3 + uv2 + quat4 = 9 floats/vertex
     for (int32_t i = 0; i < ilen; ++i) {          // reject OOB app-supplied indices
@@ -964,11 +995,13 @@ extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_diffuse(
     if (m) { m->diffuse[0]=r; m->diffuse[1]=g; m->diffuse[2]=b; m->diffuse[3]=a; }
 }
 extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_specular(
-        uintptr_t mat, int32_t set, float r, float g, float b) {
+        uintptr_t mat, int32_t set, float r, float g, float b, float power) {
     auto* m = asMaterial(mat);
     if (m) {
         m->specular[0]=r; m->specular[1]=g; m->specular[2]=b;
-        m->specular[3] = set ? 32.0f : 0.0f; // default Phong exponent
+        // Prism's specularPower (default 32); a = 0 means "no specular".
+        if (!(power > 0.0f) || !std::isfinite(power)) power = 32.0f;
+        m->specular[3] = set ? power : 0.0f;
     }
 }
 // Build an RGBA8 texture with a full box-filtered mipmap chain from tightly-packed
@@ -1070,7 +1103,7 @@ extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_texture(
         int32_t w, int32_t h, uint64_t imageId) {
     auto* m = asMaterial(mat);
     if (!m || typeOrdinal < 0 || typeOrdinal >= MAP_COUNT) return;
-    if (skia_fx::d3d12_device_lost()) return;       // no GPU upload on a removed device
+    if (deviceGone()) return;       // no GPU upload on a removed device
     // Drop whatever this slot held (release shared ref / destroy un-shared).
     releaseMaterialSlot(m, typeOrdinal);
     if (!pixels || w <= 0 || h <= 0) return; // clear-only
@@ -1203,7 +1236,7 @@ extern "C" OPENJFX3D_API void openjfx_skia3d_meshview_destroy(uintptr_t mv) {
 extern "C" OPENJFX3D_API uintptr_t openjfx_skia3d_target_create(int32_t w, int32_t h,
                                                                 int32_t samples) {
     if (w <= 0 || h <= 0) return 0;
-    if (skia_fx::d3d12_device_lost()) return 0; // shared device gone — no 3D GPU work
+    if (deviceGone()) return 0; // shared device gone — no 3D GPU work
     if (!ensureBgfxInit()) return 0;
     if (std::getenv("OPENJFX_SKIA_3D_DIAG")) {
         std::fprintf(stderr, "[skia3d] target_create %dx%d samples=%d (frame %llu)\n",
@@ -1298,7 +1331,7 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_target_begin(uintptr_t target,
         float r, float g, float b, float a) {
     auto* t = asTarget(target);                  // null / wild / destroyed / stale-gen → skip
     if (!t) return -1;
-    if (skia_fx::d3d12_device_lost()) return -1;
+    if (deviceGone()) return -1;
     // Shadow depth pass setup (view kViewShadow, renders before the main view this
     // frame). Best-effort: if it can't be set up the main pass renders unshadowed.
     if (shadowsEnabled() && ensureShadowResources()) {
@@ -1314,7 +1347,7 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_target_begin(uintptr_t target,
 extern "C" OPENJFX3D_API int32_t openjfx_skia3d_target_end(uintptr_t target) {
     auto* t = asTarget(target);                  // null / wild / destroyed / stale-gen → skip
     if (!t) return -1;                           // (don't submit a stray frame() for a dead target)
-    if (skia_fx::d3d12_device_lost()) return -1; // don't submit to a removed device
+    if (deviceGone()) return -1; // don't submit to a removed device
     // First, execute this pulse's 3D draws (submitted to kView3D) into the
     // framebuffer — msaaColor for MSAA, or colorTex(=colorRes) directly otherwise.
     bgfx::frame();
@@ -1348,10 +1381,43 @@ extern "C" OPENJFX3D_API void openjfx_skia3d_notify_present(void) {
     gPresentNum3D.fetch_add(1, std::memory_order_relaxed);
     drainPendingFrees(false);
 }
+// Device-loss recovery, called by the Java side while the shared D3D12 device
+// is lost and BEFORE the 2D bridge rebuilds it. Releases every reference this
+// library holds on the removed device — our D3D12 render-target resources and
+// the bgfx instance (bgfx::shutdown; its fence waits complete at once on a
+// removed device) — because a D3D12 device is a per-adapter singleton: while
+// anything references the removed one, the bridge cannot create a new device
+// on that GPU. bgfx cannot be re-initialized in-process on the shared-device
+// architecture (docs/3D.md 10.2), so 3D stays disabled until restart; every
+// existing 3D resource becomes stale (generation bump) and is rejected by the
+// as*() guards. Idempotent; render thread only.
+extern "C" OPENJFX3D_API int32_t openjfx_skia3d_release_device(void) {
+    static bool released = false;
+    if (released) return 1;
+    if (!gInitOk) return 0;   // bgfx never ran: it initializes on the new device
+    released = true;
+    gBroken = true;
+    gDeviceGen.fetch_add(1, std::memory_order_relaxed);
+    for (Target3D* t : gTargets) {
+        if (t->colorRes) { skia_fx::d3d12_release(t->colorRes); t->colorRes = nullptr; }
+    }
+    for (const PendingFree3D& pf : gPendingFree) {
+        if (pf.t->colorRes) skia_fx::d3d12_release(pf.t->colorRes);
+        delete pf.t;
+    }
+    gPendingFree.clear();
+    if (gRt.res) { skia_fx::d3d12_release(gRt.res); gRt.res = nullptr; }
+    gSharedTex.clear();   // bgfx handles, freed by shutdown
+    bgfx::shutdown();
+    std::fprintf(stderr,
+        "[skia3d] released the lost GPU device; 3D rendering is disabled until "
+        "the application restarts (2D rendering recovers).\n");
+    return 1;
+}
 extern "C" OPENJFX3D_API uintptr_t openjfx_skia3d_target_wrap_image(uintptr_t target) {
     auto* t = asTarget(target);                  // null / wild / destroyed / stale-gen → skip
     if (!t || !t->colorRes) return 0;
-    if (skia_fx::d3d12_device_lost()) return 0;
+    if (deviceGone()) return 0;
     if (std::getenv("OPENJFX_SKIA_3D_DIAG") && (gFrameNum3D % 30 == 0) && gDumpCount < 20) {
         char path[256];
         std::snprintf(path, sizeof(path), "F:/DEV/skia-fx/build/skia3d_dump_f%06llu.png",
@@ -1371,7 +1437,7 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_draw(uintptr_t target, uintptr_t
     Target3D*   t = asTarget(target);
     MeshView3D* v = asMeshView(meshview);
     if (!t || !v || !projView16 || !model16) return -1;
-    if (skia_fx::d3d12_device_lost()) return -1;
+    if (deviceGone()) return -1;
     if (!ensurePhongProgram()) return -1;
     Mesh3D* mesh = asMesh(reinterpret_cast<uintptr_t>(v->mesh)); // revalidate the stored mesh
     if (!mesh || !bgfx::isValid(mesh->vbh) || !bgfx::isValid(mesh->ibh)) return -1;
@@ -1490,7 +1556,7 @@ extern "C" OPENJFX3D_API int32_t openjfx_skia3d_mesh_build_short(uintptr_t, cons
 extern "C" OPENJFX3D_API void openjfx_skia3d_mesh_destroy(uintptr_t) {}
 extern "C" OPENJFX3D_API uintptr_t openjfx_skia3d_material_create(void) { return 0; }
 extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_diffuse(uintptr_t, float, float, float, float) {}
-extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_specular(uintptr_t, int32_t, float, float, float) {}
+extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_specular(uintptr_t, int32_t, float, float, float, float) {}
 extern "C" OPENJFX3D_API void openjfx_skia3d_material_set_texture(uintptr_t, int32_t, const void*, int32_t, int32_t, uint64_t) {}
 extern "C" OPENJFX3D_API int32_t openjfx_skia3d_material_bind_texture(uintptr_t, int32_t, uint64_t) { return 0; }
 extern "C" OPENJFX3D_API void openjfx_skia3d_material_destroy(uintptr_t) {}
@@ -1506,6 +1572,7 @@ extern "C" OPENJFX3D_API void openjfx_skia3d_target_destroy(uintptr_t) {}
 extern "C" OPENJFX3D_API int32_t openjfx_skia3d_target_begin(uintptr_t, float, float, float, float) { return -1; }
 extern "C" OPENJFX3D_API int32_t openjfx_skia3d_target_end(uintptr_t) { return -1; }
 extern "C" OPENJFX3D_API void openjfx_skia3d_notify_present(void) {}
+extern "C" OPENJFX3D_API int32_t openjfx_skia3d_release_device(void) { return 0; }
 extern "C" OPENJFX3D_API uintptr_t openjfx_skia3d_target_wrap_image(uintptr_t) { return 0; }
 extern "C" OPENJFX3D_API int32_t openjfx_skia3d_draw(uintptr_t, uintptr_t, uintptr_t, const float*, const float*, float, float, float) { return -1; }
 

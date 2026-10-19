@@ -41,6 +41,11 @@ public class FloatMap {
     private final FloatBuffer buf;
     private boolean cacheValid;
 
+    // skia-fx: bumped on every mutation through this class so the Skia
+    // DisplacementMap peer can detect content changes without hashing the
+    // whole map each frame (getAccelData is unused on the Skia pipeline).
+    private volatile long modCount;
+
     /**
      * Constructs a new {@code FloatMap} of the given width and height.
      *
@@ -118,6 +123,7 @@ public class FloatMap {
     public void setSample(int x, int y, int band, float sample) {
         buf.put(((x+(y*width))*4)+band, sample);
         cacheValid = false;
+        modCount++;
     }
 
     /**
@@ -131,6 +137,7 @@ public class FloatMap {
         int index = (x+(y*width))*4;
         buf.put(index+0, s0);
         cacheValid = false;
+        modCount++;
     }
 
     /**
@@ -146,6 +153,7 @@ public class FloatMap {
         buf.put(index+0, s0);
         buf.put(index+1, s1);
         cacheValid = false;
+        modCount++;
     }
 
     /**
@@ -163,6 +171,7 @@ public class FloatMap {
         buf.put(index+1, s1);
         buf.put(index+2, s2);
         cacheValid = false;
+        modCount++;
     }
 
     /**
@@ -182,6 +191,17 @@ public class FloatMap {
         buf.put(index+2, s2);
         buf.put(index+3, s3);
         cacheValid = false;
+        modCount++;
+    }
+
+    /**
+     * Returns a counter that changes whenever the map contents are modified
+     * through {@code setSample(s)} or {@code put}. skia-fx addition.
+     *
+     * @return the modification counter
+     */
+    public long getModCount() {
+        return modCount;
     }
 
     public void put(float[] floatBuf) {
@@ -189,6 +209,7 @@ public class FloatMap {
         buf.put(floatBuf);
         buf.rewind();
         cacheValid = false;
+        modCount++;
     }
 
     private Map<FilterContext, Entry> cache;

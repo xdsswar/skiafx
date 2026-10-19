@@ -4,6 +4,9 @@ import com.sun.glass.ui.Screen;
 import com.sun.prism.Image;
 import com.sun.prism.MediaFrame;
 import com.sun.prism.skia.impl.NativeBridge;
+import com.sun.prism.skia.impl.NativeBridge3D;
+import com.sun.prism.skia.impl.NativeHandles;
+import com.sun.prism.skia.impl.SkiaGpu;
 import com.sun.prism.Mesh;
 import com.sun.prism.MeshView;
 import com.sun.prism.PhongMaterial;
@@ -62,6 +65,8 @@ public final class SkiaResourceFactory implements ResourceFactory {
     // serialized onto the render thread by the toolkit.
     private final Map<Image, Texture> clampTexCache  = new WeakHashMap<>();
     private final Map<Image, Texture> repeatTexCache = new WeakHashMap<>();
+    // REPEAT + mipmap (3D material maps), as upstream BaseResourceFactory.
+    private final Map<Image, Texture> mipmapTexCache = new WeakHashMap<>();
 
     // Fail-soft placeholders (1×1 transparent), one per cacheable wrap mode.
     // Lazily created, permanent, shared. Returned (locked) when a real upload
@@ -92,45 +97,78 @@ public final class SkiaResourceFactory implements ResourceFactory {
             attemptDeviceRecovery();
             return false; // skip this pulse; ready again once the device is rebuilt
         }
-        recoveryAttempted = false; // device healthy — re-arm for a future loss
         return true;
     }
 
-    private boolean recoveryInProgress;
-    private boolean recoveryAttempted;
+    /** Earliest time (System.nanoTime) of the next recovery attempt. */
+    private long nextRecoveryAttemptNs;
+    /** Consecutive failed attempts for the current loss (drives the back-off). */
+    private int recoveryFailures;
+    /** Resources already dropped for the current loss. */
+    private boolean resourcesDroppedForLoss;
+    private static volatile boolean recoveryFailureLogged;
 
     /**
-     * Recover from a lost shared D3D12 device (cross-DPI monitor-move TDR / adapter
-     * change). The painter has already stopped all rendering via {@link #isDeviceReady}.
-     * Order matters: drop every GPU resource tied to the OLD context FIRST (while it is
-     * still alive — releasing refs is safe even on a removed device), THEN recreate the
-     * device + GrDirectContext + bgfx. Resources rebuild lazily against the new context
-     * on the next pulse. Best-effort: if the native recover is unavailable the guard
-     * still prevents the crash (the window holds its last frame). Does NOT touch the
-     * normal 2D path — only runs while the device is genuinely lost.
+     * Recover from a lost shared D3D12 device (TDR, driver update/reset, adapter
+     * change on a cross-DPI monitor move). Render thread; called from
+     * {@link #isDeviceReady} while the painter has stopped all rendering.
+     *
+     * <ol>
+     * <li>Drop every GPU resource the factory caches and notify listeners, once
+     *     per loss, while the old context still exists (releasing refs is safe on
+     *     a removed device).</li>
+     * <li>Native recovery: the old context is abandoned, a new device/queue +
+     *     GrDirectContext is built, the device generation is bumped.</li>
+     * <li>On success, publish the new generation: render targets, presentables,
+     *     media and 3D objects from the old device then report lost/invalid and
+     *     the scene graph rebuilds them on the next pulse (Prism's own
+     *     device-reset contract). Image textures hold raster pixels and survive.</li>
+     * </ol>
+     *
+     * A failed attempt (the driver is often still resetting for a few hundred
+     * ms) is retried with back-off — 250 ms doubling to 4 s — for as long as the
+     * device stays lost, so a window never stays frozen after a transient reset.
      */
     private void attemptDeviceRecovery() {
-        if (recoveryInProgress || recoveryAttempted) return;
-        recoveryAttempted = true; // one-shot per loss; re-armed in isDeviceReady
-        recoveryInProgress = true;
+        long now = System.nanoTime();
+        if (now - nextRecoveryAttemptNs < 0) return;
         try {
-            // 1. Notify every resource (textures, cached surfaces, 3D meshes/materials)
-            //    to drop its GPU handle before the old context is destroyed.
-            for (ResourceFactoryListener l :
-                    listeners.toArray(new ResourceFactoryListener[0])) {
-                try { l.factoryReset(); } catch (Throwable ignore) { }
+            if (!resourcesDroppedForLoss) {
+                resourcesDroppedForLoss = true;
+                for (ResourceFactoryListener l :
+                        listeners.toArray(new ResourceFactoryListener[0])) {
+                    try { l.factoryReset(); } catch (Throwable ignore) { }
+                }
+                regionTexture = null;
+                glyphTexture = null;
+                disposeCache(clampTexCache);
+                disposeCache(repeatTexCache);
+                disposeCache(mipmapTexCache);
+                // Run the frees deferred by Cleaners against the OLD context
+                // before it is abandoned.
+                NativeHandles.drainDeferred();
+                // The 3D renderer shares the device; it must let go of it too
+                // or no new device can be created on the same GPU.
+                NativeBridge3D.releaseDevice();
             }
-            regionTexture = null;
-            glyphTexture = null;
-            disposeCache(clampTexCache);
-            disposeCache(repeatTexCache);
-            // 2. Recreate device + GrDirectContext + bgfx and clear the lost flag.
-            NativeBridge.recoverDevice();
+            if (NativeBridge.recoverDevice()) {
+                SkiaGpu.refreshDeviceGeneration();
+                recoveryFailures = 0;
+                resourcesDroppedForLoss = false;
+                nextRecoveryAttemptNs = now;
+                return;
+            }
         } catch (Throwable t) {
-            // Recovery itself must never crash — leave the device lost; the guard
-            // keeps the pipeline from touching it.
-        } finally {
-            recoveryInProgress = false;
+            // Recovery itself must never crash — stay latched and retry later.
+        }
+        recoveryFailures++;
+        long delayMs = Math.min(4000L, 250L << Math.min(4, recoveryFailures - 1));
+        nextRecoveryAttemptNs = now + delayMs * 1_000_000L;
+        if (recoveryFailures == 8 && !recoveryFailureLogged) {
+            recoveryFailureLogged = true;
+            System.getLogger(SkiaResourceFactory.class.getName()).log(
+                System.Logger.Level.WARNING,
+                "GPU device lost and not recovered yet; retrying every 4 s");
         }
     }
 
@@ -139,13 +177,16 @@ public final class SkiaResourceFactory implements ResourceFactory {
         if (disposed) return;
         disposed = true;
         for (ResourceFactoryListener l : listeners) {
-            l.factoryReleased();
+            // Same isolation as attemptDeviceRecovery: one throwing listener
+            // must not skip the rest or abort the cache/placeholder release.
+            try { l.factoryReleased(); } catch (Throwable ignore) { }
         }
         listeners.clear();
         regionTexture = null;
         glyphTexture = null;
         disposeCache(clampTexCache);
         disposeCache(repeatTexCache);
+        disposeCache(mipmapTexCache);
         if (placeholderClamp != null)  { placeholderClamp.dispose();  placeholderClamp = null; }
         if (placeholderRepeat != null) { placeholderRepeat.dispose(); placeholderRepeat = null; }
     }
@@ -210,13 +251,14 @@ public final class SkiaResourceFactory implements ResourceFactory {
         return new SkiaImageTexture(image, wrapMode, useMipmap);
     }
     @Override public Texture createTexture(PixelFormat formatHint, Texture.Usage usageHint, WrapMode wrapMode, int w, int h) {
-        // For the "blank texture, fill in via update" path we'd need a
-        // mutable bitmap-backed image. Phase-1 callers all go through
-        // createTexture(Image, ...).
-        throw todo("createTexture(PixelFormat, Usage, WrapMode, w, h)");
+        return createTexture(formatHint, usageHint, wrapMode, w, h, false);
     }
     @Override public Texture createTexture(PixelFormat formatHint, Texture.Usage usageHint, WrapMode wrapMode, int w, int h, boolean useMipmap) {
-        throw todo("createTexture(PixelFormat, Usage, WrapMode, w, h, mipmap)");
+        // No mutable "blank texture, fill in via update(Buffer)" texture yet
+        // (needed by SwingNode / NGExternalNode). Prism's contract for an
+        // allocation the factory can't satisfy is null, which every caller
+        // handles; throwing here failed the whole paint pass every pulse.
+        return null;
     }
     @Override public Texture createTexture(MediaFrame frame) {
         // Phase-2 (BGRA scaffolding). Validates that MediaFrames flow
@@ -239,10 +281,18 @@ public final class SkiaResourceFactory implements ResourceFactory {
         // NGCanvas) never null-check, so we must always return a drawable
         // texture — never null, never an escaping exception.
 
-        Map<Image, Texture> cache = mip ? null : cacheFor(wrapMode);
+        // CLAMP_NOT_NEEDED is satisfied by a CLAMP_TO_EDGE texture (as
+        // getSharedTexture also treats it), so share the clamp cache instead of
+        // uploading a fresh uncached texture on every call. Created textures in
+        // that bucket are always CLAMP_TO_EDGE, so CLAMP_TO_EDGE callers never
+        // get a texture with a different wrap mode.
+        if (wrapMode == WrapMode.CLAMP_NOT_NEEDED && !mip) {
+            wrapMode = WrapMode.CLAMP_TO_EDGE;
+        }
+        Map<Image, Texture> cache = cacheFor(wrapMode, mip);
         if (disposed || cache == null) {
-            // Factory gone, or a wrap mode / mipmap mode we don't cache
-            // (CLAMP_NOT_NEEDED, mipmapped 3D maps): build fresh, fail-soft.
+            // Factory gone, or a combination upstream doesn't cache either
+            // (it throws for CLAMP+mipmap / CLAMP_TO_ZERO): build fresh, fail-soft.
             Texture fresh = createImageTextureSafe(image, wrapMode, mip);
             return lockOrPlaceholder(fresh, wrapMode);
         }
@@ -262,7 +312,7 @@ public final class SkiaResourceFactory implements ResourceFactory {
             }
         }
         if (tex == null) {
-            tex = createImageTextureSafe(image, wrapMode, false);
+            tex = createImageTextureSafe(image, wrapMode, mip);
             if (tex == null) {
                 // Upload failed (unsupported format / transient native OOM).
                 // Degrade to a transparent placeholder and DON'T cache it, so
@@ -278,22 +328,37 @@ public final class SkiaResourceFactory implements ResourceFactory {
         return tex;
     }
 
-    /** Cache bucket for a wrap mode, or {@code null} if that mode isn't cached. */
-    private Map<Image, Texture> cacheFor(WrapMode wrapMode) {
-        if (wrapMode == WrapMode.CLAMP_TO_EDGE) return clampTexCache;
-        if (wrapMode == WrapMode.REPEAT)        return repeatTexCache;
-        return null; // CLAMP_NOT_NEEDED etc. — created fresh, not cached
+    /** Cache bucket for a wrap/mipmap mode (upstream BaseResourceFactory
+     *  layout), or {@code null} if that combination isn't cached. */
+    private Map<Image, Texture> cacheFor(WrapMode wrapMode, boolean mip) {
+        if (wrapMode == WrapMode.REPEAT)        return mip ? mipmapTexCache : repeatTexCache;
+        if (wrapMode == WrapMode.CLAMP_TO_EDGE) return mip ? null : clampTexCache;
+        return null; // CLAMP_TO_ZERO etc. — created fresh, not cached
     }
+
+    private static volatile boolean imageUploadFailureLogged;
 
     /** Build an image texture, converting any upload failure into {@code null}. */
     private Texture createImageTextureSafe(Image image, WrapMode wrapMode, boolean mip) {
         try {
+            // M18: same budget pre-check as createTexture / upstream
+            // BaseResourceFactory.getCachedTexture (reclaim-on-pressure;
+            // degrades, never fails).
+            SkiaTextureResourcePool.INSTANCE.prepareForAllocation(
+                SkiaTextureResourcePool.INSTANCE.estimateTextureSize(
+                    image.getWidth(), image.getHeight(), image.getPixelFormat()));
             return new SkiaImageTexture(image, wrapMode, mip);
         } catch (Throwable t) {
-            System.getLogger(SkiaResourceFactory.class.getName()).log(
-                System.Logger.Level.WARNING,
-                "Skia image upload failed (" + image.getWidth() + "x" + image.getHeight()
-                + ", " + image.getPixelFormat() + "); drawing a transparent placeholder", t);
+            // Failures are not cached (the next frame retries), so a
+            // persistent one would log every frame: report the first only.
+            if (!imageUploadFailureLogged) {
+                imageUploadFailureLogged = true;
+                System.getLogger(SkiaResourceFactory.class.getName()).log(
+                    System.Logger.Level.WARNING,
+                    "Skia image upload failed (" + image.getWidth() + "x" + image.getHeight()
+                    + ", " + image.getPixelFormat() + "); drawing a transparent placeholder"
+                    + " (further failures are not logged)", t);
+            }
             return null;
         }
     }
@@ -341,8 +406,27 @@ public final class SkiaResourceFactory implements ResourceFactory {
         // never fails). The authoritative accounting is in SkiaTextureBase's ctor.
         SkiaTextureResourcePool.INSTANCE.prepareForAllocation(
             SkiaTextureResourcePool.INSTANCE.estimateRTTextureSize(width, height, false));
-        return new SkiaRTTexture(this, screen, width, height, wrapMode, msaa);
+        try {
+            return new SkiaRTTexture(this, screen, width, height, wrapMode, msaa);
+        } catch (IllegalStateException | IllegalArgumentException e) {
+            // Native surface allocation failed (GPU and raster both refused, e.g.
+            // out of memory / oversized). Match upstream D3D/ES2ResourceFactory:
+            // return null — Prism callers (UploadingPainter, NGCanvas, CacheFilter,
+            // snapshot) already treat null as "no RT this frame" and degrade.
+            if (!rtAllocFailureLogged) {
+                rtAllocFailureLogged = true;
+                System.getLogger(SkiaResourceFactory.class.getName()).log(
+                    System.Logger.Level.WARNING,
+                    "Skia RT allocation failed (" + width + "x" + height
+                    + "); returning null (further failures not logged)", e);
+            }
+            return null;
+        }
     }
+
+    // One-shot: an RT allocation failure under memory pressure can repeat every
+    // pulse; log the first only (no console spam).
+    private static volatile boolean rtAllocFailureLogged;
 
     @Override public Presentable createPresentable(PresentableState pState) {
         return new SkiaPresentable(this, pState);

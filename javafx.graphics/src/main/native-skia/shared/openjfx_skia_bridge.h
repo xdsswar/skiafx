@@ -112,7 +112,16 @@ OPENJFX_API int32_t openjfx_skia_surface_present_window(uintptr_t handle, int32_
  * Windows only.
  */
 OPENJFX_API uintptr_t openjfx_skia_surface_create_swap_chain_d3d(
-    uintptr_t hwnd, int32_t width, int32_t height);
+    uintptr_t hwnd, int32_t width, int32_t height, int32_t stretch);
+
+/**
+ * Sets the colour (0xRRGGBB, opaque) DWM shows where the swap chain's last
+ * presented buffer does not cover the client area, i.e. the strip a window
+ * has grown by during a live resize before the next frame lands. Use the
+ * scene fill. Returns 0 on success. Windows only.
+ */
+OPENJFX_API int32_t openjfx_skia_surface_set_background_d3d(
+    uintptr_t handle, int32_t rgb);
 
 /**
  * Flushes the GrDirectContext and presents the swap chain. With
@@ -342,6 +351,34 @@ OPENJFX_API int32_t openjfx_skia_surface_stroke_path(
 OPENJFX_API uintptr_t openjfx_skia_typeface_create_from_data(
     const void* data, int32_t length);
 
+/**
+ * Device-loss recovery (D3D12): replaces a removed device with a new one and
+ * rebuilds the shared GrDirectContext. Returns 1 when the device is usable,
+ * 0 when it could not be rebuilt yet (retry later). Render thread only.
+ */
+OPENJFX_API int32_t openjfx_skia_device_recover(void);
+
+/** Generation of the shared GPU device; bumped by each successful recovery. */
+OPENJFX_API int32_t openjfx_skia_device_generation(void);
+
+/** TEST ONLY: removes the D3D12 device (as a TDR would). 0 on success. */
+OPENJFX_API int32_t openjfx_skia_test_remove_device(void);
+
+/**
+ * Marks the following draw_glyphs calls on {@code handle} as eligible for
+ * LCD (ClearType) edging (1) or not (0). Set by Java around a text run that
+ * meets Prism's LCD conditions; reset afterwards. Returns 0 on success.
+ */
+OPENJFX_API int32_t openjfx_skia_surface_set_lcd_text(uintptr_t handle, int32_t lcd);
+
+/**
+ * Creates a typeface from a font file (UTF-8 path, memory-mapped) at
+ * {@code faceIndex} within a .ttc/.otc collection (0 for single fonts).
+ * Returns 0 on failure.
+ */
+OPENJFX_API uintptr_t openjfx_skia_typeface_create_from_file(
+    const char* utf8Path, int32_t faceIndex);
+
 /** Releases a typeface. Safe to call with a 0 handle (no-op). */
 OPENJFX_API void openjfx_skia_typeface_destroy(uintptr_t handle);
 
@@ -567,13 +604,23 @@ OPENJFX_API int32_t openjfx_skia_surface_save_layer_with_filter(
 
 /*
  * Sets (or clears) the sticky stroke dash pattern on the surface state.
- * `intervals` holds on/off lengths in user space; `count` must be >= 2 (a
- * count < 2 or null pointer clears the dash → solid strokes). The pattern is
- * applied by configureStroke / configureStrokeShader to subsequent strokes
- * and persists until changed. Fills are unaffected.
+ * `intervals` holds on/off lengths in user space; `count` >= 1 (an odd
+ * pattern is repeated once, BasicStroke-style: [5] = 5 on / 5 off). A count
+ * < 1, null pointer, or an invalid pattern (negative / all-zero) clears the
+ * dash → solid strokes. The SkDashPathEffect is built once here (an unchanged
+ * pattern is a no-op) and shared by subsequent strokes until changed. Fills
+ * are unaffected.
  */
 OPENJFX_API int32_t openjfx_skia_surface_set_stroke_dash(
     uintptr_t handle, const float* intervals, int32_t count, float phase);
+
+/**
+ * Sticky per-surface shape anti-aliasing (aa != 0 → on, the default) used by
+ * every fill/stroke draw (solid and shader). Text keeps its own edging.
+ * Returns 0 on success, -1 for an invalid handle.
+ */
+OPENJFX_API int32_t openjfx_skia_surface_set_antialias(
+    uintptr_t handle, int32_t aa);
 
 /* ===========================================================================
  * SkShader lifecycle.
@@ -635,6 +682,22 @@ OPENJFX_API uintptr_t openjfx_skia_shader_create_linear_gradient_lm(
     float m10, float m11, float m12);
 
 OPENJFX_API uintptr_t openjfx_skia_shader_create_radial_gradient_lm(
+    float cx, float cy, float radius,
+    int32_t nStops,
+    const float* positions,
+    const uint32_t* colorsRGBA,
+    int32_t tileMode,
+    float m00, float m01, float m02,
+    float m10, float m11, float m12);
+
+/* Focal radial gradient (Prism RadialGradient with focusAngle/focusDistance):
+ * a two-point conical gradient from the focus point (fx,fy) at radius 0 to
+ * the circle (cx,cy,radius). The focus is pulled inside the circle (at most
+ * 0.99 * radius from the centre, like Prism) so the result is never a cone.
+ * Same colour packing / premultiplied interpolation / local matrix as
+ * openjfx_skia_shader_create_radial_gradient_lm; returns 0 when degenerate. */
+OPENJFX_API uintptr_t openjfx_skia_shader_create_focal_radial_gradient_lm(
+    float fx, float fy,
     float cx, float cy, float radius,
     int32_t nStops,
     const float* positions,
@@ -1026,6 +1089,19 @@ OPENJFX_API int32_t openjfx_skia_surface_draw_image_rect(
     uintptr_t imageHandle,
     float sx, float sy, float sw, float sh,
     float dx, float dy, float dw, float dh);
+
+/**
+ * draw_image_rect with a paint colour (r,g,b,a 0..255). An alpha-only
+ * (kAlpha_8 / BYTE_ALPHA) image is drawn as a coverage mask tinted with the
+ * colour — Prism's mask-texture semantics; a colour image is modulated by
+ * the colour's alpha only. Sticky blend / extra-alpha / sampling apply.
+ */
+OPENJFX_API int32_t openjfx_skia_surface_draw_image_rect_tinted(
+    uintptr_t surfaceHandle,
+    uintptr_t imageHandle,
+    float sx, float sy, float sw, float sh,
+    float dx, float dy, float dw, float dh,
+    uint8_t r, uint8_t g, uint8_t b, uint8_t a);
 
 /**
  * Composites a raw BGRA8888 (premultiplied, top-down) pixel buffer onto the

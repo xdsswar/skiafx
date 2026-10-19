@@ -47,7 +47,8 @@ public class NGSubScene extends NGNode {
     // SubScene buffer) is gone — our MSAA resolve happens inside the bgfx 3D target
     // (Target3D), so the RTT we composite is already single-sample + anti-aliased.
     private NGNode root = null;
-    private boolean renderSG = true;
+    // volatile: also set from the FX thread by setMsaaSamples (see msaaSamples).
+    private volatile boolean renderSG = true;
     // Depth and msaa are immutable states
     private final boolean depthBuffer;
     private final boolean msaa;

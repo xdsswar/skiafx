@@ -303,16 +303,43 @@ public class NativeLibLoader {
         return plat + "-" + a;
     }
 
-    /** Per-classloader cache of the located natives classifier jar (null = none found). */
-    private static final Map<ClassLoader, Path> nativesJarCache = new HashMap<>();
+    /**
+     * Cache key identifying the caller's module / jar. NOT the ClassLoader:
+     * on a plain {@code --module-path} launch every javafx.* module shares the
+     * application class loader, so a per-loader cache would hand the first
+     * module's (e.g. javafx.graphics') classifier jar and checksum manifest to
+     * every later module (javafx.media, javafx.web, ...). Named module -> that
+     * {@link Module}; otherwise the code source location; otherwise the
+     * loader (or the caller class when bootstrap-loaded).
+     */
+    private static Object cacheKey(Class caller) {
+        Module m = caller.getModule();
+        if (m != null && m.isNamed()) {
+            return m;
+        }
+        try {
+            var pd = caller.getProtectionDomain();
+            var cs = pd == null ? null : pd.getCodeSource();
+            if (cs != null && cs.getLocation() != null) {
+                return cs.getLocation().toString();
+            }
+        } catch (SecurityException ignore) {
+            // fall through to the loader key
+        }
+        ClassLoader cl = caller.getClassLoader();
+        return cl != null ? cl : caller;
+    }
+
+    /** Per-module cache of the located natives classifier jar (null = none found). */
+    private static final Map<Object, Path> nativesJarCache = new HashMap<>();
 
     private static synchronized Path locateNativesJar(Class caller) {
-        ClassLoader cl = caller.getClassLoader();
-        if (nativesJarCache.containsKey(cl)) {
-            return nativesJarCache.get(cl);
+        Object key = cacheKey(caller);
+        if (nativesJarCache.containsKey(key)) {
+            return nativesJarCache.get(key);
         }
         Path found = findNativesJar(caller);
-        nativesJarCache.put(cl, found);
+        nativesJarCache.put(key, found);
         return found;
     }
 
@@ -526,12 +553,12 @@ public class NativeLibLoader {
     }
 
     /**
-     * Per-classloader cache of parsed native-lib SHA-256 manifests
+     * Per-module cache (see {@link #cacheKey}) of parsed native-lib SHA-256 manifests
      * ({@code /checksums.properties}). Maps a jar-root resource path
      * (e.g. {@code "/glass.dll"}) to its hex-encoded SHA-256. The map is
      * empty when the caller's jar ships no manifest.
      */
-    private static final Map<ClassLoader, Map<String, String>> manifestCache = new HashMap<>();
+    private static final Map<Object, Map<String, String>> manifestCache = new HashMap<>();
 
     /**
      * Reads (and caches) the {@code /checksums.properties} manifest
@@ -544,8 +571,8 @@ public class NativeLibLoader {
      *         empty if no manifest is present
      */
     private static synchronized Map<String, String> checksumManifest(Class caller) {
-        ClassLoader cl = caller.getClassLoader();
-        Map<String, String> cached = manifestCache.get(cl);
+        Object cacheKey = cacheKey(caller);
+        Map<String, String> cached = manifestCache.get(cacheKey);
         if (cached != null) {
             return cached;
         }
@@ -567,7 +594,7 @@ public class NativeLibLoader {
                 System.err.println("WARNING: failed reading checksums.properties: " + ex);
             }
         }
-        manifestCache.put(cl, manifest);
+        manifestCache.put(cacheKey, manifest);
         return manifest;
     }
 

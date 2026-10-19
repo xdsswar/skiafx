@@ -3,7 +3,9 @@ package com.sun.prism.skia;
 import com.sun.glass.ui.Screen;
 import com.sun.javafx.font.*;
 import com.sun.javafx.geom.RectBounds;
+import com.sun.javafx.geom.Ellipse2D;
 import com.sun.javafx.geom.Rectangle;
+import com.sun.javafx.geom.RoundRectangle2D;
 import com.sun.javafx.geom.Shape;
 import com.sun.javafx.geom.transform.BaseTransform;
 import com.sun.javafx.geom.transform.GeneralTransform3D;
@@ -11,6 +13,7 @@ import com.sun.javafx.scene.text.GlyphList;
 import com.sun.javafx.sg.prism.NGLightBase;
 import com.sun.prism.BasicStroke;
 import com.sun.prism.CompositeMode;
+import com.sun.prism.PixelFormat;
 import com.sun.prism.RTTexture;
 import com.sun.prism.ReadbackGraphics;
 import com.sun.prism.RenderTarget;
@@ -31,6 +34,7 @@ import com.sun.prism.skia.impl.SoftwareGradientCache;
 
 import java.lang.foreign.MemorySegment;
 import java.lang.foreign.ValueLayout;
+import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -68,7 +72,17 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
             throw new IllegalStateException("RTTexture is disposed; cannot create Graphics");
         }
         this.surface = MemorySegment.ofAddress(this.surfaceHandle);
+        // The native dash is sticky per SURFACE, which outlives this Graphics
+        // (a pooled / reused RT, a presentable across frames). A new Graphics
+        // starts with BaseGraphics' solid default stroke, so clear any dash a
+        // previous Graphics left behind or the first undashed stroke inherits it.
+        NativeBridge.surfaceSetStrokeDash(this.surface, null, 0f);
+        // Same for the sticky antialias flag (Shape.setSmooth(false)).
+        NativeBridge.surfaceSetAntialias(this.surface, true);
     }
+
+    /** Antialias flag last pushed to the surface (native default: on). */
+    private boolean lastAntialias = true;
 
     /** Cached native handle wrapper. Stable for the lifetime of this Graphics. */
     private MemorySegment handle() {
@@ -165,6 +179,14 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
             }
         }
 
+        // Shape.setSmooth(false) reaches us as setAntialiasedShape(false);
+        // pushed only when it changes, so the common all-AA frame pays nothing.
+        boolean aa = isAntialiasedShape();
+        if (aa != lastAntialias) {
+            NativeBridge.surfaceSetAntialias(surface, aa);
+            lastAntialias = aa;
+        }
+
         NativeBridge.surfaceBeginDraw(surface,
             (float) t.getMxx() * sx, (float) t.getMxy() * sx, (float) t.getMxt() * sx,
             (float) t.getMyx() * sy, (float) t.getMyy() * sy, (float) t.getMyt() * sy,
@@ -207,14 +229,17 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         // black boxes behind WebView/Canvas form inputs. Going through
         // syncBeforeDraw/restoreAfterDraw also honors the current transform
         // and clip, which the bare fillRect ignored.
-        int x = (int) Math.floor(Math.min(x1, x2));
-        int y = (int) Math.floor(Math.min(y1, y2));
-        int w = (int) (Math.ceil(Math.max(x1, x2)) - Math.floor(Math.min(x1, x2)));
-        int h = (int) (Math.ceil(Math.max(y1, y2)) - Math.floor(Math.min(y1, y2)));
+        // Exact float quad, like Prism's SRC-mode fill: widening to whole
+        // logical units cleared up to one extra logical pixel around
+        // fractional / HiDPI WebView clearRect()s.
+        float x = Math.min(x1, x2);
+        float y = Math.min(y1, y2);
+        float w = Math.abs(x2 - x1);
+        float h = Math.abs(y2 - y1);
         syncBeforeDraw(NativeBridge.BLEND_CLEAR);
         try {
             // Color is ignored under CLEAR; the rect is written as transparent.
-            NativeBridge.surfaceFillRect(handle(), x, y, w, h, 0, 0, 0, 0);
+            NativeBridge.surfaceFillRoundRect(handle(), x, y, w, h, 0f, 0f, 0, 0, 0, 0);
         } finally { restoreAfterDraw(); }
     }
 
@@ -222,6 +247,9 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
 
     @Override
     public void fillRect(float x, float y, float width, float height) {
+        // Prism draws nothing for an empty/negative size (Skia would sort the
+        // rect and paint it extending left/up). Also rejects NaN.
+        if (!(width > 0 && height > 0)) return;
         Paint p = getPaint();
         syncBeforeDraw();
         try {
@@ -241,6 +269,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 // from the cached-image blit instead. Falls through to the
                 // direct fill whenever ineligible; GPU tiers skip entirely.
                 if (p instanceof Gradient grad && SkiaGpu.isResolvedSoftware()
+                        && !usesNodeBounds(p) && isAntialiasedShape()
                         && SoftwareGradientCache.tryFill(surface,
                             getTransformNoClone(),
                             getPixelScaleFactorX(), getPixelScaleFactorY(),
@@ -264,6 +293,9 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
 
     @Override
     public void fillRoundRect(float x, float y, float w, float h, float arcw, float arch) {
+        // Prism draws nothing for an empty/negative size (Skia would sort the
+        // rect and paint it extending left/up). Also rejects NaN.
+        if (!(w > 0 && h > 0)) return;
         Paint p = getPaint();
         syncBeforeDraw();
         try {
@@ -274,6 +306,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 // Software tier: see fillRect — cached blit for repeated
                 // large gradient fills (CSS rounded backgrounds).
                 if (p instanceof Gradient grad && SkiaGpu.isResolvedSoftware()
+                        && !usesNodeBounds(p) && isAntialiasedShape()
                         && SoftwareGradientCache.tryFill(surface,
                             getTransformNoClone(),
                             getPixelScaleFactorX(), getPixelScaleFactorY(),
@@ -291,6 +324,9 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
 
     @Override
     public void fillEllipse(float x, float y, float w, float h) {
+        // Prism draws nothing for an empty/negative size (Skia would sort the
+        // rect and paint it extending left/up). Also rejects NaN.
+        if (!(w > 0 && h > 0)) return;
         Paint p = getPaint();
         syncBeforeDraw();
         try {
@@ -309,6 +345,15 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
 
     @Override
     public void fill(Shape shape) {
+        fillShape(shape, shape);
+    }
+
+    /**
+     * Fills {@code shape}; a proportional non-Color paint resolves against the
+     * bounds of {@code paintShape} (or the node bounds), which differs from
+     * {@code shape} only for INSIDE/OUTSIDE strokes filled as outlines.
+     */
+    private void fillShape(Shape shape, Shape paintShape) {
         Paint p = getPaint();
         syncBeforeDraw();
         try (PathEncoder.Encoded path = PathEncoder.encode(shape)) {
@@ -319,7 +364,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     path.fillRule,
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                float[] b = boundsOf(path);
+                float[] b = boundsOf(paintShape);
                 try (SkiaShaders.Handle s = shaderFor(p, b[0], b[1], b[2], b[3])) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceFillPathShader(handle(),
@@ -363,6 +408,10 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     public void draw(Shape shape) {
         Paint paint = getPaint();
         BasicStroke st = currentStroke();
+        if (st.getType() != BasicStroke.TYPE_CENTERED) {
+            drawTypedStroke(shape, st);
+            return;
+        }
         syncBeforeDraw();
         try (PathEncoder.Encoded path = PathEncoder.encode(shape)) {
             if (paint instanceof Color c) {
@@ -373,7 +422,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     st.getLineWidth(), st.getEndCap(), st.getLineJoin(), st.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
-                float[] b = boundsOf(path);
+                float[] b = boundsOf(shape);
                 try (SkiaShaders.Handle s = shaderFor(paint, b[0], b[1], b[2], b[3])) {
                     if (!s.isValid()) return;
                     NativeBridge.surfaceStrokePathShader(handle(),
@@ -390,11 +439,18 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     @Override public void drawLine(float x1, float y1, float x2, float y2) {
         Paint paint = getPaint();
         BasicStroke s = currentStroke();
+        // A line has no interior: INSIDE draws nothing and OUTSIDE is a
+        // centered stroke of twice the width (BaseShaderGraphics.drawLine).
+        if (s.getType() == BasicStroke.TYPE_INNER) {
+            return;
+        }
+        float lw = (s.getType() == BasicStroke.TYPE_OUTER)
+            ? s.getLineWidth() * 2f : s.getLineWidth();
         syncBeforeDraw();
         try {
             if (paint instanceof Color c) {
                 NativeBridge.surfaceStrokeLine(handle(), x1, y1, x2, y2,
-                    s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
+                    lw, s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
                     c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
             } else {
                 try (SkiaShaders.Handle sh = shaderFor(paint,
@@ -402,7 +458,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                         Math.abs(x2 - x1), Math.abs(y2 - y1))) {
                     if (!sh.isValid()) return;
                     NativeBridge.surfaceStrokeLineShader(handle(), x1, y1, x2, y2,
-                        s.getLineWidth(), s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
+                        lw, s.getEndCap(), s.getLineJoin(), s.getMiterLimit(),
                         sh.shader, 0xFF);
                 }
             }
@@ -410,8 +466,15 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     }
 
     @Override public void drawRect(float x, float y, float w, float h) {
+        if (w < 0 || h < 0) return; // Prism: negative size strokes nothing
         Paint paint = getPaint();
         BasicStroke s = currentStroke();
+        if (s.getType() != BasicStroke.TYPE_CENTERED) {
+            RoundRectangle2D rr = scratchRRect();
+            rr.setRoundRect(x, y, w, h, 0f, 0f);
+            drawTypedStroke(rr, s);
+            return;
+        }
         syncBeforeDraw();
         try {
             if (paint instanceof Color c) {
@@ -430,8 +493,15 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     }
 
     @Override public void drawRoundRect(float x, float y, float w, float h, float arcw, float arch) {
+        if (w < 0 || h < 0) return; // Prism: negative size strokes nothing
         Paint paint = getPaint();
         BasicStroke s = currentStroke();
+        if (s.getType() != BasicStroke.TYPE_CENTERED) {
+            RoundRectangle2D rr = scratchRRect();
+            rr.setRoundRect(x, y, w, h, arcw, arch);
+            drawTypedStroke(rr, s);
+            return;
+        }
         syncBeforeDraw();
         try {
             if (paint instanceof Color c) {
@@ -451,8 +521,15 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     }
 
     @Override public void drawEllipse(float x, float y, float w, float h) {
+        if (w < 0 || h < 0) return; // Prism: negative size strokes nothing
         Paint paint = getPaint();
         BasicStroke s = currentStroke();
+        if (s.getType() != BasicStroke.TYPE_CENTERED) {
+            if (scratchEllipse == null) scratchEllipse = new Ellipse2D();
+            scratchEllipse.setFrame(x, y, w, h);
+            drawTypedStroke(scratchEllipse, s);
+            return;
+        }
         syncBeforeDraw();
         try {
             if (paint instanceof Color c) {
@@ -468,6 +545,26 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 }
             }
         } finally { restoreAfterDraw(); }
+    }
+
+    // Lazily created geometry for the (uncommon) INSIDE/OUTSIDE stroke path.
+    private RoundRectangle2D scratchRRect;
+    private Ellipse2D scratchEllipse;
+
+    private RoundRectangle2D scratchRRect() {
+        if (scratchRRect == null) scratchRRect = new RoundRectangle2D();
+        return scratchRRect;
+    }
+
+    /**
+     * INSIDE / OUTSIDE strokes. Skia only strokes centered, so fill the stroke
+     * outline Prism computes ({@link BasicStroke#createStrokedShape} clips the
+     * centered stroke to the inside / outside of the shape). A proportional
+     * paint still resolves against the original shape's bounds, as in
+     * {@code BaseGraphics.draw}.
+     */
+    private void drawTypedStroke(Shape shape, BasicStroke st) {
+        fillShape(st.createStrokedShape(shape), shape);
     }
 
     // ---- Text -------------------------------------------------------------
@@ -525,8 +622,12 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         // don't need an explicit zero-fill, but skip[] must start
         // false because the for-loop only sets it on the failure
         // branch — clear it explicitly.)
-        java.util.Arrays.fill(skip, 0, n, false);
+        Arrays.fill(skip, 0, n, false);
 
+        // Consecutive glyphs almost always share a font: reuse the last
+        // typeface lookup instead of a map lookup per glyph.
+        FontResource lastFr = null;
+        SkiaTypeface lastFace = null;
         for (int i = 0; i < n; i++) {
             int code = gl.getGlyphCode(i);
             FontStrike ps;
@@ -553,7 +654,12 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     || !Float.isFinite(gx) || !Float.isFinite(gy)) {
                 skip[i] = true;
             } else {
-                faces[i] = SkiaTypeface.forFontResource(ps.getFontResource());
+                FontResource fres = ps.getFontResource();
+                if (fres != lastFr) {
+                    lastFr = fres;
+                    lastFace = SkiaTypeface.forFontResource(fres);
+                }
+                faces[i] = lastFace;
             }
         }
 
@@ -599,9 +705,29 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         }
         final MemorySegment shaderSeg = fillShader != null ? fillShader.shader : null;
 
-        syncBeforeDraw();
+        // LCD (ClearType) text under exactly Prism's conditions
+        // (BaseShaderGraphics.drawString): an LCD strike (Modena's
+        // -fx-font-smoothing-type: lcd), SRC_OVER, an opaque Color paint, a
+        // 2D transform — plus no group extra-alpha, since LCD coverage can't
+        // be faded. Native side additionally requires an LCD-geometry
+        // (on-screen, opaque) surface, else Skia renders grayscale.
+        final boolean lcd = strike.getAAMode() == FontResource.AA_LCD
+            && paint instanceof Color pc && pc.getAlpha() >= 1f
+            && getCompositeMode() == CompositeMode.SRC_OVER
+            && getExtraAlpha() >= 1f
+            && getTransformNoClone().is2D();
+
+        try {
+            syncBeforeDraw();
+        } catch (RuntimeException | Error e) {
+            if (fillShader != null) fillShader.close(); // else leaked
+            Arrays.fill(faces, 0, n, null);
+            Arrays.fill(pstr, 0, n, null);
+            throw e;
+        }
         try {
             MemorySegment surface = handle();
+            if (lcd) NativeBridge.surfaceSetLcdText(surface, true);
             int i = 0;
             while (i < n) {
                 if (skip[i]) { i++; continue; }
@@ -648,8 +774,13 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 i = j;
             }
         } finally {
+            if (lcd) NativeBridge.surfaceSetLcdText(handle(), false);
             restoreAfterDraw();
             if (fillShader != null) fillShader.close();
+            // The pooled scratch outlives the call: drop the references so
+            // the longest run's strikes/typefaces can be collected.
+            Arrays.fill(faces, 0, n, null);
+            Arrays.fill(pstr, 0, n, null);
         }
     }
 
@@ -746,43 +877,78 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     public void blit(RTTexture srcTex, RTTexture dstTex,
                      int srcX0, int srcY0, int srcX1, int srcY1,
                      int dstX0, int dstY0, int dstX1, int dstY1) {
-        // Source surface → snapshot SkImage → drawImage on dst surface.
-        // Phase-1 path: read pixels from src, upload as SkImage to dst,
-        // draw, dispose. Slow but correct. Faster bridge entry can come
-        // when this is a hotspot.
+        // Prism's blit is a raw framebuffer copy from srcTex into dstTex
+        // (BaseShaderGraphics retargets to dstTex): physical pixel coords, no
+        // transform, no clip, no extra alpha, replace not blend. A null dstTex
+        // means this Graphics' own target. UploadingPainter relies on dstTex
+        // being honoured to resolve its scene RT into the readback RT.
         if (!(srcTex instanceof SkiaRTTexture src)) {
             throw new IllegalArgumentException(
                 "blit source must be a SkiaRTTexture; got " + srcTex.getClass().getSimpleName());
         }
-        // For dst, this Graphics IS the surface — ignore dstTex.
+        SkiaRTTexture dst;
+        if (dstTex == null) {
+            dst = target;
+        } else if (dstTex instanceof SkiaRTTexture d) {
+            dst = d;
+        } else {
+            throw new IllegalArgumentException(
+                "blit destination must be a SkiaRTTexture; got " + dstTex.getClass().getSimpleName());
+        }
         long srcHandle = src.getNativeHandle();
-        if (srcHandle == 0L) throw new IllegalStateException("Source RTTexture disposed");
-
-        // Read source rect via the existing readPixels path.
+        long dstHandle = dst.getNativeHandle();
+        if (srcHandle == 0L || dstHandle == 0L) {
+            return; // disposed source or destination: drop the copy (H1)
+        }
         int sw = srcX1 - srcX0;
         int sh = srcY1 - srcY0;
         if (sw <= 0 || sh <= 0) return;
 
-        // Read into the pooled per-thread scratch buffer (grown monotonically,
-        // never freed) rather than a fresh confined Arena per blit. blit runs
-        // on the render thread, where a per-call sw*sh*4 malloc/free is needless
-        // churn. The raster image is created, drawn, and destroyed before this
-        // thread's scratch buffer can next be reused, so sharing it is safe.
-        MemorySegment buf = SkiaRTTexture.ensureReadBuffer((long) sw * sh * 4);
-        int rc = NativeBridge.surfaceReadPixels(
-            MemorySegment.ofAddress(srcHandle), buf, srcX0, srcY0, sw, sh);
-        if (rc != 0) return;
+        MemorySegment dstSeg = (dstHandle == surfaceHandle)
+            ? surface : MemorySegment.ofAddress(dstHandle);
+        if (srcHandle == dstHandle) {
+            blitSelf(dstSeg, srcX0, srcY0, sw, sh, dstX0, dstY0, dstX1, dstY1);
+            return;
+        }
+        // Surface-to-surface draw: a GPU copy on GPU tiers, no CPU readback.
+        NativeBridge.surfaceBeginDraw(dstSeg,
+            1f, 0f, 0f, 0f, 1f, 0f,
+            0, 0, 0, 0, false,
+            NativeBridge.BLEND_SRC, 1f);
+        try {
+            NativeBridge.surfaceDrawSurface(dstSeg, MemorySegment.ofAddress(srcHandle),
+                srcX0, srcY0, sw, sh,
+                dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0);
+        } finally {
+            NativeBridge.surfaceEndDraw(dstSeg);
+        }
+    }
 
+    /**
+     * Blit within one surface. Drawing a surface onto itself is undefined, so
+     * read the source rect back into the pooled per-thread scratch buffer
+     * (grown monotonically, never freed) and draw it as a raster image.
+     */
+    private void blitSelf(MemorySegment surf, int srcX0, int srcY0, int sw, int sh,
+                          int dstX0, int dstY0, int dstX1, int dstY1) {
+        MemorySegment buf = SkiaRTTexture.ensureReadBuffer((long) sw * sh * 4);
+        int rc = NativeBridge.surfaceReadPixels(surf, buf, srcX0, srcY0, sw, sh);
+        if (rc != 0) return;
         MemorySegment img = NativeBridge.imageCreateRaster(
             sw, sh, sw * 4, buf, NativeBridge.CT_RGBA_8888_PREMUL);
         if (img == null || img.equals(MemorySegment.NULL)) return;
         try {
-            syncBeforeDraw();
+            NativeBridge.surfaceBeginDraw(surf,
+                1f, 0f, 0f, 0f, 1f, 0f,
+                0, 0, 0, 0, false,
+                NativeBridge.BLEND_SRC, 1f);
             try {
-                NativeBridge.surfaceDrawImageRect(handle(), img,
+                NativeBridge.surfaceDrawImageRect(surf, img,
                     0, 0, sw, sh,
                     dstX0, dstY0, dstX1 - dstX0, dstY1 - dstY0);
-            } finally { restoreAfterDraw(); }
+            } finally {
+                NativeBridge.surfaceEndDraw(surf);
+            }
         } finally {
             NativeBridge.imageDestroy(img);
         }
@@ -845,7 +1011,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     @Override
     public void drawTexture(Texture tex, float x, float y, float w, float h) {
         if (tex instanceof SkiaRTTexture src) {
-            if (src.is3DPassBegun()) { composite3DRtt(src, x, y, w, h); return; }
+            if (src.is3DPassBegun()) src.composite3DEnd();
             // Quantum draws RT-cached node images via drawTexture.
             // Snapshot the source SkSurface and draw it.
             long srcHandle = src.getNativeHandle();
@@ -863,14 +1029,41 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     0, 0, src.getContentWidth(), src.getContentHeight(),
                     x, y, w, h);
             } finally { restoreAfterDraw(); }
+            draw3DOver(src, 0, 0, src.getContentWidth(), src.getContentHeight(), x, y, w, h);
             return;
         }
         long imgHandle = imageHandleOf(tex);
+        if (imgHandle == 0L) return;
+        if (tex.getPixelFormat() == PixelFormat.BYTE_ALPHA) {
+            drawAlphaMask(tex, imgHandle, 0, 0, tex.getContentWidth(), tex.getContentHeight(),
+                          x, y, w, h);
+            return;
+        }
         syncImageFilter(tex);
         syncBeforeDraw();
         try {
             NativeBridge.surfaceDrawImage(handle(),
                 MemorySegment.ofAddress(imgHandle), x, y, w, h);
+        } finally { restoreAfterDraw(); }
+    }
+
+    /**
+     * A BYTE_ALPHA texture is a coverage mask over the current paint, not an
+     * image (BaseGraphics treats it as a paint op): e.g. EffectUtil's fast
+     * rect drop shadow sets the shadow colour and draws its gaussian mask.
+     * A non-Color paint is approximated by its representative colour.
+     */
+    private void drawAlphaMask(Texture tex, long imgHandle,
+                               float sx, float sy, float sw, float sh,
+                               float dx, float dy, float dw, float dh) {
+        Color c = representativeColor(getPaint());
+        syncImageFilter(tex);
+        syncBeforeDraw();
+        try {
+            NativeBridge.surfaceDrawImageRectTinted(handle(),
+                MemorySegment.ofAddress(imgHandle),
+                sx, sy, sw, sh, dx, dy, dw, dh,
+                c8(c.getRed()), c8(c.getGreen()), c8(c.getBlue()), c8(c.getAlpha()));
         } finally { restoreAfterDraw(); }
     }
 
@@ -922,6 +1115,19 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     public void drawTexture(Texture tex,
                             float dx1, float dy1, float dx2, float dy2,
                             float sx1, float sy1, float sx2, float sy2) {
+        // An inverted DESTINATION (dx2 < dx1, e.g. GraphicsContext.drawImage
+        // with a negative width to flip a sprite) is a mirror in Prism. Skia
+        // treats a negative dst rect as empty and draws nothing, while the
+        // native draw does mirror a negative SOURCE extent — so move the
+        // inversion onto the source (an inverted src+dst cancels out).
+        if (dx2 < dx1) {
+            float t = dx1; dx1 = dx2; dx2 = t;
+            t = sx1; sx1 = sx2; sx2 = t;
+        }
+        if (dy2 < dy1) {
+            float t = dy1; dy1 = dy2; dy2 = t;
+            t = sy1; sy1 = sy2; sy2 = t;
+        }
         // NGRegion's drawTexture3Slice/9Slice can produce a degenerate
         // source (sx1 == sx2 or sy1 == sy2) for the stretchable middle
         // strip when the cached region has no central +1 column / row.
@@ -968,10 +1174,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
         }
 
         if (tex instanceof SkiaRTTexture src) {
-            if (src.is3DPassBegun()) {
-                composite3DRtt(src, dx1, dy1, dx2 - dx1, dy2 - dy1);
-                return;
-            }
+            if (src.is3DPassBegun()) src.composite3DEnd();
             long srcHandle = src.getNativeHandle();
             if (srcHandle == 0L) {
                 return; // disposed RTTexture source — drop the draw (H1)
@@ -984,9 +1187,16 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                     sx1, sy1, sw, sh,
                     dx1, dy1, dx2 - dx1, dy2 - dy1);
             } finally { restoreAfterDraw(); }
+            draw3DOver(src, sx1, sy1, sw, sh, dx1, dy1, dx2 - dx1, dy2 - dy1);
             return;
         }
         long imgHandle = imageHandleOf(tex);
+        if (imgHandle == 0L) return;
+        if (tex.getPixelFormat() == PixelFormat.BYTE_ALPHA) {
+            drawAlphaMask(tex, imgHandle, sx1, sy1, sw, sh,
+                          dx1, dy1, dx2 - dx1, dy2 - dy1);
+            return;
+        }
         syncImageFilter(tex);
         syncBeforeDraw();
         try {
@@ -1096,10 +1306,12 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     public void drawTextureRaw(Texture tex,
                                float dx1, float dy1, float dx2, float dy2,
                                float tx1, float ty1, float tx2, float ty2) {
-        // "Raw" means texture coords are in [0..1] normalized space.
-        // Convert to pixel space and dispatch.
-        float tw = tex.getContentWidth();
-        float th = tex.getContentHeight();
+        // "Raw" means texture coords are normalized to the PHYSICAL texture
+        // size (callers divide by getPhysicalWidth/Height, e.g. PrEffectHelper,
+        // EffectUtil). Pooled effect drawables have content < physical, so
+        // scaling by the content size sampled a shrunken sub-rect.
+        float tw = tex.getPhysicalWidth();
+        float th = tex.getPhysicalHeight();
         drawTexture(tex,
             dx1, dy1, dx2, dy2,
             tx1 * tw, ty1 * th, tx2 * tw, ty2 * th);
@@ -1112,9 +1324,10 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                                      float tx12, float ty12, float tx22, float ty22) {
         // Fully general 4-corner mapping. Phase-1 maps to the bounding
         // rect; non-axis-aligned mappings need SkCanvas::drawAtlas or
-        // a custom mesh draw which is out of scope here.
-        float tw = tex.getContentWidth();
-        float th = tex.getContentHeight();
+        // a custom mesh draw which is out of scope here. Coords are
+        // normalized to the physical size, as in drawTextureRaw.
+        float tw = tex.getPhysicalWidth();
+        float th = tex.getPhysicalHeight();
         float minTX = Math.min(Math.min(tx11, tx21), Math.min(tx12, tx22));
         float maxTX = Math.max(Math.max(tx11, tx21), Math.max(tx12, tx22));
         float minTY = Math.min(Math.min(ty11, ty21), Math.min(ty12, ty22));
@@ -1138,7 +1351,9 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
                 "Texture must be a SkiaImageTexture or SkiaMediaTexture; got "
                 + tex.getClass().getSimpleName());
         }
-        if (h == 0L) throw new IllegalStateException("Texture is disposed");
+        // 0 = disposed, or a media texture whose first frame has not uploaded
+        // yet: callers drop the draw (as for a disposed RTTexture source)
+        // rather than throwing out of the paint pass every pulse.
         return h;
     }
 
@@ -1159,7 +1374,13 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
 
     // ---- Misc state -------------------------------------------------------
 
-    @Override public void setNodeBounds(RectBounds bounds) { /* batching hint */ }
+    /**
+     * Stores the node bounds (BaseGraphics.nodeBounds, as BaseShaderGraphics
+     * does); {@link #shaderFor} resolves proportional paints against them so
+     * one gradient spans a whole node (e.g. every line of a multi-line Text)
+     * instead of restarting per draw call.
+     */
+    @Override public void setNodeBounds(RectBounds bounds) { nodeBounds = bounds; }
 
     private NGLightBase[] lights;
     @Override public void setLights(NGLightBase[] lights) { this.lights = lights; }
@@ -1189,24 +1410,21 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     }
 
     /**
-     * Composite a SubScene RTT whose 3D pass was begun: end the bgfx pass,
-     * wrap its color zero-copy as an SkImage, and draw it into this surface.
-     * Returns true if the source was a live 3D pass (and was handled).
+     * Composite the 3D result of a SubScene RTT (its last finished bgfx pass,
+     * a zero-copy SkImage over the bgfx color) on top of the RTT's own surface,
+     * which holds the SubScene fill and any 2D children. Called on every draw
+     * of the RTT — including the clean pulses where NGSubScene reuses it
+     * without re-rendering, and snapshots — so a static 3D scene stays visible.
      */
-    private boolean composite3DRtt(SkiaRTTexture src, float dx, float dy, float dw, float dh) {
-        long imgHandle = src.composite3DEnd(); // bgfx::frame + BorrowTextureFrom
-        if (imgHandle == 0L) {
-            return true; // pass ended; nothing to draw
-        }
+    private void draw3DOver(SkiaRTTexture src, float sx, float sy, float sw, float sh,
+                            float dx, float dy, float dw, float dh) {
+        long img = src.last3DImage();
+        if (img == 0L) return;
         syncBeforeDraw();
         try {
-            NativeBridge.surfaceDrawImageRect(handle(),
-                MemorySegment.ofAddress(imgHandle),
-                0, 0, src.getContentWidth(), src.getContentHeight(),
-                dx, dy, dw, dh);
+            NativeBridge.surfaceDrawImageRect(handle(), MemorySegment.ofAddress(img),
+                sx, sy, sw, sh, dx, dy, dw, dh);
         } finally { restoreAfterDraw(); }
-        NativeBridge.imageDestroy(MemorySegment.ofAddress(imgHandle));
-        return true;
     }
 
     // ---- Helpers ----------------------------------------------------------
@@ -1266,52 +1484,75 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
     public void setStroke(BasicStroke stroke) {
         super.setStroke(stroke);
         float[] dash = (stroke == null) ? null : stroke.getDashArray();
-        if (dash != null && dash.length >= 2) {
-            NativeBridge.surfaceSetStrokeDash(handle(), dash, stroke.getDashPhase());
-        } else {
-            NativeBridge.surfaceSetStrokeDash(handle(), null, 0f);
+        // Prism accepts a single-entry dash ([5] == 5 on, 5 off); the native
+        // side doubles odd-length patterns.
+        if (dash != null && dash.length == 0) {
+            dash = null;
         }
+        float phase = (dash == null) ? 0f : stroke.getDashPhase();
+        // NGShape re-sets the stroke for every shape every frame; skip the
+        // native crossing when the pattern actually pushed is unchanged.
+        // Compared by content against a private copy: BasicStroke.set(float[])
+        // keeps the caller's array, which the caller may later mutate.
+        if (phase == lastDashPhase && Arrays.equals(dash, lastDash)) {
+            return;
+        }
+        NativeBridge.surfaceSetStrokeDash(handle(), dash, phase);
+        lastDash = (dash == null) ? null : dash.clone();
+        lastDashPhase = phase;
     }
+
+    /** Copy of the dash pattern last pushed to the surface (null = solid). */
+    private float[] lastDash;
+    private float lastDashPhase;
 
     /**
      * Build the SkShader for a non-Color paint. The {@code (rx,ry,rw,rh)}
      * fill-shape bounds (node-local) let a proportional gradient resolve its
-     * endpoints against the shape, mirroring stock PaintHelper; image patterns
-     * ignore them.
+     * endpoints against the shape, mirroring stock PaintHelper; a proportional
+     * image pattern maps its anchor rect onto them the same way. Node bounds,
+     * when set, take precedence (BaseGraphics semantics).
      */
     private SkiaShaders.Handle shaderFor(Paint p, float rx, float ry, float rw, float rh) {
+        if (usesNodeBounds(p)) {
+            rx = nodeBounds.getMinX();
+            ry = nodeBounds.getMinY();
+            rw = nodeBounds.getWidth();
+            rh = nodeBounds.getHeight();
+        }
         if (p instanceof Gradient g) {
             return SkiaShaders.forGradient(g, rx, ry, rw, rh);
         }
         if (p instanceof ImagePattern ip) {
-            return SkiaShaders.forImagePattern(ip);
+            return SkiaShaders.forImagePattern(ip, factory, rx, ry, rw, rh);
         }
         throw new UnsupportedOperationException(
             "Unsupported Paint subtype: " + p.getClass().getSimpleName());
     }
 
+    /** True when a proportional paint must resolve against the node bounds. */
+    private boolean usesNodeBounds(Paint p) {
+        return nodeBounds != null && p.isProportional();
+    }
+
     /**
-     * Local-space bounding box of an encoded path, written into a per-thread
-     * scratch {@code float[4]} ({x, y, w, h}) so gradient fills/strokes of a
-     * Shape can resolve proportional gradients without allocating. Uses the
-     * encoded coordinates already in hand (a superset of the tight bounds for
-     * curves — acceptable for gradient resolution).
+     * Tight local-space bounds of {@code shape} ({x, y, w, h}) in a per-thread
+     * scratch {@code float[4]}, for resolving proportional paints without
+     * allocating. Tight (curve extrema, not control points) like
+     * {@code BaseGraphics.fill}; {@link #shaderFor} overrides them with the
+     * node bounds when those are set.
      */
-    private static float[] boundsOf(PathEncoder.Encoded path) {
+    private static float[] boundsOf(Shape shape) {
         float[] b = BBOX_SCRATCH.get();
-        int cc = path.coordCount;
-        if (cc < 2) { b[0] = 0f; b[1] = 0f; b[2] = 0f; b[3] = 0f; return b; }
-        float minx = Float.POSITIVE_INFINITY, miny = Float.POSITIVE_INFINITY;
-        float maxx = Float.NEGATIVE_INFINITY, maxy = Float.NEGATIVE_INFINITY;
-        for (int i = 0; i + 1 < cc; i += 2) {
-            float px = path.coords.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, i);
-            float py = path.coords.getAtIndex(java.lang.foreign.ValueLayout.JAVA_FLOAT, i + 1);
-            if (px < minx) minx = px;
-            if (px > maxx) maxx = px;
-            if (py < miny) miny = py;
-            if (py > maxy) maxy = py;
+        b[0] = Float.POSITIVE_INFINITY; b[1] = Float.POSITIVE_INFINITY;
+        b[2] = Float.NEGATIVE_INFINITY; b[3] = Float.NEGATIVE_INFINITY;
+        Shape.accumulate(b, shape, BaseTransform.IDENTITY_TRANSFORM);
+        if (!(b[0] <= b[2]) || !(b[1] <= b[3])) {
+            b[0] = 0f; b[1] = 0f; b[2] = 0f; b[3] = 0f;
+            return b;
         }
-        b[0] = minx; b[1] = miny; b[2] = maxx - minx; b[3] = maxy - miny;
+        b[2] -= b[0];
+        b[3] -= b[1];
         return b;
     }
 
@@ -1325,6 +1566,7 @@ public final class SkiaGraphics extends BaseGraphics implements ReadbackGraphics
             case CLEAR    -> NativeBridge.BLEND_CLEAR;
             case SRC      -> NativeBridge.BLEND_SRC;
             case SRC_OVER -> NativeBridge.BLEND_SRC_OVER;
+            case DST_OUT  -> NativeBridge.BLEND_DST_OUT;
             case ADD      -> NativeBridge.BLEND_PLUS;
             default       -> NativeBridge.BLEND_SRC_OVER;
         };

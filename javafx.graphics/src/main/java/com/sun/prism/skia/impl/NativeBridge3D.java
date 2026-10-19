@@ -136,6 +136,36 @@ public final class NativeBridge3D {
      * True if the native 3D renderer is present and usable on the active
      * GPU backend (currently: Windows + D3D12). Never throws.
      */
+    private static final MethodHandle MH_RELEASE_DEVICE = optional(
+        "openjfx_skia3d_release_device", FunctionDescriptor.of(ValueLayout.JAVA_INT));
+
+    /** Set once a device loss shut the 3D renderer down (until restart). */
+    private static volatile boolean disabledByDeviceLoss;
+
+    /**
+     * Device-loss recovery: makes the 3D library drop every reference to the
+     * lost shared D3D12 device (bgfx shutdown + its render targets) so the 2D
+     * bridge can create a new device on the same GPU. If 3D was running it
+     * stays disabled afterwards ({@link #isDisabledByDeviceLoss()}); if it never
+     * initialized, it initializes on the new device as usual. Render thread.
+     */
+    public static void releaseDevice() {
+        if (MH_RELEASE_DEVICE == null) return;
+        try {
+            if ((int) MH_RELEASE_DEVICE.invokeExact() == 1) {
+                disabledByDeviceLoss = true;
+            }
+        } catch (Throwable t) { }
+    }
+
+    /**
+     * True once a GPU device loss shut the 3D renderer down: 3D content then
+     * renders nothing (no exceptions) until the application restarts.
+     */
+    public static boolean isDisabledByDeviceLoss() {
+        return disabledByDeviceLoss;
+    }
+
     public static boolean available() {
         if (MH_AVAILABLE == null) {
             return false;
@@ -217,9 +247,11 @@ public final class NativeBridge3D {
         catch (Throwable t) { }
     }
 
-    public static void materialSetSpecularColor(long m, boolean set, float r, float g, float b) {
+    public static void materialSetSpecularColor(long m, boolean set, float r, float g, float b,
+                                                float power) {
         if (MH_MATERIAL_SET_SPECULAR == null || m == 0L) return;
-        try { MH_MATERIAL_SET_SPECULAR.invokeExact(MemorySegment.ofAddress(m), set ? 1 : 0, r, g, b); }
+        int setFlag = set ? 1 : 0;
+        try { MH_MATERIAL_SET_SPECULAR.invokeExact(MemorySegment.ofAddress(m), setFlag, r, g, b, power); }
         catch (Throwable t) { }
     }
 

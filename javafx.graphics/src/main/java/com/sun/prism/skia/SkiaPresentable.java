@@ -7,6 +7,7 @@ import com.sun.prism.Presentable;
 import com.sun.prism.PresentableState;
 import com.sun.prism.Texture.WrapMode;
 import com.sun.prism.impl.RectQueuedPixelSource;
+import com.sun.prism.paint.Color;
 import com.sun.prism.skia.impl.Copies;
 import com.sun.prism.skia.impl.Copies.Category;
 import com.sun.prism.skia.impl.NativeBridge;
@@ -79,6 +80,8 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
     // disposing+recreating the presentable, so the scale the live surface was
     // built for advances here when that happens.
     private float builtRenderScaleX;
+    /** Scaling mode the D3D swap chain was created with (see needsStretch). */
+    private final boolean builtStretch;
     private float builtRenderScaleY;
     // Debounce state for the scale-change rebuild (Fix 2). During a DPI-boundary
     // drag the new scale and its (async) size land on different pulses, so the
@@ -88,6 +91,12 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
     // previous pulse's values; seeded to the built state in the constructor.
     private float lastSeenScaleX, lastSeenScaleY;
     private int   lastSeenRenderW, lastSeenRenderH;
+    /** True after a lockResources that saw a scale change but deferred it
+     *  (not yet settled). Nothing else is guaranteed to schedule the next
+     *  pulse, so the painter polls {@link #isScaleChangePending()} and
+     *  re-queues a repaint; otherwise an idle scene would never re-enter
+     *  lockResources and the presentable would stay at the old scale. */
+    private boolean scaleChangePending;
     // Direct IntBuffers on the READBACK tier: the native readback writes
     // straight into the pooled Pixels buffer (no scratch-segment hop), and
     // Glass's Windows upload uses GetDirectBufferAddress instead of pinning
@@ -158,6 +167,7 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         this.pixelSource =
             new RectQueuedPixelSource(presentMode == PresentMode.READBACK);
         this.builtRenderScaleX = pState.getRenderScaleX();
+        this.builtStretch = needsStretch(pState);
         this.builtRenderScaleY = pState.getRenderScaleY();
         this.lastSeenScaleX = builtRenderScaleX;
         this.lastSeenScaleY = builtRenderScaleY;
@@ -250,6 +260,14 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         }
     }
 
+    /** DXGI scaling mode a D3D swap chain for {@code pState} needs: STRETCH
+     *  only when the render scale differs from the output scale. The mode is
+     *  fixed at creation (ResizeBuffers can't change it). */
+    private static boolean needsStretch(PresentableState pState) {
+        return pState.getRenderScaleX() != pState.getOutputScaleX()
+            || pState.getRenderScaleY() != pState.getOutputScaleY();
+    }
+
     private static AllocResult allocate(PresentableState pState) {
         int w = pState.getRenderWidth();
         int h = pState.getRenderHeight();
@@ -259,8 +277,14 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         // path that escapes Windows DWM's windowed-vsync cap.
         if (SkiaGpu.isEnabled() && hwnd != 0L) {
             releaseStaleSwapChain(hwnd);
+            // The buffer is 1:1 with the client area unless the render scale
+            // was overridden away from the output scale (glass.win.renderScale);
+            // only then does DWM need to stretch it. 1:1 swap chains use
+            // DXGI_SCALING_NONE so a live border-drag never rescales the last
+            // frame while the next one renders.
+            int stretch = needsStretch(pState) ? 1 : 0;
             MemorySegment seg = NativeBridge.surfaceCreateSwapChainD3d(
-                MemorySegment.ofAddress(hwnd), w, h);
+                MemorySegment.ofAddress(hwnd), w, h, stretch);
             if (seg != null && !seg.equals(MemorySegment.NULL)) {
                 return new AllocResult(seg.address(), PresentMode.D3D);
             }
@@ -350,8 +374,10 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
             lastSeenScaleX = nsx; lastSeenScaleY = nsy;
             lastSeenRenderW = nw; lastSeenRenderH = nh;
             if (!settled) {
+                scaleChangePending = true;
                 return false; // still oscillating — defer one pulse
             }
+            scaleChangePending = false;
             // Settled at a new scale. For the D3D tier resize the live swapchain
             // IN PLACE instead of disposing+recreating the presentable. A
             // dispose+recreate races the swapchain lifecycle: DXGI permits only
@@ -368,7 +394,10 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
             // safe there) and its in-place re-wrap does not pick up the new
             // physical size, so it stays on the recreate path; READBACK/raster
             // wraps a reallocated pixel buffer and likewise must recreate.
-            if (presentMode == PresentMode.D3D) {
+            // A swap chain's scaling mode can't change in place: if the new
+            // scale flips between 1:1 (NONE) and render!=output (STRETCH),
+            // recreate (allocate() releases the old chain on the HWND first).
+            if (presentMode == PresentMode.D3D && needsStretch(pState) == builtStretch) {
                 int rc = NativeBridge.surfaceResizeD3d(
                     MemorySegment.ofAddress(getNativeHandle()), nw, nh);
                 if (rc == 0) {
@@ -382,6 +411,7 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         }
         // Scale unchanged: keep the debounce snapshot current so a later scale
         // change is measured against the latest size.
+        scaleChangePending = false;
         lastSeenScaleX = nsx; lastSeenScaleY = nsy;
         lastSeenRenderW = nw; lastSeenRenderH = nh;
         if (!sizeChanged) return false;
@@ -424,13 +454,67 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         return true;
     }
 
+    /** Last colour handed to the D3D swap chain background; -1 = never set. */
+    private int d3dBackgroundRgb = -1;
+
+    /**
+     * Keeps the D3D swap chain background (what DWM shows in the strip a
+     * window has grown by during a live resize, until the next frame lands)
+     * in step with the scene fill. Cheap per frame: native call only when the
+     * colour changes. Translucent / null fills fall back to white, the stock
+     * Scene default. No-op on the other tiers.
+     */
+    public void setBackgroundColor(Color c) {
+        if (presentMode != PresentMode.D3D) return;
+        int rgb = 0xFFFFFF;
+        if (c != null && c.getAlpha() >= 1f) {
+            rgb = (Math.round(c.getRed() * 255) << 16)
+                | (Math.round(c.getGreen() * 255) << 8)
+                | Math.round(c.getBlue() * 255);
+        }
+        if (rgb == d3dBackgroundRgb) return;
+        if (NativeBridge.surfaceSetBackgroundD3d(
+                MemorySegment.ofAddress(getNativeHandle()), rgb) == 0) {
+            d3dBackgroundRgb = rgb;
+        }
+    }
+
+    /** Set by {@link #beginFrame()} once this frame's D3D back-buffer fence
+     *  wait has run; consumed by {@link #prepare} so it doesn't wait twice. */
+    private boolean d3dFrameBegun;
+
+    /**
+     * Frame start, called by the painter BEFORE {@code createGraphics()} and
+     * any drawing. For the D3D tier this waits on the per-buffer fence of the
+     * back buffer about to be drawn into, so the CPU never records into a
+     * buffer the GPU is still using and pacing keeps a 1-frame lead. No-op on
+     * the other tiers.
+     *
+     * @return false if the surface is unusable (view closed, device lost);
+     *         the caller must take the dispose + repaint path
+     */
+    public boolean beginFrame() {
+        if (pState.isViewClosed()) return false;
+        if (presentMode == PresentMode.D3D) {
+            int rc = NativeBridge.surfaceBeginFrameD3d(
+                MemorySegment.ofAddress(getNativeHandle()));
+            if (rc != 0) return false;
+            d3dFrameBegun = true;
+        }
+        return true;
+    }
+
     @Override
     public boolean prepare(Rectangle dirtyregion) {
         if (pState.isViewClosed()) return false;
-        // D3D: wait on DXGI's frame-latency waitable + per-buffer
-        // fence before any drawing this frame. Gives deterministic
-        // CPU↔GPU pacing with a 1-frame lead.
+        // D3D: wait on the per-buffer fence before any drawing this frame.
+        // Normally already done by beginFrame() (called before painting);
+        // fall back to waiting here for callers that did not call it.
         if (presentMode == PresentMode.D3D) {
+            if (d3dFrameBegun) {
+                d3dFrameBegun = false;
+                return true;
+            }
             int rc = NativeBridge.surfaceBeginFrameD3d(
                 MemorySegment.ofAddress(getNativeHandle()));
             if (rc != 0) return false;
@@ -748,8 +832,20 @@ public final class SkiaPresentable extends SkiaRTTexture implements Presentable 
         }
     }
 
-    @Override public float getPixelScaleFactorX() { return pState.getRenderScaleX(); }
-    @Override public float getPixelScaleFactorY() { return pState.getRenderScaleY(); }
+    // Report the scale the live surface was BUILT for (advanced in place by the
+    // D3D settled-resize path), not the live pState scale: while a scale change
+    // is debounced the surface is still sized for the old scale, and painting
+    // at the new scale into it would overflow/clip. Matches upstream
+    // D3DSwapChain, which freezes the scale at construction.
+    @Override public float getPixelScaleFactorX() { return builtRenderScaleX; }
+    @Override public float getPixelScaleFactorY() { return builtRenderScaleY; }
+
+    /**
+     * True when the last {@link #lockResources} observed a render-scale change
+     * but deferred acting on it until it settles. The caller must make sure
+     * another repaint pulse happens so the deferred change is applied.
+     */
+    public boolean isScaleChangePending() { return scaleChangePending; }
 
     @Override public int getContentWidth()  { return pState.getOutputWidth(); }
     @Override public int getContentHeight() { return pState.getOutputHeight(); }

@@ -35,6 +35,10 @@ final class GradientResolver {
     float x1, y1, x2, y2;
     /** Resolved radial centre + radius (valid after {@link #resolveRadial}). */
     float cx, cy, radius;
+    // Radial focus point in gradient space; hasFocus is false when it
+    // coincides with the center (plain concentric radial).
+    float fx, fy;
+    boolean hasFocus;
 
     /**
      * True when a non-identity local matrix is needed (a non-identity
@@ -74,8 +78,8 @@ final class GradientResolver {
         }
     }
 
-    /** Mirrors PaintHelper#setRadialGradient proportional branch (focus dropped,
-     *  matching the concentric-only Skia native radial path). */
+    /** Mirrors PaintHelper#setRadialGradient: proportional resolution plus the
+     *  focus point (focusAngle/focusDistance, clamped to 0.99 of the radius). */
     void resolveRadial(RadialGradient rg, float rx, float ry, float rw, float rh) {
         float ccx = rg.getCenterX(), ccy = rg.getCenterY(), r = rg.getRadius();
         boolean elliptical = false;
@@ -94,6 +98,23 @@ final class GradientResolver {
             r = r * scale;
         }
         cx = ccx; cy = ccy; radius = r;
+
+        float fd = rg.getFocusDistance();
+        float fa = rg.getFocusAngle();
+        if (fd < 0f) {
+            fd = -fd;
+            fa += 180f;
+        }
+        fd = Math.min(fd, 0.99f);
+        hasFocus = fd > 0f;
+        if (hasFocus) {
+            double a = Math.toRadians(fa);
+            fx = ccx + (float) (fd * r * Math.cos(a));
+            fy = ccy + (float) (fd * r * Math.sin(a));
+        } else {
+            fx = ccx;
+            fy = ccy;
+        }
 
         BaseTransform gt = rg.getGradientTransformNoClone();
         boolean gtIdentity = (gt == null) || gt.isIdentity();

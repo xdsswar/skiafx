@@ -88,8 +88,11 @@ void main()
     if (u_mapFlags.y > 0.5) { specColor *= texture2D(s_specular, uv).rgb; }
     float specPow = u_specular.a;
 
-    // View reflection vector for the Phong specular term (matches stock).
-    vec3 refl = reflect(normalize(v_wpos - u_camPos.xyz), N);
+    // View reflection vector for the Phong specular term, exactly as stock
+    // (Mtl1PS.hlsl / main1Light.frag): reflect the point->EYE vector, then
+    // the light loop uses -refl. Reflecting eye->point flipped the highlight
+    // to the side facing away from the light, so specular never showed.
+    vec3 refl = reflect(normalize(u_camPos.xyz - v_wpos), N);
 
     vec3 d = vec3(0.0, 0.0, 0.0);
     vec3 s = vec3(0.0, 0.0, 0.0);

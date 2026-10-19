@@ -1,5 +1,6 @@
 package com.sun.prism.skia.impl;
 
+import com.sun.javafx.geom.Path2D;
 import com.sun.javafx.geom.PathIterator;
 import com.sun.javafx.geom.Shape;
 
@@ -47,12 +48,15 @@ public final class PathEncoder {
      * rendering many glyphs at known positions.
      */
     public static Encoded encodeTranslated(Shape shape, float dx, float dy) {
+        if (shape instanceof Path2D path) {
+            return encodePath2D(path, dx, dy);
+        }
         // Pass 1: count.
         PathIterator pass1 = shape.getPathIterator(null);
         int fillRule = pass1.getWindingRule();
         int verbCount = 0;
         int coordCount = 0;
-        float[] scratch = new float[6];
+        float[] scratch = SCRATCH.get();
         while (!pass1.isDone()) {
             int type = pass1.currentSegment(scratch);
             verbCount++;
@@ -82,12 +86,15 @@ public final class PathEncoder {
     }
 
     public static Encoded encode(Shape shape) {
+        if (shape instanceof Path2D path) {
+            return encodePath2D(path, 0f, 0f);
+        }
         // Pass 1: count verbs + coords.
         PathIterator pass1 = shape.getPathIterator(null);
         int fillRule = pass1.getWindingRule();
         int verbCount = 0;
         int coordCount = 0;
-        float[] scratch = new float[6];
+        float[] scratch = SCRATCH.get();
         while (!pass1.isDone()) {
             int type = pass1.currentSegment(scratch);
             verbCount++;
@@ -114,6 +121,43 @@ public final class PathEncoder {
         }
         return new Encoded(lease, verbs, coords, verbCount, coordCount, fillRule);
     }
+
+    /**
+     * Fast path for {@link Path2D} (glyph outlines, SVGPath, Path, stroked
+     * outlines): its command bytes are already PathIterator SEG_* values and
+     * its coords are a flat float array, so copy them straight into the arena
+     * instead of walking two PathIterators.
+     */
+    private static Encoded encodePath2D(Path2D path, float dx, float dy) {
+        int verbCount = path.getNumCommands();
+        byte[] cmds = path.getCommandsNoClone();
+        float[] src = path.getFloatCoordsNoClone();
+        int coordCount = 0;
+        for (int i = 0; i < verbCount; i++) {
+            coordCount += coordsForVerb(cmds[i]);
+        }
+        FrameArena.Lease lease = FrameArena.current().open();
+        MemorySegment verbs  = lease.allocateBytes(verbCount);
+        MemorySegment coords = lease.allocateFloats(coordCount);
+        if (verbCount > 0) {
+            MemorySegment.copy(cmds, 0, verbs, ValueLayout.JAVA_BYTE, 0L, verbCount);
+        }
+        if (coordCount > 0) {
+            if (dx == 0f && dy == 0f) {
+                MemorySegment.copy(src, 0, coords, ValueLayout.JAVA_FLOAT, 0L, coordCount);
+            } else {
+                for (int k = 0; k < coordCount; k += 2) {
+                    coords.setAtIndex(ValueLayout.JAVA_FLOAT, k,     src[k]     + dx);
+                    coords.setAtIndex(ValueLayout.JAVA_FLOAT, k + 1, src[k + 1] + dy);
+                }
+            }
+        }
+        return new Encoded(lease, verbs, coords, verbCount, coordCount, path.getWindingRule());
+    }
+
+    /** Per-thread segment scratch for the generic PathIterator path. */
+    private static final ThreadLocal<float[]> SCRATCH =
+        ThreadLocal.withInitial(() -> new float[6]);
 
     private static int coordsForVerb(int type) {
         return switch (type) {

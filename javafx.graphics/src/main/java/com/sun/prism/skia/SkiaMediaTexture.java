@@ -8,6 +8,7 @@ import com.sun.prism.Texture.WrapMode;
 import com.sun.prism.skia.impl.HdrToneMap;
 import com.sun.prism.skia.impl.NativeBridge;
 import com.sun.prism.skia.impl.NativeHandles;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 import java.lang.foreign.Arena;
 import java.lang.foreign.MemorySegment;
@@ -563,7 +564,7 @@ public final class SkiaMediaTexture implements Texture {
         // update() arrives with a real frame. Without this guard, the
         // very first frame failing interop would NPE here and tear
         // down the whole media stack before playback even started.
-        UploadResult r = uploadFrame(initialFrame);
+        UploadResult r = uploadOrNull(initialFrame);
         long imgHandle    = (r != null) ? r.skImageHandle()  : 0L;
         long interopValue = (r != null) ? r.interopHandle()  : 0L;
         int tw = textureWidthOf(initialFrame);
@@ -654,7 +655,38 @@ public final class SkiaMediaTexture implements Texture {
     @Override public void contentsUseful()    { /* no atlas yet */ }
     @Override public void contentsNotUseful() { /* no atlas yet */ }
 
-    @Override public boolean isSurfaceLost() { return resources.skImage.get() == 0L; }
+    /** Set by {@link #dispose()}. A texture whose first frame has not
+     *  uploaded yet (image handle 0) is NOT lost: it draws nothing until the
+     *  next update(), instead of being dropped and rebuilt every pulse. */
+    private volatile boolean disposed;
+
+    /** GPU device generation the frame images were created on (see SkiaGpu). */
+    private final int deviceGeneration = SkiaGpu.deviceGeneration();
+
+    @Override public boolean isSurfaceLost() {
+        // Frame images may be GPU-backed (YUV planes / zero-copy interop): after
+        // a device replacement the handler must build a new texture.
+        return disposed || deviceGeneration != SkiaGpu.deviceGeneration();
+    }
+
+    private static volatile boolean uploadFailureLogged;
+
+    /** uploadFrame, but a failed convert/upload keeps the previous frame
+     *  (Prism's media contract: null, not an exception that skips the
+     *  caller's unlock()/releaseFrame() and fails the whole paint pass). */
+    private UploadResult uploadOrNull(MediaFrame frame) {
+        try {
+            return uploadFrame(frame);
+        } catch (RuntimeException e) {
+            if (!uploadFailureLogged) {
+                uploadFailureLogged = true;
+                System.getLogger(SkiaMediaTexture.class.getName()).log(
+                    System.Logger.Level.WARNING,
+                    "Skia media frame upload failed; keeping the previous frame", e);
+            }
+            return null;
+        }
+    }
 
     @Override public int getLastImageSerial()        { return lastImageSerial; }
     @Override public void setLastImageSerial(int s)  { this.lastImageSerial = s; }
@@ -675,7 +707,10 @@ public final class SkiaMediaTexture implements Texture {
     // the same D3D11 texture). Symptom: post-seek flicker.
     //
     @Override public void update(MediaFrame frame, boolean skipFlush) {
-        UploadResult r = uploadFrame(frame);
+        // After dispose the Resources block is drained: a late update would
+        // allocate scratch arenas / images nothing frees any more.
+        if (disposed) return;
+        UploadResult r = uploadOrNull(frame);
         if (r == null) {
             // Upload failed and there's nothing to swap in. Keep showing
             // whatever the previous frame produced — the SkImage and
@@ -740,6 +775,7 @@ public final class SkiaMediaTexture implements Texture {
     }
 
     @Override public void dispose() {
+        disposed = true;
         // dispose() is the explicit / preferred teardown. It runs the
         // exact same drain logic the Cleaner safety net would run if
         // the texture became unreachable without dispose() being
@@ -1272,21 +1308,32 @@ public final class SkiaMediaTexture implements Texture {
             bgraFrame = converted;
         }
 
-        int w = bgraFrame.getWidth();
-        int h = bgraFrame.getHeight();
-        int rowBytes = bgraFrame.strideForPlane(0);
-        ByteBuffer src = bgraFrame.getBufferForPlane(0);
-        int planeBytes = rowBytes * h;
+        try {
+            int w = bgraFrame.getWidth();
+            int h = bgraFrame.getHeight();
+            int rowBytes = bgraFrame.strideForPlane(0);
+            ByteBuffer src = bgraFrame.getBufferForPlane(0);
+            int planeBytes = rowBytes * h;
 
-        ensureSdrBgraScratch(planeBytes);
-        copyIntoSegment(src, resources.sdrBgraSeg, planeBytes);
+            ensureSdrBgraScratch(planeBytes);
+            copyIntoSegment(src, resources.sdrBgraSeg, planeBytes);
 
-        MemorySegment imgHandle = NativeBridge.imageCreateRaster(
-            w, h, rowBytes, resources.sdrBgraSeg, NativeBridge.CT_BGRA_8888_PREMUL);
-        if (imgHandle == null || imgHandle.equals(MemorySegment.NULL)) {
-            throw new IllegalStateException(
-                "Skia media frame upload failed (" + w + "x" + h + ")");
+            MemorySegment imgHandle = NativeBridge.imageCreateRaster(
+                w, h, rowBytes, resources.sdrBgraSeg, NativeBridge.CT_BGRA_8888_PREMUL);
+            if (imgHandle == null || imgHandle.equals(MemorySegment.NULL)) {
+                throw new IllegalStateException(
+                    "Skia media frame upload failed (" + w + "x" + h + ")");
+            }
+            return imgHandle.address();
+        } finally {
+            // convertToFormat hands back a NEW native-backed frame (its own
+            // VideoDataBuffer ref) that we own — release it or it leaks one
+            // native frame per video frame (upstream J2DTexture does the same).
+            // The pixels were already copied into sdrBgraSeg above. Never
+            // release the caller's source frame here.
+            if (bgraFrame != frame) {
+                bgraFrame.releaseFrame();
+            }
         }
-        return imgHandle.address();
     }
 }

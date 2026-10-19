@@ -743,7 +743,15 @@ public class NGCanvas extends NGNode {
             effect.filter(fctx, transform, outputClip, null, definput);
         Rectangle r = id.getUntransformedBounds();
         Filterable f = id.getUntransformedImage();
-        Texture tex = ((PrTexture) f).getTextureObject();
+        if (!(f instanceof PrTexture pt) || pt.getTextureObject() == null) {
+            // skia-fx: an effect pass that could not produce an image (a
+            // transient pool/surface miss) yields no pixels for this op, as a
+            // lost renderer does in stock Prism. Stock code dereferenced it and
+            // threw an NPE on every repaint of the region.
+            id.unref();
+            return new Rectangle();
+        }
+        Texture tex = pt.getTextureObject();
         destbuf.g.setTransform(id.getTransform());
         destbuf.g.setCompositeMode(comp);
         destbuf.g.drawTexture(tex, r.x, r.y, r.width, r.height);

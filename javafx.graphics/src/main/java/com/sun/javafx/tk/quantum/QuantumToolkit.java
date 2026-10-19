@@ -606,7 +606,24 @@ public final class QuantumToolkit extends Toolkit {
         if (!qt.toolkitRunning.get()) return;
         if (!qt.animationRunning.get() && !qt.nextPulseRequested.get()) return;
         if ((System.nanoTime() - lastLiveRepaintNanos) < DRAG_GATE_NANOS) return;
-        if (qt.pulseRunning.getAndSet(true)) return;
+        if (qt.pulseRunning.getAndSet(true)) {
+            // pulseRunning is also latched by postPulse() while its posted
+            // pulseRunnable waits in the invokeLater queue — which this very
+            // modal pump does not dispatch. Without this, one postPulse at the
+            // start of the drag would block every native-timer pulse until the
+            // modal loop ends. If the posted pulse has been pending too long
+            // and no pulse is executing, run one inline WITHOUT touching the
+            // latch: the queued runnable still owns it and clears it when it
+            // finally runs (one extra pulse, harmless), and keeping it set
+            // stops postPulse from piling more runnables into the queue.
+            long posted = qt.pulsePostedNanos;
+            if (posted != 0L && qt.inPulse == 0
+                    && System.nanoTime() - posted > STALE_POSTED_PULSE_NANOS) {
+                qt.maybeApplySoftwareCap();
+                qt.pulse();
+            }
+            return;
+        }
         try {
             qt.pulseFromQueue();
         } catch (Throwable t) {
@@ -616,6 +633,12 @@ public final class QuantumToolkit extends Toolkit {
         // pulseFromQueue's finally clears pulseRunning via endPulseRunning,
         // so no explicit reset on the success path.
     }
+
+    /** nanoTime at which postPulse queued pulseRunnable; 0 once it ran. */
+    private volatile long pulsePostedNanos;
+    /** A posted pulse pending longer than this is considered stuck behind a
+     *  modal loop that does not dispatch posted messages. */
+    private static final long STALE_POSTED_PULSE_NANOS = 50_000_000L; // 50 ms
 
     void postPulse() {
         // See lastLiveRepaintNanos.
@@ -627,6 +650,7 @@ public final class QuantumToolkit extends Toolkit {
             !dragActive &&
             !setPulseRunning()) {
 
+            pulsePostedNanos = System.nanoTime();
             Application.invokeLater(pulseRunnable);
 
             if (debug) {
@@ -679,6 +703,7 @@ public final class QuantumToolkit extends Toolkit {
     }
 
     void pulseFromQueue() {
+        pulsePostedNanos = 0L;
         try {
             maybeApplySoftwareCap();
             pulse();
@@ -775,6 +800,17 @@ public final class QuantumToolkit extends Toolkit {
                 PulseLogger.pulseEnd();
             }
         }
+    }
+
+    /**
+     * True while {@link #pulse(boolean)} is executing on the FX thread
+     * (animation / layout / CSS / sync / renderAll). Used to avoid
+     * re-entering a pulse from code that runs inside one (e.g. a
+     * Stage.show() from a Timeline onFinished or AnimationTimer).
+     * FX thread only.
+     */
+    boolean isInPulse() {
+        return inPulse > 0;
     }
 
     void vsyncHint() {
@@ -1063,16 +1099,17 @@ public final class QuantumToolkit extends Toolkit {
     public void dispose() {
         if (toolkitRunning.compareAndSet(true, false)) {
             pulseTimer.stop();
-            renderer.stopRenderer();
 
             // Final drain of deferred native/GPU frees. These are normally drained
             // once per pulse in PresentingPainter, but pulses have now stopped — so
             // anything a Cleaner enqueued after the last pulse (e.g. a GC'd
             // SkiaMediaTexture's GPU SkImage + D3D interop) would otherwise leak at
-            // exit. Safe here: the render thread is confirmed stopped (no
-            // concurrency), each queued action is idempotent, and the queue is
-            // empty in the common case. (bugs.md M17)
-            NativeHandles.drainDeferred();
+            // exit. The frees are render-thread-affine (single-threaded
+            // GrDirectContext), and stopRenderer() only shuts the executor down —
+            // jobs already queued still run — so the drain is queued as the last
+            // render job rather than run here on the FX thread. (bugs.md M17)
+            renderer.submit(new RenderJob(NativeHandles::drainDeferred, null));
+            renderer.stopRenderer();
 
             try {
                 Runtime.getRuntime().removeShutdownHook(shutdownHook);
@@ -1184,11 +1221,15 @@ public final class QuantumToolkit extends Toolkit {
 
     @Override
     protected Object createImagePatternPaint(ImagePattern paint) {
-        if (paint.getImage() == null) {
+        // SvgImage has no raster platform image; treat it like a null image
+        // instead of letting prism ImagePattern throw during paint sync.
+        com.sun.prism.Image platformImage = paint.getImage() == null ? null
+                : (com.sun.prism.Image) Toolkit.getImageAccessor().getPlatformImage(paint.getImage());
+        if (platformImage == null) {
             return com.sun.prism.paint.Color.TRANSPARENT;
         } else {
             return new com.sun.prism.paint.ImagePattern(
-                    (com.sun.prism.Image) Toolkit.getImageAccessor().getPlatformImage(paint.getImage()),
+                    platformImage,
                     (float)paint.getX(),
                     (float)paint.getY(),
                     (float)paint.getWidth(),

@@ -151,6 +151,7 @@ class GlassWindowEventHandler extends Window.EventHandler implements Supplier<Vo
                 break;
             case WindowEvent.DESTROY:
                 stage.setPlatformWindowClosed();
+                WindowStage.removeActiveWindow(stage);
                 stage.stageListener.closed();
                 break;
             case WindowEvent.CLOSE:

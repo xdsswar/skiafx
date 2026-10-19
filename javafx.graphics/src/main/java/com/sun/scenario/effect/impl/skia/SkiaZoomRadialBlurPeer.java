@@ -70,7 +70,8 @@ public final class SkiaZoomRadialBlurPeer extends EffectPeer<RenderState> {
             srcBounds.height + 2 * pad);
         dstBounds.intersectWith(outputClip);
         if (dstBounds.width <= 0 || dstBounds.height <= 0) {
-            return new ImageData(fctx, null, srcBounds);
+            // Empty result: a real cleared drawable, like upstream (never image-less).
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
         SkiaPrDrawable dst = (SkiaPrDrawable)
@@ -85,6 +86,9 @@ public final class SkiaZoomRadialBlurPeer extends EffectPeer<RenderState> {
         // preserved and fades correctly. (bugs.md H2)
         MemorySegment filter = NativeBridge.filterBlur(sigma, sigma, NativeBridge.TILE_DECAL);
         if (filter == null || filter.equals(MemorySegment.NULL)) {
+            // Passthrough: return the pooled drawable we checked out above,
+            // otherwise it stays locked in the ImagePool forever.
+            getRenderer().releaseCompatibleImage(dst);
             srcData.addref();
             return srcData;
         }

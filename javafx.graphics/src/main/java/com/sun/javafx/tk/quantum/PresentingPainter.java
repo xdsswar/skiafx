@@ -27,6 +27,8 @@ package com.sun.javafx.tk.quantum;
 
 import java.lang.foreign.MemorySegment;
 
+import javafx.application.Platform;
+
 import com.sun.javafx.logging.PulseLogger;
 import static com.sun.javafx.logging.PulseLogger.PULSE_LOGGING_ENABLED;
 import com.sun.javafx.sg.prism.NGNode;
@@ -184,6 +186,40 @@ final class PresentingPainter extends ViewPainter {
         super(view);
     }
 
+    /** True while a {@link #rearmDeferredPresent} is queued on the FX thread;
+     *  collapses repeated deferrals into a single post (no per-pulse churn). */
+    private volatile boolean deferredRearmPending;
+
+    /** Pre-allocated FX-thread task that re-marks this scene dirty after the
+     *  present-rate cap deferred a present. A bare requestNextPulse is not
+     *  enough: a pulse only repaints scenes in PaintCollector's dirty list
+     *  (cleared by renderAll), so an idle scene would never re-enter paint and
+     *  the deferred frame would never be presented. sceneChanged() (NOT
+     *  entireSceneNeedsRepaint) is deliberate: it re-queues the scene without
+     *  setting the forced-repaint flag, so the follow-up present stays subject
+     *  to the cap (it is retried until the interval has elapsed). */
+    private final Runnable rearmDeferredPresent = () -> {
+        deferredRearmPending = false;
+        GlassScene gs = sceneState.getScene();
+        if (gs != null) {
+            gs.sceneChanged();
+        }
+    };
+
+    /** Re-queues this scene for repaint on the FX thread (render-thread safe,
+     *  allocation-free, coalesced). Not a forced repaint: the present-rate cap
+     *  still applies to the resulting paint. */
+    private void scheduleRepaint() {
+        if (!deferredRearmPending) {
+            deferredRearmPending = true;
+            try {
+                Platform.runLater(rearmDeferredPresent);
+            } catch (IllegalStateException toolkitGone) {
+                deferredRearmPending = false;
+            }
+        }
+    }
+
     // ---- Paint-rate diagnostic --------------------------------------------
     // Diagnostic flags hoisted to constants: Boolean.getBoolean is a
     // synchronized Properties lookup and these were evaluated up to four
@@ -289,6 +325,12 @@ final class PresentingPainter extends ViewPainter {
             if (presentable != null && presentable.lockResources(sceneState)) {
                 disposePresentable();
                 resetChangeDetection();
+            } else if (presentable instanceof SkiaPresentable pendingSp
+                    && pendingSp.isScaleChangePending()) {
+                // The presentable deferred a render-scale change until it
+                // settles (monitor-move debounce). Make sure another pulse
+                // re-enters lockResources for this scene even if it is idle.
+                scheduleRepaint();
             }
             if (presentable == null) {
                 presentable = factory.createPresentable(sceneState);
@@ -362,6 +404,17 @@ final class PresentingPainter extends ViewPainter {
                     return;
                 }
 
+                // D3D tier: wait on the back buffer's fence BEFORE drawing into
+                // it (the wait used to run in prepare(), i.e. after painting).
+                if (presentable instanceof SkiaPresentable bsp) {
+                    if (!bsp.beginFrame()) {
+                        disposePresentable();
+                        sceneState.getScene().entireSceneNeedsRepaint();
+                        return;
+                    }
+                    bsp.setBackgroundColor(sceneState.getClearColor());
+                }
+
                 Graphics g = presentable.createGraphics();
                 if (g != null) {
                     long paintStart = System.nanoTime();
@@ -407,11 +460,15 @@ final class PresentingPainter extends ViewPainter {
                     // scene goes idle right after this deferral (no animation, no
                     // dirty event) postPulse pauses the master timer and the frame
                     // we just painted is NEVER presented until some unrelated dirty
-                    // event — a visibly stale final frame on quiescence. A
-                    // requestNextPulse keeps pulsing until enough time has elapsed
-                    // for the rate cap to let the present through (a few pulses at
-                    // most, bounded by minPresentIntervalNs). (bugs.md H4)
-                    QuantumToolkit.getToolkit().requestNextPulse();
+                    // event — a visibly stale final frame on quiescence. A bare
+                    // requestNextPulse is NOT enough: a pulse only repaints scenes
+                    // in PaintCollector's dirty list (consumed by renderAll), so
+                    // re-queue this scene via sceneChanged() on the FX thread (the
+                    // dirty list is FX-thread only). addDirtyScene requests the
+                    // pulse; this repeats until the cap lets the present through
+                    // (a few pulses at most, bounded by minPresentIntervalNs).
+                    // (bugs.md H4)
+                    scheduleRepaint();
                     return;
                 }
 

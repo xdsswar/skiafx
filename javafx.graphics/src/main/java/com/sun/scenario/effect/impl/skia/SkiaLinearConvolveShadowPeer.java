@@ -9,15 +9,18 @@ import java.lang.ref.WeakReference;
 import com.sun.javafx.geom.Rectangle;
 import com.sun.javafx.geom.transform.BaseTransform;
 import com.sun.prism.skia.impl.NativeBridge;
+import com.sun.prism.Graphics;
+import com.sun.scenario.effect.BoxShadow;
 import com.sun.scenario.effect.Color4f;
 import com.sun.scenario.effect.Effect;
 import com.sun.scenario.effect.FilterContext;
+import com.sun.scenario.effect.GaussianShadow;
 import com.sun.scenario.effect.ImageData;
 import com.sun.scenario.effect.impl.EffectPeer;
 import com.sun.scenario.effect.impl.Renderer;
 import com.sun.scenario.effect.impl.prism.PrEffectHelper;
+import com.sun.scenario.effect.impl.state.BoxRenderState;
 import com.sun.scenario.effect.impl.state.LinearConvolveRenderState;
-import com.sun.scenario.effect.impl.state.RenderState;
 
 /**
  * Skia peer for the {@code "LinearConvolveShadow"} dispatch name.
@@ -34,13 +37,24 @@ import com.sun.scenario.effect.impl.state.RenderState;
  * separable internally — so we collapse the two passes into one:</p>
  *
  * <ul>
- *   <li><b>Pass 0:</b> apply {@code DropShadowOnly} with the full
- *       (sigmaX, sigmaY) derived from the state's kernel size, and the
- *       state's shadow colour. The output bounds expand by ~3σ on
- *       each side to give Skia's blur kernel room.</li>
- *   <li><b>Pass 1+:</b> pass through — the result from pass 0 is
- *       already the final filtered image.</li>
+ *   <li><b>First pass that reaches the peer:</b> apply
+ *       {@code DropShadowOnly} with the full (sigmaX, sigmaY) derived from
+ *       each axis' kernel size, the state's shadow colour and the spread
+ *       alpha gain (below). The output bounds expand by ~3 sigma on each
+ *       side. Upstream skips a no-op pass 0 (horizontal radius ~0) but
+ *       never pass 1 of a shadow, so this can be pass 1 -- it must still
+ *       colourise, otherwise a radius-0 DropShadow/InnerShadow shows a
+ *       full-colour copy instead of a silhouette.</li>
+ *   <li><b>Following pass of the same render state:</b> pass through.</li>
  * </ul>
+ *
+ * <p><b>Spread:</b> upstream renormalises one pass' kernel so its weights
+ * sum to more than 1 (Gaussian {@code total += (w0 - total) * spread},
+ * Box {@code sum += (1 - sum) * spread}), i.e. an alpha gain clamped to 1.
+ * Reproduced as a clamped colour-matrix alpha gain on the opaque blurred
+ * shadow, then multiplied by the shadow colour's alpha. The gain is applied
+ * after the full 2-D blur rather than between the two 1-D passes (exact
+ * when upstream picks pass 1 for the spread, the common case).</p>
  *
  * <p>The shadow's {@code dx,dy} offset is NOT applied here: the
  * {@code DropShadow} Effect class wraps this peer with an
@@ -50,58 +64,100 @@ import com.sun.scenario.effect.impl.state.RenderState;
  */
 public class SkiaLinearConvolveShadowPeer extends EffectPeer<LinearConvolveRenderState> {
 
+    /** Upper bound for the spread alpha gain (spread == 1 is a step). */
+    private static final float MAX_SPREAD_GAIN = 4096f;
+
     // Filter-handle cache. The vast majority of shadow effect calls
     // come from Modena CSS at fixed params (e.g. scrollbar arrow
-    // dropshadow: sigma≈0.167, black at 10% alpha) and stay identical
+    // dropshadow: sigma~0.167, black at 10% alpha) and stay identical
     // every frame. Creating + destroying a fresh sk_sp<SkImageFilter>
-    // per call is pure CPU waste under continuous WM_SIZE → measurable
-    // contributor to drag stutter even with a hit-rate-99% drawable pool.
-    private long cachedKey   = -1L;
+    // per call is pure CPU waste under continuous WM_SIZE.
     private MemorySegment cachedFilter;
+    private float cachedSigX = Float.NaN, cachedSigY = Float.NaN, cachedGain = Float.NaN;
+    private int   cachedRGBA;
 
-    // Phase B: SkImage output cache. The filter's rasterized output is
-    // snapshot into an SkImage and replayed when called with the same
-    // input identity + generation + state. On a cache hit we skip the
-    // saveLayer + filter + restore Skia pipeline entirely and just
-    // drawImage onto a fresh destination drawable. The cache key
-    // includes the input drawable's generation (bumped in
-    // SkiaPrDrawable.createGraphics) so any redraw of the input
-    // invalidates correctly.
+    // Output cache: the filter's rasterized output is snapshot into an
+    // SkImage and replayed when called with the same input identity +
+    // generation + params. The input drawable's generation is bumped in
+    // SkiaPrDrawable.createGraphics so any redraw of the input invalidates.
+    //
+    // A snapshot is itself a GPU copy, so it is only taken once the same
+    // key MISSES twice in a row (i.e. a genuinely static input being
+    // re-filtered). With several shadowed nodes interleaving, every call is
+    // a miss against a different key; snapshotting on each miss thrashed the
+    // single entry and added a copy per call for no hit.
     private MemorySegment cachedOutputImage;
-    private int           cachedOutputW, cachedOutputH;
-    // WeakReference to the input drawable, compared by identity (==). A previous
-    // version keyed on System.identityHashCode, which is RECYCLED after GC: a
-    // different pooled drawable could land on the same hash and trigger a stale
-    // shadow blit. A weak ref never pins the pooled drawable, and a GC'd/replaced
-    // input fails the == check → cache miss → correct. (bugs.md M4)
-    private WeakReference<Object> cachedInputRef;
-    private long          cachedInputGen   = 0L;
-    private long          cachedStateKey   = -1L;
-    // Sampling offset (dstBounds - srcBounds) baked into the cached pixels.
-    // renderImageData samples the source at this delta, so a clip that shifts
-    // the output origin relative to the source changes the rasterized shadow
-    // even when size/input/params match — must be part of the cache key.
-    private int           cachedOffX = Integer.MIN_VALUE;
-    private int           cachedOffY = Integer.MIN_VALUE;
+    private final Key cachedKey  = new Key();
+    private final Key pendingKey = new Key();
+    private final Key currentKey = new Key();
+
+    // Render state whose full shadow was already produced by an earlier
+    // pass of the same LinearConvolveCoreEffect.filterImageDatas() call
+    // (a fresh render state is created per call; both passes resolve to
+    // this same cached peer instance).
+    private LinearConvolveRenderState workDoneFor;
+
+    /** Mutable cache key; compared field-wise, not allocated per call. */
+    private static final class Key {
+        // WeakReference to the input drawable, compared by identity (==).
+        // identityHashCode is RECYCLED after GC; a weak ref never pins the
+        // pooled drawable, and a GC'd/replaced input fails the == check.
+        // (bugs.md M4)
+        WeakReference<Object> inputRef;
+        Object input;          // currentKey only; cleared after each call
+        long  gen;
+        float sigX, sigY, gain;
+        int   rgba;
+        int   w, h;
+        // Sampling offset (dstBounds - srcBounds) baked into the pixels.
+        int   offX, offY;
+        boolean valid;
+
+        boolean matches(Key k) {
+            return valid
+                && k.input != null
+                && inputRef != null
+                && inputRef.get() == k.input
+                && gen == k.gen
+                && Float.compare(sigX, k.sigX) == 0
+                && Float.compare(sigY, k.sigY) == 0
+                && Float.compare(gain, k.gain) == 0
+                && rgba == k.rgba
+                && w == k.w && h == k.h
+                && offX == k.offX && offY == k.offY;
+        }
+
+        void copyFrom(Key k) {
+            if (inputRef == null || inputRef.get() != k.input) {
+                inputRef = (k.input == null) ? null : new WeakReference<>(k.input);
+            }
+            gen = k.gen;
+            sigX = k.sigX; sigY = k.sigY; gain = k.gain;
+            rgba = k.rgba;
+            w = k.w; h = k.h;
+            offX = k.offX; offY = k.offY;
+            valid = true;
+        }
+
+        void clear() {
+            inputRef = null;
+            input = null;
+            valid = false;
+        }
+    }
 
     public SkiaLinearConvolveShadowPeer(FilterContext fctx, Renderer r, String name) {
         super(fctx, r, name);
     }
 
-    /** Filter cache key: bits for sigma (rounded to /16th of pixel) +
-     *  packed RGBA. Cheap, no allocation. */
-    private static long key(float sigma, int r, int g, int b, int a) {
-        int sigmaQ = (int) (sigma * 16f + 0.5f);
-        return ((long) (sigmaQ & 0xFFFF) << 32)
-             | ((r & 0xFF) << 24)
-             | ((g & 0xFF) << 16)
-             | ((b & 0xFF) <<  8)
-             |  (a & 0xFF);
-    }
-
-    private MemorySegment getOrCreateFilter(float sigma, int r, int g, int b, int a) {
-        long k = key(sigma, r, g, b, a);
-        if (k == cachedKey && cachedFilter != null) {
+    private MemorySegment getOrCreateFilter(float sigX, float sigY, float gain,
+                                            int r, int g, int b, int a) {
+        final int rgba = (r << 24) | (g << 16) | (b << 8) | a;
+        if (cachedFilter != null
+            && Float.compare(sigX, cachedSigX) == 0
+            && Float.compare(sigY, cachedSigY) == 0
+            && Float.compare(gain, cachedGain) == 0
+            && rgba == cachedRGBA) {
             return cachedFilter;
         }
         // Params changed (or first call). Release old filter, create new.
@@ -109,33 +165,123 @@ public class SkiaLinearConvolveShadowPeer extends EffectPeer<LinearConvolveRende
             NativeBridge.filterDestroy(cachedFilter);
             cachedFilter = null;
         }
-        MemorySegment f = NativeBridge.filterDropShadowOnly(
-            0f, 0f, sigma, sigma, r, g, b, a);
+        MemorySegment f = (gain > 1f)
+            ? createSpreadFilter(sigX, sigY, gain, r, g, b, a)
+            : NativeBridge.filterDropShadowOnly(0f, 0f, sigX, sigY, r, g, b, a);
         if (f == null || f.equals(MemorySegment.NULL)) return null;
-        cachedKey = k;
+        cachedSigX = sigX;
+        cachedSigY = sigY;
+        cachedGain = gain;
+        cachedRGBA = rgba;
         cachedFilter = f;
         return f;
     }
 
+    /**
+     * alpha' = clamp(gain * blurredAlpha) * colourAlpha, rgb = shadow rgb.
+     * Built as ColorMatrix(alpha*colourA) o ColorMatrix(alpha*gain, clamped)
+     * o DropShadowOnly(opaque colour). Intermediate handles are released
+     * once composed (the native compose holds its own refs).
+     */
+    private static MemorySegment createSpreadFilter(float sigX, float sigY, float gain,
+                                                    int r, int g, int b, int a) {
+        MemorySegment shadow = NativeBridge.filterDropShadowOnly(
+            0f, 0f, sigX, sigY, r, g, b, 255);
+        if (shadow == null || shadow.equals(MemorySegment.NULL)) return null;
+        MemorySegment gainCm = SkiaColorMatrixPeerBase.createColorMatrixFilter(alphaScale(gain));
+        if (gainCm == null) {
+            NativeBridge.filterDestroy(shadow);
+            return null;
+        }
+        MemorySegment spread = NativeBridge.filterCompose(gainCm, shadow);
+        NativeBridge.filterDestroy(gainCm);
+        NativeBridge.filterDestroy(shadow);
+        if (spread == null || spread.equals(MemorySegment.NULL)) return null;
+        if (a >= 255) {
+            return spread;
+        }
+        MemorySegment colorCm = SkiaColorMatrixPeerBase.createColorMatrixFilter(alphaScale(a / 255f));
+        if (colorCm == null) {
+            NativeBridge.filterDestroy(spread);
+            return null;
+        }
+        MemorySegment out = NativeBridge.filterCompose(colorCm, spread);
+        NativeBridge.filterDestroy(colorCm);
+        NativeBridge.filterDestroy(spread);
+        return (out == null || out.equals(MemorySegment.NULL)) ? null : out;
+    }
+
+    private static float[] alphaScale(float s) {
+        return new float[] {
+            1, 0, 0, 0, 0,
+            0, 1, 0, 0, 0,
+            0, 0, 1, 0, 0,
+            0, 0, 0, s, 0,
+        };
+    }
+
+    private static float spreadOf(Effect effect, LinearConvolveRenderState rstate) {
+        if (effect instanceof GaussianShadow gs) return gs.getSpread();
+        if (effect instanceof BoxShadow bs) return bs.getSpread();
+        if (rstate instanceof BoxRenderState box) return box.getSpread();
+        return 0f;
+    }
+
+    /**
+     * Alpha gain equivalent to upstream's spread renormalisation of the
+     * spread pass' 1-D kernel (see class doc). Mirrors the spread-pass
+     * choice of GaussianRenderState / BoxRenderState from the per-axis
+     * kernel sizes.
+     */
+    static float spreadGain(LinearConvolveRenderState rstate, float spread) {
+        if (!(spread > 0f)) return 1f;
+        if (spread > 1f) spread = 1f;
+        final int ks0 = rstate.getInputKernelSize(0);
+        final int ks1 = rstate.getInputKernelSize(1);
+        double total;
+        double totalSpread;
+        if (rstate instanceof BoxRenderState box) {
+            final int ks = (ks1 > 1) ? ks1 : ks0;
+            final int n = box.getBlurPasses();
+            if (n <= 0 || ks <= 1) return 1f;
+            final int k = (ks - 1) / n + 1;
+            total = Math.pow(k, n);
+            totalSpread = total + (1.0 - total) * spread;
+        } else {
+            final int ks = (ks1 > 3 || ks1 >= ks0) ? ks1 : ks0;
+            final int pad = (ks - 1) / 2;
+            if (pad <= 0) return 1f;
+            final double sigma = pad / 3.0;
+            final double sigma22 = 2.0 * sigma * sigma;
+            total = 0.0;
+            for (int i = -pad; i <= pad; i++) {
+                total += Math.exp(-(i * (double) i) / sigma22);
+            }
+            final double w0 = Math.exp(-(pad * (double) pad) / sigma22);
+            totalSpread = total + (w0 - total) * spread;
+        }
+        if (!(totalSpread > 0.0)) return MAX_SPREAD_GAIN;
+        return (float) Math.min(MAX_SPREAD_GAIN, Math.max(1.0, total / totalSpread));
+    }
+
     @Override
     public void dispose() {
+        workDoneFor = null;
         if (cachedFilter != null) {
             NativeBridge.filterDestroy(cachedFilter);
             cachedFilter = null;
-            cachedKey = -1L;
+            cachedSigX = cachedSigY = cachedGain = Float.NaN;
         }
         if (cachedOutputImage != null) {
             NativeBridge.imageDestroy(cachedOutputImage);
             cachedOutputImage = null;
-            cachedInputRef = null;
-            cachedInputGen = 0L;
-            cachedStateKey = -1L;
         }
+        cachedKey.clear();
+        pendingKey.clear();
+        currentKey.clear();
     }
 
-    /** Compact identity + generation hash for an input ImageData.
-     *  Identity uses the underlying drawable instance; generation is
-     *  the drawable's draw-session counter. */
+    /** Generation (draw-session counter) of an input's drawable. */
     private static long inputGenerationOf(ImageData img) {
         Object u = (img == null) ? null : img.getUntransformedImage();
         if (u instanceof SkiaPrDrawable d) return d.getGeneration();
@@ -143,16 +289,6 @@ public class SkiaLinearConvolveShadowPeer extends EffectPeer<LinearConvolveRende
     }
     private static Object inputObjectOf(ImageData img) {
         return (img == null) ? null : img.getUntransformedImage();
-    }
-
-    /** State hash combining sigma quanta + packed RGBA. */
-    private static long stateHash(float sigma, int r, int g, int b, int a) {
-        int sigmaQ = (int) (sigma * 16f + 0.5f);
-        return ((long) (sigmaQ & 0xFFFFL) << 32)
-             | ((long) (r & 0xFF) << 24)
-             | ((long) (g & 0xFF) << 16)
-             | ((long) (b & 0xFF) <<  8)
-             |  (long) (a & 0xFF);
     }
 
     @Override
@@ -164,43 +300,53 @@ public class SkiaLinearConvolveShadowPeer extends EffectPeer<LinearConvolveRende
         final FilterContext fctx = getFilterContext();
         final ImageData srcData = inputs[0];
 
-        // Drag-resize bypass: while the user is mid-drag, skip the
-        // per-frame saveLayer + filter + restore GPU pipeline cost
-        // (the structural bottleneck that pooling can't fix). Effects
-        // re-engage automatically the moment the drag ends. See
-        // SKPICTURE_CACHING_DESIGN.md for the long-term fix.
+        // Drag-resize bypass (opt-in, -Dskia.effects.gateOnResize).
         if (SkiaEffectRenderer.shouldBypassForDrag()) {
             SkiaEffectRenderer.BYPASS_COUNT.incrementAndGet();
             srcData.addref();
             return srcData;
         }
 
-        // Subsequent passes pass through — pass 0 already produced
-        // the full 2-D blurred + tinted result.
-        if (getPass() > 0) {
+        // The earlier pass of this same render state already produced the
+        // full 2-D blurred + tinted result: pass through. Otherwise (pass 0,
+        // or pass 1 after upstream skipped a no-op pass 0 -- a shadow's
+        // pass 1 is never skipped) do the work here.
+        if (getPass() > 0 && workDoneFor == rstate) {
+            workDoneFor = null;
             srcData.addref();
             return srcData;
         }
+        workDoneFor = (getPass() == 0) ? rstate : null;
 
         final Rectangle srcBounds = srcData.getTransformedBounds(null);
 
-        // JFX kernel size N → Skia Gaussian sigma (N - 1) / 6 (the
-        // ~3σ rule of thumb that aligns with kernel half-width).
-        final int kernelSize = rstate.getInputKernelSize(0);
-        final float sigma = Math.max(0.001f, (kernelSize - 1) / 6.0f);
+        final float sigmaX = SkiaLinearConvolvePeer.sigmaFor(rstate, 0);
+        final float sigmaY = SkiaLinearConvolvePeer.sigmaFor(rstate, 1);
+        final float gain   = spreadGain(rstate, spreadOf(effect, rstate));
 
-        // Expand bounds by ~3σ on each side to give the blur kernel
+        // Expand bounds by ~3 sigma on each side to give the blur kernel
         // room (otherwise edges get clipped).
-        final int pad = (int) Math.ceil(sigma * 3.0f) + 1;
+        final int padX = (int) Math.ceil(sigmaX * 3.0f) + 1;
+        final int padY = (int) Math.ceil(sigmaY * 3.0f) + 1;
         Rectangle dstBounds = new Rectangle(
-            srcBounds.x - pad, srcBounds.y - pad,
-            srcBounds.width  + 2 * pad,
-            srcBounds.height + 2 * pad);
-        dstBounds.intersectWith(outputClip);
+            srcBounds.x - padX, srcBounds.y - padY,
+            srcBounds.width  + 2 * padX,
+            srcBounds.height + 2 * padY);
+        if (outputClip != null) {
+            // The kernel reads source pixels up to one pad OUTSIDE the clip,
+            // and only pixels drawn into the layer reach it: cover the clip
+            // grown by the pad (consumers clip the margin). Clipping to the
+            // bare outputClip dropped that fringe -- e.g. InnerShadow's
+            // opaque InvertMask pad never got blurred into the content.
+            Rectangle reach = new Rectangle(outputClip);
+            reach.grow(padX, padY);
+            dstBounds.intersectWith(reach);
+        }
         if (dstBounds.width <= 0 || dstBounds.height <= 0) {
             // Nothing to draw: the (possibly inverted/off-clip) source doesn't
-            // intersect the output clip. PrEffectHelper/Merge skip this cleanly.
-            return new ImageData(fctx, null, srcBounds);
+            // intersect the output clip.
+            // Empty result: a real cleared drawable, like upstream (never image-less).
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
         SkiaPrDrawable dst = (SkiaPrDrawable)
@@ -215,90 +361,76 @@ public class SkiaLinearConvolveShadowPeer extends EffectPeer<LinearConvolveRende
         final int b = (int) (c.getBlue()  * 255f + 0.5f);
         final int a = (int) (c.getAlpha() * 255f + 0.5f);
 
-        // ---- Phase B cache key ----------------------------------------
-        // Hit when: same input drawable instance + same generation
-        // (= input pixels unchanged since last call) + same shadow
-        // params + same output dimensions.
-        final Object inObj = inputObjectOf(srcData);
-        final long inG  = inputGenerationOf(srcData);
-        final long stK  = stateHash(sigma, r, g, b, a);
-        final int  offX = dstBounds.x - srcBounds.x;
-        final int  offY = dstBounds.y - srcBounds.y;
-        final boolean cacheHit =
-            cachedOutputImage != null
-            && inObj != null
-            && cachedInputRef != null
-            && cachedInputRef.get() == inObj
-            && inG == cachedInputGen
-            && stK == cachedStateKey
-            && cachedOutputW == dstBounds.width
-            && cachedOutputH == dstBounds.height
-            && cachedOffX == offX
-            && cachedOffY == offY;
-
         MemorySegment dstSeg = MemorySegment.ofAddress(dst.getSurfaceHandle());
         if (dstSeg.equals(MemorySegment.NULL)) {
             return new ImageData(fctx, dst, dstBounds);
         }
 
-        if (cacheHit) {
-            // Blit cached rasterized shadow into a fresh dst. Skips the
-            // saveLayer + filter + restore pipeline entirely → ~10×
-            // faster on the hot drag-resize path. The drawable arrives
-            // already cleared from SkiaEffectRenderer.getCompatibleImage,
-            // and drawImage overwrites the whole content region.
-            NativeBridge.surfaceDrawImage(dstSeg, cachedOutputImage,
-                0f, 0f, dstBounds.width, dstBounds.height);
-            return new ImageData(fctx, dst, dstBounds);
-        }
-
-        // ---- Cache miss: run the filter and snapshot the output ------
-        // Shadow-only filter (no offset; the parent DropShadow effect
-        // applies offset via a separate Offset effect in its chain).
-        // Cached by (sigma, color) — identical-param consecutive calls
-        // reuse the same SkImageFilter handle. No finally{destroy} —
-        // dispose() releases on peer teardown.
-        MemorySegment filter = getOrCreateFilter(sigma, r, g, b, a);
-        if (filter == null) {
-            return new ImageData(fctx, dst, dstBounds);
-        }
-
-        com.sun.prism.Graphics gdst = dst.createGraphics();
-        if (gdst == null) {
-            return new ImageData(fctx, dst, dstBounds);
-        }
-        NativeBridge.surfaceSaveLayerWithFilter(dstSeg, filter);
+        final Key k = currentKey;
+        k.input = inputObjectOf(srcData);
         try {
-            // PrEffectHelper.renderImageData draws the source at the drawable
-            // ORIGIN (0,0) sized to its 3rd arg, sampling the source texture at
-            // (dstBounds - srcUntransformedBounds). It must therefore receive the
-            // OUTPUT (dstBounds) and be given an UNtranslated Graphics — exactly
-            // like PrMergePeer. The old code translated gdst by -dstBounds AND
-            // passed srcBounds, which placed the source at device (-dstBounds.xy)
-            // — almost entirely off the top-left of the output, leaving only a
-            // tiny corner of shadow (the "ghost"). See the effect-dump captures.
-            PrEffectHelper.renderImageData(gdst, srcData, dstBounds);
-        } finally {
-            NativeBridge.surfaceRestore(dstSeg);
-        }
+            k.gen  = inputGenerationOf(srcData);
+            k.sigX = sigmaX;
+            k.sigY = sigmaY;
+            k.gain = gain;
+            k.rgba = (r << 24) | (g << 16) | (b << 8) | a;
+            k.w    = dstBounds.width;
+            k.h    = dstBounds.height;
+            k.offX = dstBounds.x - srcBounds.x;
+            k.offY = dstBounds.y - srcBounds.y;
 
-        // Snapshot the rasterized output for next time. The previous
-        // cached image (if any) is released first.
-        if (cachedOutputImage != null) {
-            NativeBridge.imageDestroy(cachedOutputImage);
-            cachedOutputImage = null;
+            if (cachedOutputImage != null && cachedKey.matches(k)) {
+                // Blit the cached rasterized shadow into the fresh (already
+                // cleared) dst; skips saveLayer + filter + restore entirely.
+                NativeBridge.surfaceDrawImage(dstSeg, cachedOutputImage,
+                    0f, 0f, dstBounds.width, dstBounds.height);
+                return new ImageData(fctx, dst, dstBounds);
+            }
+
+            // ---- Cache miss: run the filter ---------------------------
+            // Shadow-only filter (no offset; the parent DropShadow effect
+            // applies offset via a separate Offset effect in its chain).
+            MemorySegment filter = getOrCreateFilter(sigmaX, sigmaY, gain, r, g, b, a);
+            if (filter == null) {
+                return new ImageData(fctx, dst, dstBounds);
+            }
+
+            Graphics gdst = dst.createGraphics();
+            if (gdst == null) {
+                return new ImageData(fctx, dst, dstBounds);
+            }
+            NativeBridge.surfaceSaveLayerWithFilter(dstSeg, filter);
+            try {
+                // PrEffectHelper.renderImageData draws the source at the
+                // drawable ORIGIN (0,0) sized to its 3rd arg, sampling the
+                // source texture at (dstBounds - srcUntransformedBounds). It
+                // must therefore receive the OUTPUT (dstBounds) and an
+                // UNtranslated Graphics -- exactly like PrMergePeer.
+                PrEffectHelper.renderImageData(gdst, srcData, dstBounds);
+            } finally {
+                NativeBridge.surfaceRestore(dstSeg);
+            }
+
+            // Snapshot only when this exact key already missed on the
+            // previous call (static input re-filtered); else remember it.
+            if (k.input != null) {
+                if (pendingKey.matches(k)) {
+                    MemorySegment snap = NativeBridge.surfaceSnapshotToImage(dstSeg);
+                    if (snap != null && !snap.equals(MemorySegment.NULL)) {
+                        if (cachedOutputImage != null) {
+                            NativeBridge.imageDestroy(cachedOutputImage);
+                        }
+                        cachedOutputImage = snap;
+                        cachedKey.copyFrom(k);
+                    }
+                    pendingKey.clear();
+                } else {
+                    pendingKey.copyFrom(k);
+                }
+            }
+            return new ImageData(fctx, dst, dstBounds);
+        } finally {
+            k.input = null;
         }
-        MemorySegment snap = NativeBridge.surfaceSnapshotToImage(dstSeg);
-        if (snap != null && !snap.equals(MemorySegment.NULL)) {
-            cachedOutputImage = snap;
-            cachedOutputW = dstBounds.width;
-            cachedOutputH = dstBounds.height;
-            cachedInputRef = (inObj == null) ? null : new WeakReference<>(inObj);
-            cachedInputGen = inG;
-            cachedStateKey = stK;
-            cachedOffX = offX;
-            cachedOffY = offY;
-        }
-        return new ImageData(fctx, dst, dstBounds);
     }
 }

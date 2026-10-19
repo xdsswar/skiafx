@@ -15,7 +15,7 @@ if(NOT DEFINED SKIA_HOME AND DEFINED ENV{SKIA_HOME})
     set(SKIA_HOME "$ENV{SKIA_HOME}")
 endif()
 
-set(_OPENJFX_SKIA_SOURCES openjfx_skia_bridge.cpp)
+set(_OPENJFX_SKIA_SOURCES openjfx_skia_bridge.cpp openjfx_skia_effects_ext.cpp)
 if(WIN32)
     # D3D12 / DXGI / Ganesh integration lives in its own TU so that
     # <d3d12.h>'s macro pollution (interface, small, near, far, …)

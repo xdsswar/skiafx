@@ -69,7 +69,8 @@ public abstract class SkiaColorMatrixPeerBase extends EffectPeer<RenderState> {
         Rectangle dstBounds = new Rectangle(srcBounds);
         dstBounds.intersectWith(outputClip);
         if (dstBounds.width <= 0 || dstBounds.height <= 0) {
-            return new ImageData(fctx, null, srcBounds);
+            // Empty result: a real cleared drawable, like upstream (never image-less).
+            return SkiaEffectRenderer.emptyResult(fctx, getRenderer(), dstBounds);
         }
 
         SkiaPrDrawable dst = (SkiaPrDrawable)
@@ -109,20 +110,39 @@ public abstract class SkiaColorMatrixPeerBase extends EffectPeer<RenderState> {
             NativeBridge.filterDestroy(cachedFilter);
             cachedFilter = null;
         }
-        float[] m = buildMatrix(effect);
+        MemorySegment f = createFilter(effect);
+        if (f == null || f.equals(MemorySegment.NULL)) return null;
+        cachedKey = k;
+        cachedFilter = f;
+        return f;
+    }
+
+    /**
+     * Builds the native filter for the current effect params. Called only
+     * on a {@link #stateKey} change; the result is cached and destroyed by
+     * this base. The default wraps {@link #buildMatrix} in a colour-matrix
+     * filter; subclasses needing a filter graph (e.g. a luminance gate)
+     * override this.
+     */
+    protected MemorySegment createFilter(Effect effect) {
+        return createColorMatrixFilter(buildMatrix(effect));
+    }
+
+    /**
+     * Creates a Skia colour-matrix image filter (row-major 4x5, applied to
+     * UNpremultiplied colour, result clamped to [0,1]) over the source.
+     * Returns null on a bad matrix or native failure.
+     */
+    static MemorySegment createColorMatrixFilter(float[] m) {
         if (m == null || m.length != 20) return null;
-        MemorySegment f;
         try (Arena a = Arena.ofConfined()) {
             MemorySegment ms = a.allocate(ValueLayout.JAVA_FLOAT, 20);
             for (int i = 0; i < 20; i++) {
                 ms.setAtIndex(ValueLayout.JAVA_FLOAT, i, m[i]);
             }
-            f = NativeBridge.filterColorMatrix(ms);
+            MemorySegment f = NativeBridge.filterColorMatrix(ms);
+            return (f == null || f.equals(MemorySegment.NULL)) ? null : f;
         }
-        if (f == null || f.equals(MemorySegment.NULL)) return null;
-        cachedKey = k;
-        cachedFilter = f;
-        return f;
     }
 
     @Override

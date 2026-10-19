@@ -170,6 +170,15 @@ SKIA_FX_API void* d3d12_queue();
 SKIA_FX_API bool d3d12_device_lost();
 
 /**
+ * Generation of the shared D3D12 device: starts at 1 and is incremented every
+ * time openjfx_skia_device_recover() replaces a lost device with a new one.
+ * Anything a consumer built on the device (bgfx state, resources, raw
+ * pointers from d3d12_device()/d3d12_queue()) is only valid for the
+ * generation it was created under.
+ */
+SKIA_FX_API uint32_t d3d12_device_generation();
+
+/**
  * Create a color render-target ID3D12Resource (RGBA8, width x height) on
  * the shared D3D12 device. Initial state RENDER_TARGET, sampleable as a
  * shader resource. Returns the resource as a void* (the caller owns one

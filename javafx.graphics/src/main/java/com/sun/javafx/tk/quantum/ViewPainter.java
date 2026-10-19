@@ -179,6 +179,10 @@ abstract class ViewPainter implements Runnable {
         }
     }
 
+    /** -Dskia.resize.diag=true: per-paint diagnostics. Hoisted: Boolean.getBoolean
+     *  is a synchronized Properties lookup and paintImpl runs every frame. */
+    private static final boolean PAINT_RESIZE_DIAG = Boolean.getBoolean("skia.resize.diag");
+
     protected void paintImpl(final Graphics backBufferGraphics) {
         // Default to "whole surface" — only the dirty-region path below
         // narrows it. Covers renderEverything, debug overlays and bails.
@@ -186,7 +190,7 @@ abstract class ViewPainter implements Runnable {
         // We should not be painting anything with a width / height
         // that is <= 0, so we might as well bail right off.
         if (width <= 0 || height <= 0 || backBufferGraphics == null) {
-            if (Boolean.getBoolean("skia.resize.diag")) {
+            if (PAINT_RESIZE_DIAG) {
                 System.err.println("[skia.paint] BAIL (no content drawn) w=" + width
                     + " h=" + height + " g=" + (backBufferGraphics != null)
                     + " scene=" + sceneState.getScene().getClass().getSimpleName());
@@ -194,7 +198,7 @@ abstract class ViewPainter implements Runnable {
             root.renderForcedContent(backBufferGraphics);
             return;
         }
-        if (Boolean.getBoolean("skia.resize.diag")) {
+        if (PAINT_RESIZE_DIAG) {
             System.err.println("[skia.paint] PAINT w=" + width + " h=" + height
                 + " scene=" + sceneState.getScene().getClass().getSimpleName());
         }

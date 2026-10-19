@@ -2290,6 +2290,25 @@ public abstract class NGNode {
         // Extract clip bounds
         Rectangle clipRect = new Rectangle(clipBounds);
         clipRect.intersectWith(PrEffectHelper.getGraphicsClipNoClone(g));
+        // skia-fx HiDPI: curXform and the clip are LOGICAL here (the Skia
+        // pipeline applies the pixel scale per draw), but readBack copies
+        // DEVICE pixels. Work in device space throughout — content image,
+        // background readback and the Blend inputs — as renderOpacity does,
+        // or the node blends against the wrong background patch at
+        // logical resolution. Identity at 100% / under Prism.
+        float psx = (g instanceof SkiaGraphics) ? g.getPixelScaleFactorX() : 1f;
+        float psy = (g instanceof SkiaGraphics) ? g.getPixelScaleFactorY() : 1f;
+        boolean hidpi = (psx != 1f || psy != 1f);
+        if (hidpi) {
+            int dx0 = (int) Math.floor(clipRect.x * psx);
+            int dy0 = (int) Math.floor(clipRect.y * psy);
+            int dw = (int) Math.ceil((clipRect.x + clipRect.width) * (double) psx) - dx0;
+            int dh = (int) Math.ceil((clipRect.y + clipRect.height) * (double) psy) - dy0;
+            clipRect = new Rectangle(dx0, dy0, dw, dh);
+        }
+        if (clipRect.isEmpty()) {
+            return;
+        }
 
         // render the node content into the first offscreen image
         FilterContext fctx = getFilterContext(g);
@@ -2302,6 +2321,9 @@ public abstract class NGNode {
         gContentImg.setHasPreCullingBits(g.hasPreCullingBits());
         gContentImg.setClipRectIndex(g.getClipRectIndex());
         gContentImg.translate(-clipRect.x, -clipRect.y);
+        if (hidpi) {
+            gContentImg.scale(psx, psy);
+        }
         gContentImg.transform(curXform);
         if (getOpacity() < 1f) {
             renderOpacity(gContentImg);
@@ -2323,7 +2345,13 @@ public abstract class NGNode {
                                 new PassThrough(bgPrD, clipRect),
                                 new PassThrough(contentImg, clipRect));
         CompositeMode oldmode = g.getCompositeMode();
-        g.setTransform(null);
+        if (hidpi) {
+            // Inputs are in device pixels: cancel the per-draw pixel scale so
+            // PrEffectHelper filters at identity and composites 1:1.
+            g.setTransform(BaseTransform.getScaleInstance(1.0 / psx, 1.0 / psy));
+        } else {
+            g.setTransform(null);
+        }
         g.setCompositeMode(CompositeMode.SRC);
         PrEffectHelper.render(blend, g, 0, 0, null);
         g.setCompositeMode(oldmode);
@@ -2634,7 +2662,12 @@ public abstract class NGNode {
                     // frees its filter + slot when the disposer notices.
                     Disposer.addRecord(this, autoCacheRec);
                 }
-                CacheFilter f = new CacheFilter(this, CacheHint.SPEED);
+                // DEFAULT, not SPEED: SPEED sets scale/rotate hints, so a
+                // fade combined with a scale/rotate animation would blit the
+                // stale bitmap resampled (blurry, not pixel-equivalent to
+                // renderOpacity). DEFAULT reuses the bitmap only across pure
+                // translations and re-renders on any scale/rotate change.
+                CacheFilter f = new CacheFilter(this, CacheHint.DEFAULT);
                 if (autoCacheRec.attach(f)) {
                     autoCacheFilter = f;
                     if (PULSE_LOGGING_ENABLED) {

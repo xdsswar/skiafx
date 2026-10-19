@@ -767,11 +767,17 @@ class GlassViewEventHandler extends View.EventHandler {
     // TODO - dropTargetListener.dropActionChanged
     // TODO - dragSourceListener.dropActionChanged
 
+    /** MOVE events closer together than this belong to one burst (a drag). */
+    private static final long MOVE_BURST_GAP_NANOS = 100_000_000L; // 100 ms
+
     private final ViewEventNotification viewNotification = new ViewEventNotification();
     private class ViewEventNotification implements Supplier<Void> {
         View view;
         long time;
         int type;
+        // MOVE forced-repaint coalescing (FX thread only): see ViewEvent.MOVE.
+        private long lastMoveNanos;
+        private Screen lastMoveScreen;
 
         @Override
         public Void get() {
@@ -827,10 +833,24 @@ class GlassViewEventHandler extends View.EventHandler {
                     // rendering window (e.g. a live WebView) re-presents every
                     // pulse and self-heals, but a STATIC window (a dialog/alert)
                     // never repaints and is left blank on the new monitor. Force a
-                    // repaint so it re-presents into the moved window. Cheap: the
-                    // present-rate cap throttles it, and a drag suppresses pulses
-                    // until it settles, so this coalesces to one repaint per move.
-                    scene.entireSceneNeedsRepaint();
+                    // repaint so it re-presents into the moved window.
+                    //
+                    // A forced repaint is exempt from the present-rate cap, and a
+                    // title-bar drag delivers a MOVE per mouse step (pulses keep
+                    // running via the modal-loop timer), so forcing on EVERY move
+                    // meant a full repaint+present each pulse for the whole drag.
+                    // Only force when the window landed on another screen, or on
+                    // the first MOVE of a burst (a programmatic relocation such as
+                    // centerOnScreen right after show). handleScreenChangedEvent
+                    // also forces one on the screen switch itself.
+                    final long nowNs = System.nanoTime();
+                    final Screen moveScreen = (w == null) ? null : w.getScreen();
+                    if (moveScreen != lastMoveScreen
+                            || nowNs - lastMoveNanos > MOVE_BURST_GAP_NANOS) {
+                        scene.entireSceneNeedsRepaint();
+                    }
+                    lastMoveScreen = moveScreen;
+                    lastMoveNanos = nowNs;
                     break;
                 }
                 case ViewEvent.FULLSCREEN_ENTER:

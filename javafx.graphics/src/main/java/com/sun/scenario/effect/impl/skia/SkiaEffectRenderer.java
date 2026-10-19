@@ -201,12 +201,15 @@ public final class SkiaEffectRenderer extends PrRenderer {
             // be flushed correctly on checkIn. (bugs.md NEW-H2)
             releaseCompatibleImage(im);
             im = (SkiaPrDrawable) super.getCompatibleImage(w, h);
-            // Defensive: if even the fresh checkout is lost (genuine device
-            // loss), fall back to a raw drawable rather than returning a corpse.
-            // This last-ditch path is not pool-tracked, but a lost device is
-            // already a degraded state and the next pulse retries from scratch.
+            // If even the fresh checkout is lost (genuine device loss), check
+            // it back in and return null: callers treat null as a one-pulse
+            // miss and the next pulse retries. (A raw createCompatibleImage()
+            // substitute used to be returned here; it is not pool-tracked, so
+            // the caller's releaseCompatibleImage -> checkIn dropped it and its
+            // native SkSurface leaked on every device-loss pulse.)
             if (im != null && (im.isLost() || im.getSurfaceHandle() == 0L)) {
-                im = createCompatibleImage(w, h);
+                releaseCompatibleImage(im);
+                return null;
             }
         }
         if (im != null && !im.isLost()) {
@@ -229,6 +232,27 @@ public final class SkiaEffectRenderer extends PrRenderer {
         // PrRenderer's transient-failure recovery. State is only set to
         // LOST through the explicit dispose path (line ~373).
         return im;
+    }
+
+    /**
+     * Result for an EMPTY (or inverted) peer output, matching upstream's
+     * shader peers, which always hand back {@code getCompatibleImage(w, h)}
+     * (a real, cleared drawable) instead of an image-less ImageData. Callers
+     * like NGCanvas.blendAthruBintoC dereference the result image without a
+     * null check. Our {@link #getCompatibleImage} deliberately returns null
+     * for non-positive sizes (NGNode.renderNodeBlendMode relies on that), so
+     * request at least 1x1 here; the bounds are normalised to a non-negative
+     * (possibly zero) extent so nothing visible is drawn from it. Only a
+     * genuine allocation failure still yields a null image (upstream
+     * markLost semantics).
+     */
+    static ImageData emptyResult(FilterContext fctx, Renderer r, Rectangle bounds) {
+        Rectangle b = (bounds == null)
+            ? new Rectangle()
+            : new Rectangle(bounds.x, bounds.y,
+                            Math.max(0, bounds.width), Math.max(0, bounds.height));
+        Filterable img = r.getCompatibleImage(Math.max(1, b.width), Math.max(1, b.height));
+        return new ImageData(fctx, img, b);
     }
 
     @Override
@@ -263,19 +287,37 @@ public final class SkiaEffectRenderer extends PrRenderer {
         int h = img.getHeight();
         // Route through the pool — bucketed so repeated identical-size
         // requests during a drag hit the cache instead of allocating.
+        if (w <= 0 || h <= 0) {
+            return emptyResult(fctx, this, new Rectangle(0, 0, w, h));
+        }
         SkiaPrDrawable dst = (SkiaPrDrawable) getCompatibleImage(w, h);
         if (dst == null) {
+            // Genuine allocation failure.
             return new ImageData(fctx, null, new Rectangle(0, 0, w, h));
         }
         Graphics g = dst.createGraphics();
         if (g != null) {
-            Texture tex = factory().createTexture(img,
-                Texture.Usage.DEFAULT,
-                WrapMode.CLAMP_TO_EDGE);
-            g.drawTexture(tex, 0f, 0f, (float) w, (float) h);
-            tex.dispose();
+            // Use the factory's per-Image texture cache (as NGImageView does)
+            // instead of uploading + disposing a fresh texture on every call:
+            // a static ImageInput is uploaded once. The cached texture is
+            // returned locked and must be unlocked, never disposed.
+            Texture tex = factory().getCachedTexture(img, WrapMode.CLAMP_TO_EDGE);
+            if (tex != null) {
+                try {
+                    g.drawTexture(tex, 0f, 0f, (float) w, (float) h);
+                } finally {
+                    tex.unlock();
+                }
+            }
         }
-        return new ImageData(fctx, dst, new Rectangle(0, 0, w, h));
+        // Match upstream PPSRenderer: a HiDPI Image (pixelScale != 1) has
+        // w x h PHYSICAL pixels covering w/ps x h/ps logical units.
+        BaseTransform tx = BaseTransform.IDENTITY_TRANSFORM;
+        float ps = img.getPixelScale();
+        if (ps != 1.0f && ps > 0f) {
+            tx = BaseTransform.getScaleInstance(1.0f / ps, 1.0f / ps);
+        }
+        return new ImageData(fctx, dst, new Rectangle(0, 0, w, h), tx);
     }
 
     @Override
@@ -301,8 +343,12 @@ public final class SkiaEffectRenderer extends PrRenderer {
     public ImageData transform(FilterContext fctx, ImageData original,
                                BaseTransform transform,
                                Rectangle origBounds, Rectangle xformBounds) {
+        if (xformBounds.width <= 0 || xformBounds.height <= 0) {
+            return emptyResult(fctx, this, xformBounds);
+        }
         SkiaPrDrawable dst = (SkiaPrDrawable) getCompatibleImage(xformBounds.width, xformBounds.height);
         if (dst == null) {
+            // Genuine allocation failure.
             return new ImageData(fctx, null, xformBounds);
         }
         Graphics g = dst.createGraphics();

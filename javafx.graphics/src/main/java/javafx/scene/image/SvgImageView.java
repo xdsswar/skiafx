@@ -515,7 +515,7 @@ public class SvgImageView extends ImageView {
         recomputeWidthHeight();
 
         SvgImage svg = getSvgImage();
-        peer.setSvgHandle(svg == null ? 0L : svg.nativeHandle());
+        peer.setSvgSource(svg == null ? null : svg.handleSource);
         peer.setPosition((float) getX(), (float) getY());
         peer.setDimensions((float) dispWidth, (float) dispHeight);
 

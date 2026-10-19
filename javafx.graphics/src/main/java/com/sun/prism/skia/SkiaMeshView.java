@@ -9,6 +9,7 @@ import com.sun.prism.Material;
 import com.sun.prism.impl.BaseMeshView;
 import com.sun.prism.impl.Disposer;
 import com.sun.prism.skia.impl.NativeBridge3D;
+import com.sun.prism.skia.impl.SkiaGpu;
 
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -132,9 +133,17 @@ final class SkiaMeshView extends BaseMeshView {
         }
     }
 
+    /** GPU device generation this object's native resources belong to. */
+    private final int deviceGeneration = SkiaGpu.deviceGeneration();
+
+    /**
+     * Invalid once device-loss recovery replaced the GPU device: NGShape3D /
+     * NGTriangleMesh / NGPhongMaterial then dispose and rebuild it (the same
+     * isValid() contract Prism's D3D pipeline uses after a device reset).
+     */
     @Override
     public boolean isValid() {
-        return true;
+        return deviceGeneration == SkiaGpu.deviceGeneration();
     }
 
     @Override
